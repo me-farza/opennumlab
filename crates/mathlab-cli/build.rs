@@ -26,6 +26,8 @@ fn main() {
         root.join("Cargo.toml"),
         root.join("octave/mathlab_worker.m"),
         root.join("octave/mathlab_value_page.m"),
+        root.join("octave/mathlab_value_edit.m"),
+        root.join("octave/mathlab_ready_json.m"),
     ];
     for name in [
         "mathlab-cli",

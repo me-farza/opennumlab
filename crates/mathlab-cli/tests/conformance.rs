@@ -87,7 +87,14 @@ fn runtime() -> Option<PathBuf> {
         eprintln!("Skipping CP01 runtime integration: GNU Octave was not found.");
         return None;
     };
-    let output = Command::new(&executable).arg("--version").output().ok()?;
+    let output = Command::new(&executable)
+        .arg("--version")
+        .output()
+        .unwrap_or_else(|error| {
+            panic!(
+                "Failed to spawn GNU Octave {executable:?} for CP01 runtime integration: {error}"
+            )
+        });
     if !output.status.success() || !String::from_utf8_lossy(&output.stdout).contains("11.3.0") {
         eprintln!(
             "Skipping CP01 runtime integration: the declared reference profile requires Octave 11.3.0."

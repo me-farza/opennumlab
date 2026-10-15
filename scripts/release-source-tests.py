@@ -203,6 +203,35 @@ class SourceArchiveTests(unittest.TestCase):
             self.assertEqual((member.uid, member.gid, member.uname, member.gname, member.mtime), (0, 0, "", "", 0))
         self.assertEqual(source.verify(self.output), manifest)
 
+    def test_value_provisioning_source_inputs_preserve_bytes_and_modes_without_widening_selection(self):
+        selected = {
+            "scripts/build-value-bridge.sh": ("#!/bin/sh\n# owned value builder fixture\n", 0o755),
+            "scripts/verify-value-provisioning-test.sh": ("#!/bin/sh\n# owned provisioning contract fixture\n", 0o755),
+            "scripts/release-launcher-value-test.sh": ("#!/bin/sh\n# owned launcher value contract fixture\n", 0o755),
+            "docs/VALUE_EDIT_PROTOCOL.md": ("# Owned value edit protocol fixture\n", 0o644),
+        }
+        denied = ("scripts/build-value-bridge-local.sh", "scripts/verify-value-provisioning-test-private.sh",
+                  "scripts/private/build-value-bridge.sh", "docs/VALUE_EDIT_PROTOCOL_PRIVATE.md",
+                  "docs/private/VALUE_EDIT_PROTOCOL.md", "native/mathlab_value_bridge.oct")
+        for name, (text, mode) in selected.items():
+            self.write(name, text).chmod(mode)
+        for name in denied:
+            self.write(name, "VALUE_PROVISIONING_PRIVATE_SENTINEL\n").chmod(0o755)
+        self.create(reference=self.commit_all())
+        manifest, members = self.archive_contents()
+        records = {record["path"]: record for record in manifest["files"]}
+        prefix = manifest["archive"]["root"] + "/"
+        for name, (text, mode) in selected.items():
+            with self.subTest(path=name):
+                member, data = members[prefix + name]
+                self.assertEqual(data, text.encode())
+                self.assertEqual(member.mode, mode)
+                self.assertEqual(records[name]["mode"], format(mode, "04o"))
+                self.assertEqual(records[name]["executable"], mode == 0o755)
+        self.assertFalse(set(records).intersection(denied))
+        self.assertFalse(any(b"VALUE_PROVISIONING_PRIVATE_SENTINEL" in data for _, data in members.values()))
+        self.assertEqual(source.verify(self.output), manifest)
+
     def test_forbidden_tracked_and_untracked_content_is_absent(self):
         denied = ("docs/research/private.md", "docs/research/evidence/local.mat", "artifacts/report.json",
                   "crates/vendor/source.rs", "native/vendor.oct", "tests/fixtures/generated.slx",

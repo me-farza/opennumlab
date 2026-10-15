@@ -8,6 +8,45 @@ The current limits are 2,000 requested page cells and 32 MiB per ordinary respon
 these are transport limits, not measurements of physical memory or execution
 budgets. Native debugger, scope and input adapters retain their separate gates.
 
+### Readiness JSON producer
+
+The worker explicitly identifies its own Ready replies at initial startup,
+same-process recovery, ping and value-adapter installation. A private
+`mathlab_ready_json` helper assembles only the three unsigned numeric fields:
+protocol version, variable-cell limit and response-byte limit. It validates
+primitive dense real scalar input before producing canonical decimal integer
+tokens; fractions, negatives, negative zero, nonfinite values and overflow are
+errors. It preserves different valid integers for the strict Rust contract to
+reject, rather than substituting the expected constants. Native `uint64`
+formatting avoids a floating-point intermediate above 2^53.
+
+The helper uses the genuine `__fieldnames__` primitive and the builtin JSON
+encoder for field names, strings, capabilities, context and extension fields.
+An explicit logical owner flag selects this behavior. All ordinary replies,
+including user data with exactly the same structure as Ready, retain builtin
+JSON encoding without readiness inspection. UTF-8 conversion and the existing
+32 MiB response limit apply before physical publication.
+
+Startup and recovery preflight the Ready response inside their validation
+handler. A producer error disables worker recovery before encoding one ordinary
+E0 diagnostic, preserving identifiers such as `MathLab:ReadyJsonInteger` instead
+of replacing them with Interrupted and repeatedly re-entering startup. Chosen
+bytes are published outside that handler; encoding validation must not catch a
+file/fence failure and overwrite already committed metadata.
+
+Local Octave 11.3 validation passed the direct producer probe, strict Rust raw
+token decoding, startup rejection and recovery-producer failure regressions.
+The recovery fault returns the producer-specific diagnostic, closes transport,
+does not repeat re-entry and cannot publish subsequent user execution. Exact
+uint64-max and 2^53+1 tokens, escaping/extensions, malformed values and ordinary
+payload passthrough passed on that runtime. See the retained
+[scoped validation](../artifacts/ready-history-validation/RESULTS.json).
+`MATHLAB_REQUIRE_READY_JSON_TESTS=1` makes the direct producer probe and startup
+regressions mandatory when verifying a runtime profile. Exact uint64-max and
+2^53+1 output must be exercised on actual Octave 11.3 and hosted 8.4; source
+inspection and a local pass alone do not qualify the older runtime. The shared
+dispatcher/startup boundary described below remains a separate open issue.
+
 ## Identity and invalidation
 
 `SessionContext` contains an opaque `worker_id` plus `generation`, `invocation`
@@ -43,8 +82,8 @@ invalidation before their capabilities can be advertised.
 
 ## Inspection and mutation
 
-`workspace_snapshot` returns metadata and tokens without invoking property
-getters, overloaded indexing or display. It enumerates names with the genuine
+`workspace_snapshot` is intended to return metadata and tokens without invoking property
+getters, overloaded indexing or display. The selected tested paths enumerate names with the genuine
 `who`; even genuine `whos` can dispatch an object's overloaded `size`, so byte
 accounting is requested only after proving a primitive runtime class. Objects
 report `dimensions_known=false` and `bytes_known=false`; their empty dimensions
@@ -65,8 +104,9 @@ and out-of-range indices leave the value and revision unchanged. Metadata in
 the receipt uses the same safe snapshot collector. Atomic ranges and undo remain
 CP03 work.
 
-The primitive call chain uses genuine builtins, including request decoding,
-classification, scalar conversion, metadata/error construction and publication.
+The primitive call chain requests builtins for decoding, classification, scalar
+conversion, metadata/error construction and publication; its dispatcher identity
+is not yet protected throughout startup and recovery, as detailed below.
 It avoids M-file `repmat`/`isequal` in the checked path. Literal builtin-handle
 invocation in the base workspace avoids variable precedence for names such as
 `builtin`, `who`, `whos` and `feval`. The pinned Octave path uses its genuine
@@ -75,6 +115,43 @@ shadowable M-file wrappers. Readiness/ping uses intrinsic `OCTAVE_VERSION`.
 Automatic figure enumeration uses `__go_figure_handles__` rather than traversing
 M-file plotting helpers for an otherwise numerical command. These dependencies require regression on other
 runtime versions; a capability handshake alone does not qualify them.
+
+### Dispatcher identity qualification
+
+The later native graphics probe reproduced a gap in this implementation:
+a project `builtin.m` can intercept both bare `builtin(...)` calls and a simple
+`@builtin` handle. A literal handle avoids a base **variable** with that name;
+it does not retain the intrinsic function object's identity against an M-file
+with that name. Consequently the prior selected helper-shadow and object-trap
+tests do not establish protection against every project dispatcher shadow.
+This also affects the typed-page and pending range-edit services that share
+the worker's dispatch path.
+
+Current first startup uses the project directory and inherited search-path
+environment before resolving `addpath` and `mathlab_worker`. Same-process Stop
+re-entry resolves those names again. Base-workspace query strings contain
+`@builtin`, and the separately generated scope registry has its own ordinary
+function dependencies. Merely binding a dispatcher in the main worker, or
+enabling an adapter after first Ready, does not close those paths. Identity
+checks that themselves call shadowable helpers also require protection.
+
+The native graphics probe retained the actual intrinsic function object and
+used native base-workspace queries successfully for its declared cases. That
+standalone result does not qualify the complete engine startup, registry,
+inspection, mutation or recovery chain. A shared implementation must establish
+trusted startup before exposing the project path, retain genuine primitive and
+worker entry objects across clearing/recovery, cover the complete private-helper
+and registry closure, and avoid project name resolution in base queries.
+Project-defined functions must remain callable by ordinary user source.
+
+Required causal checks include shadows present before `Engine::start`, inherited
+search-path shadows, base variables with helper names, later shadows followed by
+`clear functions`/`clear all`, and SIGINT re-entry. Each needs a user-call positive
+control plus actual source/runtime identity and unchanged value/revision checks.
+Until those pass, the existing capability names identify the implemented
+protocol surface; they are not a claim that this transitive dispatch defect is
+fixed. The source audit and preserved native probe identity are recorded in
+`artifacts/intrinsic-dispatch-audit-20261015.json`.
 
 Existing unconditional APIs remain available for callers that explicitly choose
 them. Their effects conservatively revoke snapshot tokens. Desktop read-only

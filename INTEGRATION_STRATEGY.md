@@ -71,11 +71,11 @@ Open-source licenses differ. Review the exact components and how they are combin
 
 Do not translate working components merely to increase the Rust percentage. First profile representative workloads and identify numerical kernels, copies, interpreter overhead or rendering bottlenecks. Replace a component only when its Rust implementation passes conformance tests and improves a measured outcome.
 
-Initially, Octave remains the only source execution engine. Rust extensions may implement selected operations behind explicit, tested adapters. A later Rust interpreter can be developed as an independent backend only if maintaining it has a justified benefit and a sufficiently broad test suite. Seamless fallback between two interpreters is not assumed.
+Initially, Octave remains the only source execution engine. Rust extensions may implement selected operations behind explicit, tested adapters. A Rust-native interpreter remains a required long-term workstream in the complete [product roadmap](ROADMAP.md), with its own language, value, numerical and debugger contracts. Develop it as an independently identified backend against the shared conformance corpus; changing the default requires measured correctness and performance evidence. Seamless fallback between two interpreters is not assumed.
 
 A better desktop can improve usability immediately, but placing a Rust UI around Octave does not itself accelerate computations. Publish cold/warm execution, memory use and end-to-end timings, including data conversion and interprocess overhead.
 
-If strict 100% Rust becomes a hard requirement, retaining Octave, Python/SymPy or OpenModelica as bundled engines conflicts with it. The choice would then be an incremental replacement program with reduced early coverage. The recommended integration path follows the user's stated priority of functionality, reliability and performance.
+Early integration editions contain non-Rust engines and dependencies; they do not complete the Rust-native execution objective. Deliver the Rust workstream incrementally without dropping the broader compatibility and ecosystem requirements. Declare any remaining native dependencies per edition, and claim a fully Rust distribution only when the actual shipped implementation and dependency boundary support it. This sequence preserves the user's priorities of functionality, reliability and performance while retaining the full long-term scope.
 
 ## First delivery and subsequent expansion
 

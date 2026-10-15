@@ -1,6 +1,6 @@
 ## SPDX-License-Identifier: GPL-3.0-or-later
 ## An isolated protocol function keeps transport variables out of the base workspace.
-function mathlab_worker (session_directory, announce_ready = true, debugger_enabled = false, scope_bridge_path = '', response_prefix = '', generation = 1, console_helper_path = '', invocation = 1, input_bridge_path = '')
+function mathlab_worker (session_directory, announce_ready = true, debugger_enabled = false, scope_bridge_path = '', response_prefix = '', generation = 1, console_helper_path = '', invocation = 1, input_bridge_path = '', value_bridge_path = '')
   registry_directory = fullfile (session_directory, 'registry');
   registry_path = fullfile (registry_directory, 'mathlab_scope_register.m');
   if (! debugger_enabled && builtin('isempty', scope_bridge_path) && ! mathlab_path_contains (registry_directory))
@@ -29,13 +29,38 @@ function mathlab_worker (session_directory, announce_ready = true, debugger_enab
   captured = '';
   started = builtin('tic');
   binding_revision = builtin('uint64', 0);
+  edit_history = mathlab_edit_history_new (invocation);
+  ## Optional startup-only adapter. Its canonical path must be supplied by the
+  ## Engine from an explicitly trusted matching binary, including recovery.
+  ## Retain the configured path in worker scope. Checked dispatch revalidates
+  ## native identity and captures the fresh handle used by that operation.
+  value_bridge = [];
   unwind_protect
     ## Recovery re-entry has its own readiness fence. Rust waits for it before
     ## publishing the interrupted request's completion or accepting another command.
     mathlab_begin (0, response_prefix, generation, console_helper_path, invocation);
-    mathlab_emit (builtin('struct', 'id', 0, 'ok', true, 'result', ...
-                         mathlab_ready (response_prefix, generation, invocation, binding_revision)), ...
-                  session_directory, response_prefix, generation, console_helper_path, invocation);
+    try
+      ## MATHLAB_VALUE_BRIDGE_READY_VALIDATION
+      value_bridge = mathlab_value_bridge_open (value_bridge_path);
+      startup_response = builtin('struct', 'id', 0, 'ok', true, 'result', ...
+                                 mathlab_ready (response_prefix, generation, invocation, binding_revision, value_bridge));
+      [startup_response, startup_encoded] = mathlab_encode_response (startup_response, (1 == 1));
+    catch caught
+      ## Encoding is part of readiness validation. Do not replace a producer
+      ## failure with Interrupted/R0 and recursively re-enter the same failure.
+      ## Disable recovery even if encoding the diagnostic itself then fails.
+      worker_active = false;
+      startup_response = builtin('struct', 'id', 0, 'ok', false, 'error', mathlab_error(caught));
+      [startup_response, startup_encoded] = mathlab_encode_response (startup_response, (1 == 0));
+    end_try_catch
+    if (! startup_response.ok); worker_active = false; endif
+    ## Publish once, outside the validation catch: an I/O/fence failure must
+    ## never overwrite metadata that may already have been committed.
+    mathlab_publish (startup_response, startup_encoded, session_directory, response_prefix, ...
+                     generation, console_helper_path, invocation);
+    response_sent = true;
+    builtin('clear', '-variables', 'startup_response', 'startup_encoded', 'caught');
+    if (! worker_active); return; endif
     if (debugger_enabled && ! builtin('isempty', input_bridge_path))
       autoload ('mathlab_input_bridge', input_bridge_path);
       mathlab_require_function ('mathlab_input_bridge', input_bridge_path);
@@ -62,6 +87,11 @@ function mathlab_worker (session_directory, announce_ready = true, debugger_enab
       endif
       request_line = builtin('fgetl', request_file);
       builtin('fclose', request_file);
+      range_edit_started = false;
+      result_is_ready = (1 == 0);
+      ## Request metadata and error structs are not durable session state.
+      ## This outer guard also runs if publication or SIGINT leaves the try.
+      unwind_protect
       try
         request = builtin('jsondecode', request_line);
         request_id = request.id;
@@ -74,7 +104,9 @@ function mathlab_worker (session_directory, announce_ready = true, debugger_enab
         ## dispatch, never only after success. Checked operations own their commit.
         if (! builtin('any', builtin('strcmp', request.command, {'ping', 'workspace_snapshot', ...
                                             'read_variable_checked', 'set_variable_element_checked', ...
-                                            'read_value_page_checked'})))
+                                            'read_value_page_checked', 'write_value_range_checked', ...
+                                            'undo_value_edit_checked', 'redo_value_edit_checked'})))
+          edit_history = mathlab_edit_history_invalidate (edit_history);
           binding_revision = mathlab_next_revision (binding_revision);
         endif
         builtin('unlink', request_path);
@@ -92,6 +124,9 @@ function mathlab_worker (session_directory, announce_ready = true, debugger_enab
             builtin('error', 'MathLab:Interrupted', 'Request canceled before execution. Workspace preserved.');
           endif
         else
+        ## All dispatch-local candidates must die while the accepted base root
+        ## still owns every opaque sibling. Never retain a root between requests.
+        unwind_protect
         switch (request.command)
           case {'execute', 'run_file'}
             execution_request = true;
@@ -226,8 +261,12 @@ function mathlab_worker (session_directory, announce_ready = true, debugger_enab
           case 'ping'
             ## Service pending interpreter interrupts before confirming readiness.
             builtin('pause', 0);
-            result = mathlab_ready (response_prefix, generation, invocation, binding_revision);
-          case 'workspace_snapshot'
+            if (! builtin('isempty', value_bridge_path))
+              value_bridge = mathlab_validate_value_bridge (value_bridge_path);
+            endif
+            result = mathlab_ready (response_prefix, generation, invocation, binding_revision, value_bridge);
+            result_is_ready = (1 == 1);
+          case {'workspace_snapshot', 'reset_value_edit_history'}
             context = mathlab_binding_context (response_prefix, generation, invocation, binding_revision);
             metadata = mathlab_safe_workspace ();
             bound = builtin('cell', 1, builtin('numel', metadata));
@@ -246,18 +285,57 @@ function mathlab_worker (session_directory, announce_ready = true, debugger_enab
             mathlab_check_binding (binding_request, context);
             ## The private appended helper traverses only genuine containers and
             ## primitive leaves, under the same owner and accepted root token.
-            result = mathlab_value_page (request);
+            if (! builtin('isempty', value_bridge_path))
+              value_bridge = mathlab_validate_value_bridge (value_bridge_path);
+            endif
+            result = mathlab_value_page (request, value_bridge);
           case 'set_variable_element_checked'
             context = mathlab_binding_context (response_prefix, generation, invocation, binding_revision);
             mathlab_check_binding (request, context);
             replacement = mathlab_set_variable_element (request, false);
             ## Validation constructs an owned replacement. Revision revocation
             ## and its single assignment are in this same interpreter operation.
+            edit_history = mathlab_edit_history_invalidate (edit_history);
             binding_revision = mathlab_next_revision (binding_revision);
             builtin('assignin', 'base', request.name, replacement);
             context = mathlab_binding_context (response_prefix, generation, invocation, binding_revision);
             result = builtin('struct', 'token', builtin('struct', 'context', context, 'name', request.name), ...
                              'workspace', {mathlab_safe_workspace()});
+          case {'write_value_range_checked', 'undo_value_edit_checked', 'redo_value_edit_checked'}
+            context = mathlab_binding_context (response_prefix, generation, invocation, binding_revision);
+            if (builtin('strcmp', request.command, 'write_value_range_checked'))
+              edit_token = mathlab_page_token (request.path.root);
+              operation = 'write';
+              edit_request = request;
+            else
+              edit_token = mathlab_page_token (request.expected);
+              if (builtin('strcmp', request.command, 'undo_value_edit_checked')); operation = 'undo'; else; operation = 'redo'; endif
+            endif
+            binding_request = builtin('struct', 'name', edit_token.name, 'expected', edit_token);
+            mathlab_check_binding (binding_request, context);
+            if (! builtin('isempty', value_bridge_path))
+              value_bridge = mathlab_validate_value_bridge (value_bridge_path);
+            endif
+            if (! builtin('strcmp', operation, 'write'))
+              edit_request = mathlab_edit_history_restore_request (edit_history, request, operation, context);
+            endif
+            [replacement, patch] = mathlab_prepare_value_edit (edit_request, value_bridge);
+            next_revision = mathlab_next_revision (binding_revision);
+            next_context = mathlab_binding_context (response_prefix, generation, invocation, next_revision);
+            next_token = builtin('struct', 'context', next_context, 'name', edit_token.name);
+            if (builtin('strcmp', operation, 'write'))
+              [candidate_history, edit_receipt] = mathlab_edit_history_accept_write (edit_history, patch, next_token);
+            else
+              [candidate_history, edit_receipt] = mathlab_edit_history_accept_restore (edit_history, request, operation, next_token);
+            endif
+            ## All candidate values, bounded history and receipt are ready.
+            ## MATHLAB_VALUE_EDIT_PRECOMMIT_BOUNDARY
+            range_edit_started = true;
+            binding_revision = next_revision;
+            builtin('assignin', 'base', edit_token.name, replacement);
+            ## MATHLAB_VALUE_EDIT_POSTASSIGN_BOUNDARY
+            edit_history = candidate_history;
+            result = edit_receipt;
           case 'workspace'
             result = mathlab_workspace ();
           case 'read_variable'
@@ -323,6 +401,17 @@ function mathlab_worker (session_directory, announce_ready = true, debugger_enab
             endif
             feval ('mathlab_scope_register', '__debug_configuration__', {}, true);
             result = [];
+          case 'enable_value_bridge'
+            ## Effectful installation is intentionally absent from the pure
+            ## dispatch whitelist: bindings/history were revoked before loading.
+            if (! builtin('ischar', request.bridge_path) || builtin('isempty', request.bridge_path))
+              builtin('error', 'MathLab:ValuePagePrecisionProtocol', 'Adapter installation requires a nonempty canonical .oct path.');
+            endif
+            installed_value_bridge = mathlab_value_bridge_open (request.bridge_path);
+            value_bridge = installed_value_bridge;
+            value_bridge_path = request.bridge_path;
+            result = mathlab_ready (response_prefix, generation, invocation, binding_revision, value_bridge);
+            result_is_ready = (1 == 1);
           case 'enable_input_bridge'
             autoload ('mathlab_input_bridge', request.bridge_path);
             try
@@ -389,13 +478,32 @@ function mathlab_worker (session_directory, announce_ready = true, debugger_enab
           otherwise
             builtin('error', 'MathLab:UnknownCommand', 'Unknown command: %s', request.command);
         endswitch
+        unwind_protect_cleanup
+          ## Exact local names only: never clear base values, committed history,
+          ## revision, or range_edit_started (the outer catch still needs it).
+          builtin('clear', '-variables', 'replacement', 'patch', 'candidate_history', ...
+                  'edit_receipt', 'edit_request', 'edit_token', 'operation', ...
+                  'binding_request', 'next_revision', 'next_context', 'next_token', 'context', 'ans', 'installed_value_bridge');
+        end_unwind_protect
         endif
-        mathlab_emit (builtin('struct', 'id', request_id, 'ok', true, 'result', {result}), session_directory, response_prefix, generation, console_helper_path, invocation);
+        mathlab_emit (builtin('struct', 'id', request_id, 'ok', true, 'result', {result}), session_directory, response_prefix, generation, console_helper_path, invocation, 'E', result_is_ready);
         response_sent = true;
       catch caught
+        if (range_edit_started)
+          ## Revocation/assignment or publication may already have happened.
+          ## Retire history and force explicit client reconciliation; no replay.
+          edit_history = mathlab_edit_history_invalidate (edit_history);
+          caught.identifier = 'MathLab:ValueEditUncertain';
+          caught.message = ['Edit outcome is uncertain; refresh values and explicitly reset history. ' caught.message];
+        endif
         mathlab_emit (builtin('struct', 'id', request_id, 'ok', false, 'error', mathlab_error (caught)), session_directory, response_prefix, generation, console_helper_path, invocation);
         response_sent = true;
       end_try_catch
+      unwind_protect_cleanup
+        ## These contain only request/response/error data. The outer recovery
+        ## path constructs its own response from preserved control state.
+        builtin('clear', '-variables', 'request', 'request_line', 'result', 'caught', 'execution_error', 'result_is_ready');
+      end_unwind_protect
     endwhile
   unwind_protect_cleanup
     ## Recovery is a separate commit record. A late normal End may already be
@@ -417,11 +525,15 @@ function mathlab_worker (session_directory, announce_ready = true, debugger_enab
   end_unwind_protect
 endfunction
 
-function result = mathlab_ready (worker_id, generation, invocation, revision)
-  ## Fixed wire integers use an integer native class: older JSON encoders can
-  ## spell a double-valued limit as 33554432.0, which is not an integer token.
+function result = mathlab_ready (worker_id, generation, invocation, revision, value_bridge = [])
+  capabilities = {'binding_snapshot.v1', 'checked_scalar_write.v1', 'display_page.v1', 'typed_nd_page.v1', 'atomic_range_edit.v1'};
+  if (builtin('is_function_handle', value_bridge))
+    capabilities{end + 1} = 'dense_complex_native_components.v1';
+  endif
+  ## Retain exact native integers here. The explicit Ready producer encodes
+  ## these three fields without passing them to older builtin JSON encoders.
   protocol = builtin('struct', 'name', 'mathlab-worker', 'version', builtin('uint32', 1), ...
-                     'capabilities', {{'binding_snapshot.v1', 'checked_scalar_write.v1', 'display_page.v1', 'typed_nd_page.v1'}}, ...
+                     'capabilities', {capabilities}, ...
                      'limits', builtin('struct', 'variable_cells', builtin('uint32', 2000), ...
                                        'response_bytes', builtin('uint32', 33554432)));
   result = builtin('struct', 'version', builtin('OCTAVE_VERSION'), 'working_directory', builtin('pwd'), 'protocol', protocol, ...
@@ -550,16 +662,26 @@ function mathlab_begin (request_id, nonce, generation, console_helper_path, invo
   mathlab_fence ('B', request_id, nonce, generation, console_helper_path, invocation);
 endfunction
 
-function mathlab_emit (response, session_directory, nonce, generation, console_helper_path, invocation, kind = 'E')
-  ## Metadata is never multiplexed with console bytes: write a bounded temporary
-  ## file, close it, rename atomically, then place End in the common output pipe.
-  encoded = builtin('__unicode2native__', builtin('jsonencode', response), 'UTF-8');
+function [response, encoded] = mathlab_encode_response (response, is_ready = (1 == 0))
+  ## Preflight is separate from physical publication so a startup producer
+  ## failure can become one ordinary E0 diagnostic before any file is written.
+  encoded = builtin('__unicode2native__', mathlab_ready_json(response, is_ready), 'UTF-8');
   if (builtin('numel', encoded) > 32 * 1024 * 1024)
     limit_error = builtin('struct', 'message', 'Worker metadata exceeds the 32 MiB response limit.', ...
                          'identifier', 'MathLab:ResponseLimit', 'stack', {{}});
     response = builtin('struct', 'id', response.id, 'ok', false, 'error', limit_error);
     encoded = builtin('__unicode2native__', builtin('jsonencode', response), 'UTF-8');
   endif
+endfunction
+
+function mathlab_emit (response, session_directory, nonce, generation, console_helper_path, invocation, kind = 'E', is_ready = (1 == 0))
+  [response, encoded] = mathlab_encode_response (response, is_ready);
+  mathlab_publish (response, encoded, session_directory, nonce, generation, console_helper_path, invocation, kind);
+endfunction
+
+function mathlab_publish (response, encoded, session_directory, nonce, generation, console_helper_path, invocation, kind = 'E')
+  ## Metadata is never multiplexed with console bytes: write a bounded temporary
+  ## file, close it, rename atomically, then place End in the common output pipe.
   if (builtin('strcmp', kind, 'R')); basename = 'interruption'; else; basename = 'response'; endif
   target = [session_directory '/' builtin('sprintf', '%s-%.0f-%.0f.json', basename, invocation, response.id)];
   temporary = [target '.tmp'];

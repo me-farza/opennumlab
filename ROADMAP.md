@@ -4,7 +4,7 @@ Build an open scientific desktop and CLI through independently verified releases
 
 [roadmap.json](roadmap.json) contains the normalized task, dependency, profile and evidence data. This document and that file form a self-contained public plan. Learning links point to primary documentation; illustration links remain external references, not redistributed screenshots.
 
-Jump to [release profiles](#release-profiles), [construction sequence](#execution-overlay), [engineering tasks](#tasks), [advanced designs](#advanced-families) or [learning references](#learning-sources).
+Jump to [release profiles](#release-profiles), [construction sequence](#execution-overlay), [interaction compatibility](#interaction-compatibility), [engineering tasks](#tasks), [advanced designs](#advanced-families) or [learning references](#learning-sources).
 
 <a id="evidence-policy"></a>
 
@@ -128,6 +128,83 @@ Task mapping: [D01](#task-d01), [D02](#task-d02), [D03](#task-d03), [K04](#task-
 Task mapping: [P01](#task-p01), [X01](#task-x01), [X02](#task-x02), [Q02](#task-q02), [Q03](#task-q03), [Q04](#task-q04), [Q05](#task-q05), [Q06](#task-q06), [Q09](#task-q09), [Q10](#task-q10), [Q11](#task-q11), [Q12](#task-q12). Independent prerequisites may follow the task dependency graph.
 
 Acceptance additionally requires the complete selected release-profile closure, actual installed journeys and artifact/source identity. Finishing the package list alone is insufficient.
+
+<a id="interaction-compatibility"></a>
+
+## MATLAB interaction compatibility
+
+Qualify platform keyboard profile and focused-control behavior; preserve text/files and correct engine state. These original requirements are proposed acceptance, not implementation or installed compatibility evidence.
+
+This versioned acceptance overlay applies across the existing tasks. It adds no task or dependency and changes no release-profile requirement. Interaction qualification is **not_run**; documented defaults require a declared release, operating system, keyboard layout and active shortcut profile before they become accepted bindings.
+
+The first proposed interaction slice is Open, Save and Save As, after reference bindings and dialog behavior are accepted. Record exact starting focus/state, trigger, buffer/file/engine effects, final focus, side effects and separate reference/application results. Include cancellation, failed writes, modal dialogs, busy execution, empty selections and extra modifiers. Existing source correctness and graphics work can continue independently.
+
+### File and document lifecycle
+
+Task mapping: [U03](#task-u03), [U05](#task-u05), [U06](#task-u06), [E02](#task-e02), [K04](#task-k04), [Q05](#task-q05), [Q12](#task-q12).
+
+- Qualify Open, Save, Save As, dirty-close and cancellation without changing unrelated documents.
+- Keep menu labels/order, key route, native-dialog ownership and active-file identity consistent with the declared platform profile.
+
+### Editing, language help and navigation
+
+Task mapping: [E01](#task-e01), [E02](#task-e02), [E03](#task-e03), [U02](#task-u02), [U03](#task-u03), [U06](#task-u06), [K04](#task-k04).
+
+- Preserve Unicode text, undo and original source mapping during editing, sections, search and navigation.
+- Qualify completion, help, indentation/comments, references and reviewable rename as explicit supported actions.
+
+### Focus, layout and keyboard profile
+
+Task mapping: [U01](#task-u01), [U05](#task-u05), [U06](#task-u06).
+
+- Actions target the qualified focused control and active document with visible focus at supported scaling.
+- Tile, detach, hide, reset and restore panes without duplicate documents, lost drafts or inaccessible child windows.
+- Qualify active keymaps, modifier specificity and native event delivery before claiming muscle-memory compatibility.
+
+### Command input, history and transcript
+
+Task mapping: [U02](#task-u02), [U06](#task-u06), [K01](#task-k01), [K02](#task-k02), [K03](#task-k03), [K05](#task-k05), [K06](#task-k06).
+
+- Provide multiline editing/submission, history recall/rerun and transcript copy with bounded ordered output.
+- Keep runtime input, drafts, selection evaluation and interruption in their owned request/context.
+
+### Execution and recovery
+
+Task mapping: [E02](#task-e02), [K01](#task-k01), [K03](#task-k03), [K04](#task-k04), [K05](#task-k05), [K06](#task-k06), [U06](#task-u06).
+
+- Run intended current file, selection or section with original diagnostics and source identity.
+- Distinguish no-selection behavior, advance, pause, Stop, Quit and force termination; settle errors before new work.
+
+### Debugger source, frame and control ownership
+
+Task mapping: [D01](#task-d01), [D02](#task-d02), [D03](#task-d03), [K01](#task-k01), [K03](#task-k03), [K04](#task-k04), [K05](#task-k05), [K06](#task-k06), [U06](#task-u06).
+
+- Bind breakpoint intent to original executing source and qualify pause, stepping, Continue and End Debug.
+- Use selected actual frame for locals/watches/evaluation; errors and nested input never accidentally resume or address another scope.
+
+### Workspace and typed variable interaction
+
+Task mapping: [U04](#task-u04), [U06](#task-u06), [V01](#task-v01), [V02](#task-v02), [V03](#task-v03), [K01](#task-k01), [K03](#task-k03).
+
+- Qualify Workspace sort/filter/rename/delete/save-selected with cancellation and stale-binding protection.
+- Inspect exact typed N-D/container/table views and support class-preserving transactional range edits/paste/Undo without partial invalid writes.
+
+### Files, projects and cross-pane actions
+
+Task mapping: [U03](#task-u03), [U05](#task-u05), [U06](#task-u06), [V03](#task-v03), [G01](#task-g01), [G02](#task-g02), [G03](#task-g03), [G04](#task-g04), [G05](#task-g05), [K01](#task-k01), [K03](#task-k03).
+
+- File/project operations and relocation/recovery preserve original content and document identities.
+- Figure/tree/inspector selection, property edits, axes/tips, callbacks and export target correct live objects and focused tools.
+- Keep text, file, workspace and graphics persistence distinct; unsupported actions are explicit.
+
+### Installed qualification and release traceability
+
+Task mapping: [Q05](#task-q05), [Q12](#task-q12), [U06](#task-u06).
+
+- Complete selected keyboard/pointer journeys using identified installed binaries/runtime/profile/targets.
+- Actual source, focus, buffer, file and engine evidence is required; static inventory or an acceptance overlay is not a pass.
+
+Reference documentation: [Official reference 1](https://www.mathworks.com/help/matlab/matlab_prog/editor-keyboard-shortcuts.html); [Official reference 2](https://www.mathworks.com/help/matlab/matlab_prog/save-and-back-up-code.html); [Official reference 3](https://www.mathworks.com/help/matlab/matlab_env/manage-files-and-folders.html); [Official reference 4](https://www.mathworks.com/help/matlab/matlab_env/accessibility-use-a-screen-reader-to-access-matlab.html); [Official reference 5](https://www.mathworks.com/help/matlab/matlab_env/accessibility-use-keyboard-shortcuts-to-navigate-matlab.html); [Official reference 6](https://www.mathworks.com/help/matlab/matlab_env/keyboard-shortcuts.html); [Official reference 7](https://www.mathworks.com/help/matlab/matlab_env/change-the-desktop-layout.html); [Official reference 8](https://www.mathworks.com/help/matlab/ref/variableseditor.html); [Official reference 9](https://www.mathworks.com/help/matlab/matlab_prog/debugging-process-and-features.html); [Official reference 10](https://www.mathworks.com/help/matlab/creating_plots/interactively-explore-plotted-data.html); [Official reference 11](https://www.mathworks.com/help/matlab/creating_plots/create-callbacks-for-graphics-objects.html); [Official reference 12](https://www.mathworks.com/help/matlab/ref/propertyinspector.html); [Official reference 13](https://www.mathworks.com/help/matlab/matlab_prog/create-projects.html).
 
 <a id="dependency-rules"></a>
 

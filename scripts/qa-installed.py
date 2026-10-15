@@ -33,6 +33,15 @@ RELEASE_PATH = "Contents/Resources/release.json"
 CHECKSUM_PATH = "Contents/Resources/checksums.sha256"
 NATIVE_NAMES = ("mathlab_debug_bridge.oct", "mathlab_scope_bridge.oct",
                 "mathlab_input_bridge.oct", "runtime-version.txt")
+VALUE_NAME = "mathlab_value_bridge.oct"
+VALUE_PATH = "Contents/Resources/native/" + VALUE_NAME
+VALUE_CAPABILITY = "dense_complex_native_components.v1"
+VALUE_REQUIRED_CAPABILITIES = {"typed_nd_page.v1", "atomic_range_edit.v1", VALUE_CAPABILITY}
+VALUE_PROTOCOL = {"protocol": "mathlab-value", "version": 1, "dense_complex_components": True,
+                  "max_cells": 2000, "max_rank": 32, "max_replace_leaf_bytes": 134217728}
+REQUIRED_ADAPTER_PROFILE = {"schema_version": 1, "name": "four-adapter-value-v1"}
+OMITTED_ADAPTER_PROFILE = {"schema_version": 1, "name": "native-omitted-v1"}
+OMITTED_VALUE_COMPONENT = {"status": "not_included", "reason": "native_profile_not_requested"}
 CHECKS = ("bundle_identity", "cli_version", "doctor", "missing_runtime_diagnostic",
           "numerical_original_script", "original_source_error", "persistent_repl",
           "graphics_png", "getting_started_example", "mat_self_roundtrip",
@@ -41,6 +50,7 @@ PENDING = (
     ("desktop_ui", "Actual desktop editing, variable inspection and figure interaction were not exercised."),
     ("stop_and_recovery", "No Stop, interruption or desktop recovery journey was exercised."),
     ("debugger", "No breakpoint, stepping, paused evaluation or debugger recovery was exercised."),
+    ("packaged_value_read_edit_history", "Doctor only establishes adapter prerequisites; packaged checked reads, edits, Undo and Redo were not exercised."),
     ("read_only_resources_and_relocation", "Bundle bytes were checked for changes; read-only installation and relocation were not exercised."),
     ("clean_machine_installation", "This uses an existing external runtime and does not establish clean-machine installation or dependency provisioning."),
     ("lifecycle", "Install, upgrade, rollback and uninstall were not exercised."),
@@ -111,9 +121,117 @@ def relative_name(value):
 def read_json(path, maximum=32 * 1024 * 1024):
     require(path.is_file() and path.stat().st_size <= maximum, "Missing or oversized JSON: " + str(path))
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
     except (ValueError, UnicodeError) as error:
         raise QAFailure("Invalid JSON in " + str(path)) from error
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        require(key not in result, "Duplicate JSON field: " + key)
+        result[key] = value
+    return result
+
+
+def valid_sha256(value):
+    return isinstance(value, str) and HEX256.fullmatch(value) is not None
+
+
+def capability_names(value):
+    require(isinstance(value, list) and all(isinstance(name, str) for name in value)
+            and len(set(value)) == len(value), "Worker capabilities must be unique strings")
+    return set(value)
+
+
+def observed_absolute_path(value, basename=None):
+    if not isinstance(value, str) or not value or any(ord(c) < 32 for c in value):
+        return False
+    path = Path(value)
+    return (path.is_absolute() and ".." not in path.parts and str(path) == value
+            and (basename is None or path.name == basename))
+
+
+def inspect_value_component(bundle, actual, build):
+    """Check the schema-1 additive contract without trusting a live helper import."""
+    native = build["native"]
+    artifacts, protocols = native.get("artifact_sha256", {}), native.get("protocols", {})
+    require(isinstance(artifacts, dict) and isinstance(protocols, dict), "Malformed native artifact/protocol identity")
+    value_paths = [path.relative_to(bundle).as_posix() for path in bundle.rglob("*")
+                   if path.name.lower() == VALUE_NAME]
+    if "adapter_profile" not in native:
+        require(not value_paths and not any(name.lower() == VALUE_NAME for name in artifacts)
+                and not any(name.lower() == "value" for name in protocols)
+                and "value_component" not in native and "worker_observation" not in native,
+                "Legacy adapter manifest must not bundle or declare a value adapter")
+        return
+    profile = native["adapter_profile"]
+    require(isinstance(profile, dict) and set(profile) == {"schema_version", "name"}
+            and type(profile["schema_version"]) is int and profile["schema_version"] == 1
+            and profile["name"] in (REQUIRED_ADAPTER_PROFILE["name"], OMITTED_ADAPTER_PROFILE["name"]),
+            "Unknown or malformed native adapter_profile declaration")
+    modules = {name for name in actual if PurePosixPath(name).suffix.lower() == ".oct"}
+    if profile == OMITTED_ADAPTER_PROFILE:
+        require(native.get("status") == "not_included" and isinstance(native.get("reason"), str)
+                and native["reason"].strip() and not artifacts and not protocols
+                and "worker_observation" not in native and native.get("value_component") == OMITTED_VALUE_COMPONENT
+                and not modules and not value_paths,
+                "Omitted native profile must not bundle or declare native/value adapters")
+        return
+    require(native.get("status") == "enabled_protocol_load_passed", "Required value profile did not pass native protocol loading")
+    required_names = set(NATIVE_NAMES) | {VALUE_NAME}
+    require(value_paths == [VALUE_PATH] and modules == {"Contents/Resources/native/" + name
+            for name in required_names if name.endswith(".oct")},
+            "Required value profile needs exactly four canonical native modules")
+    require(set(artifacts) == required_names and all(valid_sha256(value) for value in artifacts.values()),
+            "Required value profile needs all four module hashes and runtime-version hash")
+    for name in required_names:
+        path = "Contents/Resources/native/" + name
+        require(path in actual and actual[path]["size"] > 0 and artifacts[name] == actual[path]["sha256"],
+                "Required native artifact is missing or differs: " + name)
+    require(native.get("value_component") == {"status": "required", "path": VALUE_PATH,
+            "capability": VALUE_CAPABILITY, "sha256": artifacts[VALUE_NAME]},
+            "Required value component declaration disagrees with its path/hash/capability")
+    runtime_hash = native.get("runtime_executable_sha256")
+    require(valid_sha256(runtime_hash), "Required value profile needs the selected runtime executable SHA-256")
+    version = native.get("runtime_version")
+    require(isinstance(version, str) and re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[+~-][A-Za-z0-9.+_~-]*)?", version)
+            and isinstance(native.get("sdk"), dict) and native["sdk"].get("OCTAVE_VERSION") == version
+            and (bundle / "Contents/Resources/native/runtime-version.txt").read_text().strip() == version,
+            "Required value profile runtime/SDK/version marker disagree")
+    require(set(protocols) == {"debug", "scope", "input", "value"}, "Required value profile needs four observed protocols")
+    for name, protocol_name, expected_version in (("debug", "mathlab-debugger", 4), ("scope", "mathlab-scope", 2),
+                                                  ("input", "mathlab-input", 1)):
+        protocol = protocols[name]
+        require(isinstance(protocol, dict) and protocol.get("protocol") == protocol_name
+                and type(protocol.get("version")) is int and protocol["version"] == expected_version,
+                "Required native protocol disagrees: " + name)
+    value_protocol = protocols["value"]
+    require(isinstance(value_protocol, dict) and set(value_protocol) == set(VALUE_PROTOCOL)
+            and all(type(value_protocol[key]) is type(expected) and value_protocol[key] == expected
+                    for key, expected in VALUE_PROTOCOL.items()),
+            "Value adapter must report the exact mathlab-value v1 protocol and limit profile")
+    links = build.get("linked_libraries")
+    require(isinstance(links, dict) and all(isinstance(links.get(name), str) and links[name].strip()
+            for name in required_names if name.endswith(".oct")),
+            "Required value profile needs linked-library inspection for all four modules")
+    observation = native.get("worker_observation")
+    require(isinstance(observation, dict) and set(observation) == {
+        "method", "ready", "cli_executable_sha256", "value_adapter", "runtime", "worker_capabilities",
+        "module_sha256", "runtime_executable_sha256"},
+        "Required value profile needs an identified worker observation")
+    capabilities = capability_names(observation["worker_capabilities"])
+    require(observation["method"] == "built-cli-doctor" and observation["ready"] is True
+            and valid_sha256(observation["cli_executable_sha256"])
+            and observation["cli_executable_sha256"] == build["executable_sha256"]["mathlab"]
+            and observation["cli_executable_sha256"] == actual[CLI_PATH]["sha256"]
+            and VALUE_REQUIRED_CAPABILITIES.issubset(capabilities)
+            and observation["module_sha256"] == artifacts[VALUE_NAME]
+            and observation["runtime_executable_sha256"] == runtime_hash,
+            "Required value profile worker capability or runtime/module identity disagrees")
+    require(observed_absolute_path(observation["value_adapter"], VALUE_NAME)
+            and observed_absolute_path(observation["runtime"]),
+            "Required value profile needs canonical absolute observed runtime/value paths")
 
 
 def inventory(root):
@@ -204,6 +322,7 @@ def inspect_bundle(bundle):
                     "Missing or mismatched advertised native adapter: " + name)
     else:
         require(not any(name.startswith(native_prefix) for name in actual), "Undeclared native files in installed payload")
+    inspect_value_component(bundle, actual, build)
     return manifest, actual, included
 
 
@@ -342,7 +461,7 @@ def execution(value, project):
 
 def parse_json(text):
     try:
-        return json.loads(text)
+        return json.loads(text, object_pairs_hook=unique_object)
     except ValueError as error:
         raise QAFailure("CLI stdout is not one clean JSON record") from error
 
@@ -423,7 +542,8 @@ class Acceptance:
                        "pending_release_journeys": [{"id": name, "status": "not_run", "required_for_release": True,
                                                      "reason": reason} for name, reason in PENDING],
                        "qualification": {"cli_subset": "not_run", "release_qualified": False,
-                                         "native_input_coverage": "not_run"},
+                                         "native_input_coverage": "not_run",
+                                         "packaged_value_read_edit_history": "not_run"},
                        "limitations": ["CLI success does not establish desktop/UI, Stop/debugger, read-only installation or clean-machine readiness.",
                                        "MAT evidence is an Octave writer/reader self-round-trip, not MATLAB file interchange.",
                                        "Integrity hashes are consistency checks, not a signature or independent source audit.",
@@ -491,11 +611,23 @@ class Acceptance:
             require(runtime == Path(self.octave).resolve(), "Doctor used a different runtime than --octave")
         identity = {"path": str(runtime), "sha256": digest(runtime), "version": value.get("runtime_version"),
                     "packages": value.get("packages", [])}
+        capabilities = capability_names(value.get("worker_capabilities", []))
+        if self.value_required:
+            require(observed_absolute_path(value.get("runtime")), "Required value doctor did not identify an absolute runtime path")
+            require(value.get("value_adapter") == str((self.bundle / VALUE_PATH).resolve()),
+                    "Doctor did not activate the canonical installed value adapter")
+            require(VALUE_REQUIRED_CAPABILITIES.issubset(capabilities),
+                    "Doctor did not negotiate all required value worker capabilities")
+        else:
+            require(value.get("value_adapter") is None and VALUE_CAPABILITY not in capabilities,
+                    "Omitted or legacy profile unexpectedly activated a value adapter/capability")
         if self.native:
             for key, name in (("input_adapter", "mathlab_input_bridge.oct"), ("scope_adapter", "mathlab_scope_bridge.oct")):
                 require(Path(value.get(key) or "").resolve() == self.bundle / "Contents/Resources/native" / name,
                         "Doctor did not activate the bundled " + key)
             expected_runtime = self.manifest["build"]["native"].get("runtime_executable_sha256")
+            if self.value_required:
+                require(valid_sha256(expected_runtime), "Required value profile lacks its runtime executable fingerprint")
             if expected_runtime:
                 require(identity["sha256"] == expected_runtime, "External runtime differs from the native build fingerprint")
         self.report["runtime"] = identity
@@ -609,13 +741,14 @@ class Acceptance:
             def identity():
                 nonlocal before
                 self.manifest, before, self.native = inspect_bundle(self.bundle)
+                self.value_required = self.manifest["build"]["native"].get("adapter_profile") == REQUIRED_ADAPTER_PROFILE
                 self.report["provenance"] = {"product": self.manifest.get("product"), "profile": self.manifest["profile"],
                     "version": self.manifest["version"], "source_commit": self.manifest["source"]["commit"],
                     "source_export_sha256": self.manifest["source"]["export_sha256"],
                     "release_json_sha256": before[RELEASE_PATH]["sha256"],
                     "checksums_sha256": before[CHECKSUM_PATH]["sha256"],
                     "executable_sha256": self.manifest["build"]["executable_sha256"],
-                    "native_included": self.native}
+                    "native_included": self.native, "value_component_required": self.value_required}
                 for source_name, output_name in ((RELEASE_PATH, "release.json"), (CHECKSUM_PATH, "checksums.sha256")):
                     shutil.copyfile(self.bundle / source_name, self.directory / output_name)
                 return self.report["provenance"]
@@ -630,7 +763,8 @@ class Acceptance:
                     self.project.mkdir()
                     self.report["temporary_project"] = str(self.project)
                     environment = os.environ.copy()
-                    for key in ("MATHLAB_DEBUG_BRIDGE", "MATHLAB_SCOPE_BRIDGE", "MATHLAB_INPUT_BRIDGE", "MATHLAB_PROJECT_DIR"):
+                    for key in ("MATHLAB_DEBUG_BRIDGE", "MATHLAB_SCOPE_BRIDGE", "MATHLAB_INPUT_BRIDGE",
+                                "MATHLAB_VALUE_BRIDGE", "MATHLAB_PROJECT_DIR"):
                         environment.pop(key, None)
                     for key, name in (("HOME", "home"), ("TMPDIR", "tmp"), ("TMP", "tmp"), ("TEMP", "tmp"),
                                       ("XDG_CACHE_HOME", "cache"), ("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data")):
@@ -644,6 +778,8 @@ class Acceptance:
                         self.report["checks"]["authentic_input"]["required_for_cli_subset"] = True
                     else:
                         self.report["checks"]["authentic_input"]["reason"] = "Unsupported in this installed profile: input adapter not included; no native execution claimed"
+                    if self.value_required:
+                        environment["MATHLAB_VALUE_BRIDGE"] = str((self.bundle / VALUE_PATH).resolve())
                     self.runner = Runner(self.directory, self.project, environment, self.timeout, self.output_limit)
                     self.report["commands"] = self.runner.commands
                     def version():

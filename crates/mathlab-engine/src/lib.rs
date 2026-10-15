@@ -9,6 +9,17 @@ mod input;
 mod protocol;
 #[cfg(test)]
 mod protocol_startup_tests;
+#[cfg(all(test, unix))]
+mod value_bridge_recovery_tests;
+pub mod value_edit;
+#[cfg(all(test, unix))]
+mod value_edit_cancel_tests;
+#[cfg(all(test, unix))]
+mod value_edit_lifetime_tests;
+#[cfg(all(test, unix))]
+mod value_edit_submission_tests;
+#[cfg(all(test, unix))]
+mod value_edit_worker_tests;
 mod value_page;
 use console::{ConsoleCapture, ConsoleHub, ConsoleTransport, MergedPipe, TransportEvent};
 pub use console::{ConsoleEvent, ConsoleEventKind, ConsoleSubscription};
@@ -44,6 +55,8 @@ use tempfile::TempDir;
 
 const WORKER: &str = include_str!("../../../octave/mathlab_worker.m");
 const VALUE_PAGE_WORKER: &str = include_str!("../../../octave/mathlab_value_page.m");
+const VALUE_EDIT_WORKER: &str = include_str!("../../../octave/mathlab_value_edit.m");
+const READY_JSON_WORKER: &str = include_str!("../../../octave/mathlab_ready_json.m");
 const SCOPE_REGISTRY: &str = r#"## SPDX-License-Identifier: GPL-3.0-or-later
 function varargout = mathlab_scope_register (key, handles, configuration = [], original_source = [])
   persistent keys = {};
@@ -101,6 +114,7 @@ pub enum Error {
     Timeout,
     LimitExceeded(String),
     ValuePage(ValuePageError),
+    ValueEdit(value_edit::EditError),
 }
 
 impl fmt::Display for Error {
@@ -113,6 +127,7 @@ impl fmt::Display for Error {
             Self::ProcessExited(details) => write!(formatter, "Octave process exited. {details}"),
             Self::Timeout => formatter.write_str("Octave response timed out; restart the session."),
             Self::ValuePage(error) => write!(formatter, "{error}"),
+            Self::ValueEdit(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -134,6 +149,12 @@ impl From<serde_json::Error> for Error {
 impl From<ValuePageError> for Error {
     fn from(error: ValuePageError) -> Self {
         Self::ValuePage(error)
+    }
+}
+
+impl From<value_edit::EditError> for Error {
+    fn from(error: value_edit::EditError) -> Self {
+        Self::ValueEdit(error)
     }
 }
 
@@ -383,6 +404,8 @@ pub struct Engine {
     debugger: Option<Debugger>,
     debug_session: Option<TempDir>,
     scope_bridge: Option<PathBuf>,
+    value_bridge: Option<PathBuf>,
+    edit_history_uncertain: bool,
 }
 
 impl Engine {
@@ -405,7 +428,8 @@ impl Engine {
         let session = tempfile::Builder::new()
             .prefix("mathlab-session-")
             .tempdir()?;
-        let worker = format!("{worker}\n{VALUE_PAGE_WORKER}");
+        let worker =
+            format!("{worker}\n{VALUE_PAGE_WORKER}\n{VALUE_EDIT_WORKER}\n{READY_JSON_WORKER}");
         fs::write(session.path().join("mathlab_worker.m"), worker)?;
         fs::create_dir(session.path().join("registry"))?;
         fs::write(
@@ -443,6 +467,8 @@ impl Engine {
             debugger: None,
             debug_session: None,
             scope_bridge: None,
+            value_bridge: None,
+            edit_history_uncertain: false,
         };
         engine.spawn()?;
         if let Some(scope_bridge) = std::env::var_os("MATHLAB_SCOPE_BRIDGE") {
@@ -450,6 +476,9 @@ impl Engine {
         }
         if let Some(input_bridge) = std::env::var_os("MATHLAB_INPUT_BRIDGE") {
             engine.enable_input_adapter(Path::new(&input_bridge))?;
+        }
+        if let Some(value_bridge) = std::env::var_os("MATHLAB_VALUE_BRIDGE") {
+            engine.enable_value_bridge(Path::new(&value_bridge))?;
         }
         Ok(engine)
     }
@@ -506,6 +535,14 @@ impl Engine {
 
     pub fn process_id(&self) -> Option<u32> {
         self.child.lock().ok()?.as_ref().map(Child::id)
+    }
+
+    /// Whether this engine still owns an open transport. A false result requires
+    /// restart; true is not a process-health, idle or request-success guarantee.
+    /// This preserves lifecycle status when an ambiguous edit wraps its original
+    /// transport error as `UncertainCommit` without exposing string parsing.
+    pub fn is_transport_open(&self) -> bool {
+        self.transport.is_some()
     }
 
     /// Enable authentic, independent input replies before running user source.
@@ -627,6 +664,59 @@ impl Engine {
             Some(COMMAND_TIMEOUT),
         )?;
         Ok(())
+    }
+
+    /// Enable optional exact dense-complex component access for this Octave ABI.
+    /// The adapter is a narrow native helper, not a Rust numerical evaluator.
+    pub fn enable_value_bridge(&mut self, bridge_path: &Path) -> Result<()> {
+        let bridge_path = fs::canonicalize(bridge_path)?;
+        if !bridge_path.is_file()
+            || bridge_path
+                .extension()
+                .is_none_or(|extension| extension != "oct")
+        {
+            return Err(Error::Protocol(
+                "Value adapter must be a compiled .oct file.".into(),
+            ));
+        }
+        if self.value_bridge.as_ref() == Some(&bridge_path) {
+            // A failed restart can retain the configured path after a fresh
+            // worker advertised no adapter. Configuration alone is not proof
+            // that this generation has successfully loaded the helper.
+            return self.require_capability("dense_complex_native_components.v1");
+        }
+        if self.value_bridge.is_some() {
+            return Err(Error::Protocol(
+                "A value adapter is already loaded. Start a new engine session to change the adapter."
+                    .into(),
+            ));
+        }
+        self.install_value_bridge(&bridge_path)?;
+        self.value_bridge = Some(bridge_path);
+        Ok(())
+    }
+
+    pub fn value_bridge_path(&self) -> Option<&Path> {
+        self.value_bridge.as_deref()
+    }
+
+    fn retire_value_bridge_capability(&mut self) {
+        if let Some(capabilities) = self.capabilities.as_mut() {
+            capabilities
+                .capabilities
+                .retain(|capability| capability != "dense_complex_native_components.v1");
+        }
+    }
+
+    fn install_value_bridge(&mut self, bridge_path: &Path) -> Result<()> {
+        let (ready, _) = self.request(
+            json!({"command":"enable_value_bridge","bridge_path":bridge_path}),
+            Some(COMMAND_TIMEOUT),
+        )?;
+        // Enabling the helper changes the ordinary worker's optional capability
+        // set. Validate the complete current context/readiness envelope again.
+        self.accept_ready(&ready)?;
+        self.require_capability("dense_complex_native_components.v1")
     }
 
     fn install_debugger(&mut self, bridge_path: &Path) -> Result<()> {
@@ -1107,11 +1197,16 @@ impl Engine {
     /// declared pure reads and are conservatively revoked before all other jobs,
     /// including jobs which fail or are interrupted after partial mutations.
     pub fn workspace_snapshot(&mut self) -> Result<WorkspaceSnapshot> {
+        self.workspace_snapshot_command("workspace_snapshot")
+    }
+
+    fn workspace_snapshot_command(&mut self, command: &str) -> Result<WorkspaceSnapshot> {
         self.require_capability("binding_snapshot.v1")?;
-        let (value, _) = self.request(
-            json!({"command":"workspace_snapshot"}),
-            Some(COMMAND_TIMEOUT),
-        )?;
+        let (value, _) = self.request(json!({"command":command}), Some(COMMAND_TIMEOUT))?;
+        self.parse_workspace_snapshot(value)
+    }
+
+    fn parse_workspace_snapshot(&self, value: Value) -> Result<WorkspaceSnapshot> {
         let snapshot: WorkspaceSnapshot = serde_json::from_value(value)?;
         self.validate_context(&snapshot.context)?;
         for entry in &snapshot.variables {
@@ -1123,6 +1218,159 @@ impl Engine {
             }
         }
         Ok(snapshot)
+    }
+
+    /// A submitted edit with an ambiguous outcome disables subsequent edits and
+    /// history operations until explicit reset or restart. Reads remain usable.
+    pub fn has_value_edit_uncertainty(&self) -> bool {
+        self.edit_history_uncertain
+    }
+
+    /// Explicitly retire all edit history and return fresh binding tokens.
+    /// Numerical values are preserved. This does not retry the uncertain edit.
+    pub fn reset_value_edit_history(&mut self) -> Result<WorkspaceSnapshot> {
+        self.require_capability(value_edit::CAP_ATOMIC_RANGE_EDIT)?;
+        self.require_capability("binding_snapshot.v1")?;
+        Self::validate_response_limit(MAX_RESPONSE_BYTES)?;
+        // Local validation/mailbox failures cannot have reset the worker. In
+        // particular they must preserve an already latched ambiguous history.
+        let id = self.send_request(json!({"command":"reset_value_edit_history"}), true)?;
+        let result = self
+            .finish_request(id, Some(COMMAND_TIMEOUT))
+            .and_then(|(value, _)| self.parse_workspace_snapshot(value));
+        match result {
+            Ok(snapshot) => {
+                self.edit_history_uncertain = false;
+                Ok(snapshot)
+            }
+            Err(error) => {
+                self.edit_history_uncertain = true;
+                Err(value_edit::EditError::UncertainCommit(error.to_string()).into())
+            }
+        }
+    }
+
+    /// Commit one same-class rectangle under the original full binding token.
+    /// All cells are validated before one root assignment. No automatic retry.
+    pub fn write_value_range_checked(
+        &mut self,
+        request: &value_edit::RangeEditRequest,
+    ) -> Result<value_edit::RangeEditReceipt> {
+        self.ensure_value_edit_certain()?;
+        request.validate_decode()?;
+        let mut payload = serde_json::to_value(request)?;
+        payload["command"] = json!("write_value_range_checked");
+        let expectation = value_edit::ReceiptExpectation {
+            operation: value_edit::EditOperation::Write,
+            previous: request.path.root.clone(),
+            transaction_id: None,
+            history_epoch: None,
+        };
+        self.submit_value_edit(payload, expectation, value_edit::MAX_EDIT_REQUEST_BYTES)
+    }
+
+    pub fn undo_value_edit_checked(
+        &mut self,
+        request: &value_edit::HistoryRequest,
+    ) -> Result<value_edit::RangeEditReceipt> {
+        self.restore_value_edit(request, value_edit::EditOperation::Undo)
+    }
+
+    pub fn redo_value_edit_checked(
+        &mut self,
+        request: &value_edit::HistoryRequest,
+    ) -> Result<value_edit::RangeEditReceipt> {
+        self.restore_value_edit(request, value_edit::EditOperation::Redo)
+    }
+
+    fn restore_value_edit(
+        &mut self,
+        request: &value_edit::HistoryRequest,
+        operation: value_edit::EditOperation,
+    ) -> Result<value_edit::RangeEditReceipt> {
+        self.ensure_value_edit_certain()?;
+        request.validate()?;
+        let mut payload = serde_json::to_value(request)?;
+        payload["command"] = json!(match operation {
+            value_edit::EditOperation::Undo => "undo_value_edit_checked",
+            value_edit::EditOperation::Redo => "redo_value_edit_checked",
+            value_edit::EditOperation::Write => unreachable!("private history operation"),
+        });
+        self.submit_value_edit(
+            payload,
+            value_edit::ReceiptExpectation {
+                operation,
+                previous: request.expected.clone(),
+                transaction_id: Some(request.transaction_id),
+                history_epoch: Some(request.history_epoch),
+            },
+            value_edit::MAX_HISTORY_REQUEST_BYTES,
+        )
+    }
+
+    fn ensure_value_edit_certain(&self) -> Result<()> {
+        self.require_capability(value_edit::CAP_ATOMIC_RANGE_EDIT)?;
+        if self.edit_history_uncertain {
+            return Err(value_edit::EditError::UncertainCommit(
+                "explicitly reset edit history or restart before another write/undo/redo".into(),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn submit_value_edit(
+        &mut self,
+        payload: Value,
+        expectation: value_edit::ReceiptExpectation,
+        request_budget: usize,
+    ) -> Result<value_edit::RangeEditReceipt> {
+        // Public DTO validators bounded every collection before this encoding.
+        value_edit::bounded(
+            "edit request bytes",
+            serde_json::to_vec(&payload)?.len(),
+            request_budget,
+        )?;
+        let response_limit = value_edit::MAX_EDIT_RECEIPT_BYTES + 4096;
+        Self::validate_response_limit(response_limit)?;
+        // Publication is the uncertainty boundary. An error returned by
+        // send_request occurs before the atomic mailbox rename succeeded.
+        let id = self.send_request(payload, true)?;
+        let (raw, _) = self
+            .finish_request_raw(id, Some(COMMAND_TIMEOUT), response_limit)
+            .map_err(|error| self.value_edit_failure(error))?;
+        let mut settled = expectation.previous.context.clone();
+        settled.worker_id.clone_from(&self.response_prefix);
+        settled.generation = self.generation;
+        settled.invocation = self.invocation;
+        settled.revision = settled
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| self.value_edit_failure(value_edit::EditError::Exhausted.into()))?;
+        let receipt = value_edit::decode_receipt_json(raw.get().as_bytes(), &expectation, &settled)
+            .map_err(|error| self.value_edit_failure(error.into()))?;
+        self.validate_context(&receipt.token.context)
+            .map_err(|error| self.value_edit_failure(error))?;
+        Ok(receipt)
+    }
+
+    fn value_edit_failure(&mut self, error: Error) -> Error {
+        if let Error::Worker(worker) = &error {
+            let id = worker.identifier.as_str();
+            // The owned worker tags any post-revocation exception separately.
+            // These identifiers therefore represent known precommit rejection.
+            if matches!(
+                id,
+                "MathLab:StaleBinding" | "MathLab:VariableName" | "MathLab:VariableNotFound"
+            ) || id.starts_with("MathLab:ValuePage")
+                || id.starts_with("MathLab:ValueBridge")
+                || (id.starts_with("MathLab:ValueEdit") && id != "MathLab:ValueEditUncertain")
+            {
+                return error;
+            }
+        }
+        self.edit_history_uncertain = true;
+        value_edit::EditError::UncertainCommit(error.to_string()).into()
     }
 
     /// Read a lossless primitive N-D page through a structured container path.
@@ -1340,7 +1588,9 @@ impl Engine {
         if prepared_directory.is_dir() {
             fs::remove_dir_all(prepared_directory)?;
         }
-        self.spawn()
+        self.spawn()?;
+        self.edit_history_uncertain = false;
+        Ok(())
     }
 
     fn resolve_session_path(&self, path: &Path) -> Result<PathBuf> {
@@ -1353,6 +1603,7 @@ impl Engine {
     }
 
     fn spawn(&mut self) -> Result<()> {
+        self.retire_value_bridge_capability();
         let _ = fs::remove_file(self.session.path().join("request.json"));
         let _ = fs::remove_file(self.session.path().join("request.tmp"));
         self.generation += 1;
@@ -1422,6 +1673,9 @@ impl Engine {
         if let Some(bridge_path) = self.input_bridge.clone() {
             self.install_input_adapter(&bridge_path)?;
         }
+        if let Some(bridge_path) = self.value_bridge.clone() {
+            self.install_value_bridge(&bridge_path)?;
+        }
         Ok(())
     }
 
@@ -1441,6 +1695,11 @@ impl Engine {
     }
 
     fn send_request(&mut self, mut request: Value, active: bool) -> Result<u64> {
+        if !self.is_transport_open() {
+            return Err(Error::Protocol(
+                "Engine transport is closed; restart the session.".into(),
+            ));
+        }
         let id = self.next_id;
         self.next_id += 1;
         request["id"] = json!(id);
@@ -1702,9 +1961,17 @@ impl Engine {
                     let (ready, ready_capture) =
                         self.read_response_raw(0, Some(STARTUP_TIMEOUT))?;
                     if !ready.ok {
-                        return Err(ready.error.map(Error::Worker).unwrap_or_else(|| {
-                            Error::Protocol("Recovery worker failed without error details".into())
-                        }));
+                        // Recovery can follow an already-committed edit. A
+                        // loader's ValueBridge/ValuePage identifier is therefore
+                        // not evidence of precommit rejection of that edit.
+                        let details = ready.error.map_or_else(
+                            || "without error details".to_owned(),
+                            |error| format!("{}: {}", error.identifier, error.message),
+                        );
+                        let _ = self.terminate_transport();
+                        return Err(Error::Protocol(format!(
+                            "Recovery worker failed; the session was terminated: {details}"
+                        )));
                     }
                     let ready_value: Value =
                         serde_json::from_str(ready.result.get()).inspect_err(|_| {
@@ -1744,10 +2011,7 @@ impl Engine {
                         .flatten()
                         .is_some();
                     if exited {
-                        self.input.close();
-                        if let Some(transport) = self.transport.as_mut() {
-                            transport.stop();
-                        }
+                        self.terminate_transport()?;
                         return Err(Error::ProcessExited(format!(
                             "Worker exited before a completion fence. {}",
                             self.console.diagnostics(self.generation)
@@ -1810,6 +2074,7 @@ impl Engine {
     }
 
     fn resume_worker(&mut self) -> Result<()> {
+        self.retire_value_bridge_capability();
         self.invocation += 1;
         self.input
             .begin_generation(self.generation, self.invocation)?;
@@ -1833,8 +2098,14 @@ impl Engine {
             .map(octave_string)
             .transpose()?
             .unwrap_or_else(|| "''".into());
+        let value_path = self
+            .value_bridge
+            .as_deref()
+            .map(octave_string)
+            .transpose()?
+            .unwrap_or_else(|| "''".into());
         let command = format!(
-            "addpath ({session_path}); mathlab_worker ({session_path}, false, {enabled}, {scope_path}, {response_prefix}, {}, {helper_path}, {}, {input_path});\n",
+            "addpath ({session_path}); mathlab_worker ({session_path}, false, {enabled}, {scope_path}, {response_prefix}, {}, {helper_path}, {}, {input_path}, {value_path});\n",
             self.generation, self.invocation
         );
         let mut guard = self
@@ -1851,9 +2122,10 @@ impl Engine {
     }
 
     fn terminate_transport(&mut self) -> Result<()> {
+        self.retire_value_bridge_capability();
         self.input.close();
         let result = self.cancellation_handle().terminate();
-        if let Some(transport) = self.transport.as_mut() {
+        if let Some(mut transport) = self.transport.take() {
             transport.stop();
         }
         result

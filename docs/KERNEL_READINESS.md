@@ -11,6 +11,16 @@ and deterministic batch fixtures. It is not a complete MATLAB replacement or a
 Rust numerical interpreter. New product work can build on the session API while
 keeping the execution backend and the compatibility boundaries explicit.
 
+Later dispatch audit (October 15): a project `builtin.m` can replace the bare
+dispatcher and simple `@builtin` handles used by internal helpers. Startup,
+base-workspace query strings, the separate scope registry and Stop re-entry
+need a shared trusted function-object boundary; a worker-local binding alone
+is insufficient. Earlier selected collision/object-trap passes remain evidence
+for their exact cases, not protection against this transitive defect. See the
+[workspace qualification](WORKSPACE_PROTOCOL.md#dispatcher-identity-qualification).
+The native graphics standalone probe demonstrates an actual retained intrinsic
+object for its cases; integrated startup and lifecycle qualification is pending.
+
 The later [workspace protocol](WORKSPACE_PROTOCOL.md) adds ordinary capability
 negotiation, exact binding-context counters, safe metadata and revision-checked
 primitive inspection/editing. Object dimensions/bytes can be explicitly unknown;

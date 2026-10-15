@@ -3,7 +3,7 @@
 ## It is not installed as a separately shadowable helper on the load path.
 ## The dispatch owner must check request.path.root against its current binding
 ## context immediately before calling this helper in the same ordinary operation.
-function result = mathlab_value_page (request)
+function result = mathlab_value_page (request, value_bridge = [])
   token = mathlab_page_token (request.path.root);
   value = mathlab_named_value (token.name);
   steps = mathlab_page_steps (request.path.steps);
@@ -94,31 +94,46 @@ function result = mathlab_value_page (request)
     builtin('error', 'MathLab:ValuePageUnsupported', 'Complex typed pages require single or double values.');
   endif
 
-  ## Index only after proving primitive type and every bound. No full-source
-  ## flattening or sparse densification is performed. A selected sparse page has
-  ## at most 2000 logical cells, and find() operates on that page only.
-  page = value(subscripts{:});
-  if (sparse_value)
-    [local_rows, local_columns, components] = builtin('find', page);
-    encoded_rows = builtin('cell', 1, builtin('numel', local_rows));
-    encoded_columns = builtin('cell', 1, builtin('numel', local_columns));
-    for index = 1:builtin('numel', local_rows)
-      encoded_rows{index} = local_rows(index);
-      encoded_columns{index} = local_columns(index);
-    endfor
-    storage = 'sparse';
-    data = builtin('struct', 'kind', 'sparse_coo', 'rows', {encoded_rows}, ...
-                   'columns', {encoded_columns});
-  else
-    components = page(:);
+  ## Dense complex values MUST cross the native component route before any
+  ## complex subsref, flattening or scalar narrowing can erase imaginary -0.
+  if (complex_value && ! sparse_value)
+    if (! builtin('is_function_handle', value_bridge))
+      builtin('error', 'MathLab:ValuePagePrecisionUnavailable', ...
+              'Dense complex pages require the verified native component adapter.');
+    endif
+    parts = value_bridge('read_components', value, subscripts);
+    mathlab_value_pair_validate (parts, type, rows, columns, builtin('true'), 'MathLab:ValuePageInvariant');
     storage = 'dense';
-    data = builtin('struct', 'kind', 'dense');
-  endif
-  data.real = mathlab_page_components (builtin('real', components), type);
-  if (complex_value)
-    data.imag = mathlab_page_components (builtin('imag', components), type);
+    data = builtin('struct', 'kind', 'dense', ...
+                   'real', {mathlab_page_components(parts.real, type)}, ...
+                   'imag', {mathlab_page_components(parts.imag, type)});
   else
-    data.imag = {};
+    ## Index only after proving primitive type and every bound. No full-source
+    ## flattening or sparse densification is performed. A selected sparse page has
+    ## at most 2000 logical cells, and find() operates on that page only.
+    page = value(subscripts{:});
+    if (sparse_value)
+      [local_rows, local_columns, components] = builtin('find', page);
+      encoded_rows = builtin('cell', 1, builtin('numel', local_rows));
+      encoded_columns = builtin('cell', 1, builtin('numel', local_columns));
+      for index = 1:builtin('numel', local_rows)
+        encoded_rows{index} = local_rows(index);
+        encoded_columns{index} = local_columns(index);
+      endfor
+      storage = 'sparse';
+      data = builtin('struct', 'kind', 'sparse_coo', 'rows', {encoded_rows}, ...
+                     'columns', {encoded_columns});
+    else
+      components = page(:);
+      storage = 'dense';
+      data = builtin('struct', 'kind', 'dense');
+    endif
+    data.real = mathlab_page_components (builtin('real', components), type);
+    if (complex_value)
+      data.imag = mathlab_page_components (builtin('imag', components), type);
+    else
+      data.imag = {};
+    endif
   endif
   shape = builtin('cell', 1, builtin('numel', dimensions));
   for axis = 1:builtin('numel', dimensions)
@@ -307,4 +322,122 @@ function strings = mathlab_page_components (values, type)
     endif
     strings{index} = text;
   endfor
+endfunction
+
+## Shared private validation of the adapter's selected-only component pair.
+## Reads may be empty. Edit/history callers pass allow_empty=false and their
+## admitted exact rows/columns. Never derive the patch count from struct numel.
+function count = mathlab_value_pair_validate (pair, type, rows, columns, allow_empty, error_id)
+  if (! builtin('ischar', type) || ! builtin('any', builtin('strcmp', type, {'double','single'})) || ...
+      ! builtin('isnumeric', rows) || ! builtin('isnumeric', columns) || ...
+      ! builtin('isreal', rows) || ! builtin('isreal', columns) || ...
+      builtin('numel', rows) != 1 || builtin('numel', columns) != 1 || ...
+      ! builtin('isfinite', rows) || ! builtin('isfinite', columns) || ...
+      rows < 0 || columns < 0 || rows > 2000 || columns > 2000 || ...
+      builtin('fix', rows) != rows || builtin('fix', columns) != columns || ...
+      ! builtin('islogical', allow_empty) || builtin('numel', allow_empty) != 1)
+    builtin('error', error_id, 'Invalid bounded component-pair descriptor.');
+  endif
+  count = rows * columns;
+  if (count > 2000 || (! allow_empty && count == 0))
+    builtin('error', error_id, 'Selected component pairs contain at most 2000 cells; edit/history pairs must be nonempty.');
+  endif
+  if (! builtin('isstruct', pair) || ! builtin('strcmp', builtin('class', pair), 'struct') || ...
+      builtin('numel', pair) != 1 || builtin('numfields', pair) != 2 || ...
+      ! builtin('isfield', pair, 'real') || ! builtin('isfield', pair, 'imag'))
+    builtin('error', error_id, 'Expected exactly one genuine real/imag component-pair struct.');
+  endif
+  components = {pair.real, pair.imag};
+  for index = 1:2
+    value = components{index};
+    ## Primitive class/type checks precede dimensions and indexing. No object
+    ## getter, conversion, sparse densification or complex constructor is used.
+    if (! builtin('strcmp', builtin('class', value), type) || ! builtin('isnumeric', value) || ...
+        ! builtin('isreal', value) || builtin('issparse', value))
+      builtin('error', error_id, 'Component pairs require genuine dense real arrays of the leaf precision.');
+    endif
+    if (builtin('ndims', value) != 2 || builtin('size', value, 1) != rows || ...
+        builtin('size', value, 2) != columns || builtin('numel', value) != count)
+      builtin('error', error_id, 'A native component pair disagrees with the exact selected shape.');
+    endif
+  endfor
+endfunction
+
+## Startup/recovery only. Engine supplies an explicitly trusted matching .oct;
+## no project/load-path discovery and no function-cache clearing is performed.
+function bridge = mathlab_value_bridge_open (path)
+  bridge = [];
+  if (builtin('ischar', path) && builtin('isempty', path)); return; endif
+  path = mathlab_value_bridge_path (path);
+  if (! mathlab_value_bridge_identity(path, builtin('true')))
+    ## Only an absent definition permits initial exact-path registration. An
+    ## already exact registration is untouched; foreign metadata fails closed.
+    builtin('autoload', 'mathlab_value_bridge', path);
+  endif
+  bridge = mathlab_validate_value_bridge (path);
+endfunction
+
+## Per checked-dispatch recapture seam. Resolve actual builtin metadata and
+## reject foreign files BEFORE any protocol/numerical callback can be invoked.
+## DLD metadata/handle semantics are pinned ABI seams, requiring actual tests.
+function bridge = mathlab_validate_value_bridge (path)
+  path = mathlab_value_bridge_path (path);
+  mathlab_value_bridge_identity (path, builtin('false'));
+  bridge = builtin('str2func', 'mathlab_value_bridge');
+  try
+    protocol = bridge('protocol');
+  catch caught
+    builtin('error', 'MathLab:ValuePagePrecisionProtocol', 'Cannot load the configured component adapter: %s', caught.message);
+  end_try_catch
+  if (! builtin('isstruct', protocol) || ! builtin('strcmp', builtin('class', protocol), 'struct') || builtin('numel', protocol) != 1 || ...
+      ! builtin('isfield', protocol, 'protocol') || ! builtin('ischar', protocol.protocol) || builtin('numel', protocol.protocol) > 32 || ...
+      ! builtin('strcmp', protocol.protocol, 'mathlab-value') || ...
+      ! builtin('isfield', protocol, 'version') || ! mathlab_value_bridge_constant(protocol.version, 1) || ...
+      ! builtin('isfield', protocol, 'dense_complex_components') || ! builtin('islogical', protocol.dense_complex_components) || ...
+      builtin('numel', protocol.dense_complex_components) != 1 || ! protocol.dense_complex_components || ...
+      ! builtin('isfield', protocol, 'max_cells') || ! mathlab_value_bridge_constant(protocol.max_cells, 2000) || ...
+      ! builtin('isfield', protocol, 'max_rank') || ! mathlab_value_bridge_constant(protocol.max_rank, 32) || ...
+      ! builtin('isfield', protocol, 'max_replace_leaf_bytes') || ! mathlab_value_bridge_constant(protocol.max_replace_leaf_bytes, 134217728))
+    builtin('error', 'MathLab:ValuePagePrecisionProtocol', 'The configured component adapter has an unsupported protocol or limit profile.');
+  endif
+endfunction
+
+function path = mathlab_value_bridge_path (path)
+  if (! builtin('ischar', path) || builtin('size', path, 1) != 1 || builtin('numel', path) > 4096 || ...
+      ! builtin('is_absolute_filename', path) || builtin('numel', path) < 5 || ...
+      ! builtin('strcmp', path(end - 3:end), '.oct'))
+    builtin('error', 'MathLab:ValuePagePrecisionProtocol', 'Expected an explicit absolute component adapter .oct path.');
+  endif
+  canonical = builtin('canonicalize_file_name', path);
+  if (builtin('isempty', canonical) || ! builtin('strcmp', canonical, path) || builtin('exist', path, 'dir') == 7)
+    builtin('error', 'MathLab:ValuePagePrecisionProtocol', 'Component adapter path is unavailable or not canonical.');
+  endif
+endfunction
+
+function exact = mathlab_value_bridge_identity (path, allow_absent)
+  ## __which__ is the genuine builtin; which.m is a user-shadowable wrapper.
+  definition = builtin('__which__', 'mathlab_value_bridge');
+  if (! builtin('isstruct', definition) || builtin('numel', definition) != 1 || ...
+      ! builtin('isfield', definition, 'file') || ! builtin('ischar', definition.file) || ...
+      ! builtin('isfield', definition, 'type') || ! builtin('ischar', definition.type))
+    builtin('error', 'MathLab:ValuePagePrecisionProtocol', 'Component adapter native metadata is unavailable.');
+  endif
+  exact = builtin('false');
+  if (builtin('isempty', definition.file) && builtin('isempty', definition.type) && allow_absent)
+    return;
+  endif
+  ## On the selected Octave 11.3 ABI, __which__ reports type "function" for
+  ## both an exact autoload registration and its loaded .oct. The human-readable
+  ## "dynamically-linked function" description is not this metadata field.
+  ## The already validated canonical .oct path must still match before calling
+  ## its protocol; this generic type label alone does not prove native identity.
+  if (! builtin('strcmp', definition.type, 'function') || ...
+      ! builtin('strcmp', builtin('canonicalize_file_name', definition.file), path))
+    builtin('error', 'MathLab:ValuePagePrecisionProtocol', 'Component adapter native identity does not match the configured canonical file.');
+  endif
+  exact = builtin('true');
+endfunction
+function valid = mathlab_value_bridge_constant (value, expected)
+  valid = builtin('isnumeric', value) && builtin('isreal', value) && builtin('numel', value) == 1 && ...
+          builtin('isfinite', value) && value == expected;
 endfunction

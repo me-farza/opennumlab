@@ -24,6 +24,10 @@
     {
       "role": "learning_source_registry",
       "sha256": "fb314953fabfce4db00ffff57d2f3332c3d1063f3126cbd060555cdcccfc4fd5"
+    },
+    {
+      "role": "interaction_acceptance_overlay",
+      "sha256": "cf5fe02c7fa364478f28365f08047aaa5c2c9409355774835f61073bd742037f"
     }
   ],
   "scope": {
@@ -614,6 +618,183 @@
     "CP01_to_CP06_is_full_scope": false,
     "normalized_contract_sha256": "28eea8cd2eaa1964deec8c7338210b0dc06b1b43497cc778e65deb9eba7a6057",
     "release_infrastructure": "Independent prerequisite preparation follows the task graph; CP06 package acceptance still requires its CP dependencies and complete selected release-profile closure."
+  },
+  "interaction_compatibility_overlay": {
+    "id": "MATLAB_INTERACTION_V1",
+    "version": 1,
+    "status": "not_run",
+    "title": "Familiar scientific desktop interaction requirements",
+    "rule": "Qualify platform keyboard profile and focused-control behavior; preserve text/files and correct engine state. These original requirements are proposed acceptance, not implementation or installed compatibility evidence.",
+    "groups": [
+      {
+        "id": "files",
+        "title": "File and document lifecycle",
+        "task_ids": [
+          "U03",
+          "U05",
+          "U06",
+          "E02",
+          "K04",
+          "Q05",
+          "Q12"
+        ],
+        "requirements": [
+          "Qualify Open, Save, Save As, dirty-close and cancellation without changing unrelated documents.",
+          "Keep menu labels/order, key route, native-dialog ownership and active-file identity consistent with the declared platform profile."
+        ]
+      },
+      {
+        "id": "editing",
+        "title": "Editing, language help and navigation",
+        "task_ids": [
+          "E01",
+          "E02",
+          "E03",
+          "U02",
+          "U03",
+          "U06",
+          "K04"
+        ],
+        "requirements": [
+          "Preserve Unicode text, undo and original source mapping during editing, sections, search and navigation.",
+          "Qualify completion, help, indentation/comments, references and reviewable rename as explicit supported actions."
+        ]
+      },
+      {
+        "id": "focus_layout",
+        "title": "Focus, layout and keyboard profile",
+        "task_ids": [
+          "U01",
+          "U05",
+          "U06"
+        ],
+        "requirements": [
+          "Actions target the qualified focused control and active document with visible focus at supported scaling.",
+          "Tile, detach, hide, reset and restore panes without duplicate documents, lost drafts or inaccessible child windows.",
+          "Qualify active keymaps, modifier specificity and native event delivery before claiming muscle-memory compatibility."
+        ]
+      },
+      {
+        "id": "console",
+        "title": "Command input, history and transcript",
+        "task_ids": [
+          "U02",
+          "U06",
+          "K01",
+          "K02",
+          "K03",
+          "K05",
+          "K06"
+        ],
+        "requirements": [
+          "Provide multiline editing/submission, history recall/rerun and transcript copy with bounded ordered output.",
+          "Keep runtime input, drafts, selection evaluation and interruption in their owned request/context."
+        ]
+      },
+      {
+        "id": "execution",
+        "title": "Execution and recovery",
+        "task_ids": [
+          "E02",
+          "K01",
+          "K03",
+          "K04",
+          "K05",
+          "K06",
+          "U06"
+        ],
+        "requirements": [
+          "Run intended current file, selection or section with original diagnostics and source identity.",
+          "Distinguish no-selection behavior, advance, pause, Stop, Quit and force termination; settle errors before new work."
+        ]
+      },
+      {
+        "id": "debugging",
+        "title": "Debugger source, frame and control ownership",
+        "task_ids": [
+          "D01",
+          "D02",
+          "D03",
+          "K01",
+          "K03",
+          "K04",
+          "K05",
+          "K06",
+          "U06"
+        ],
+        "requirements": [
+          "Bind breakpoint intent to original executing source and qualify pause, stepping, Continue and End Debug.",
+          "Use selected actual frame for locals/watches/evaluation; errors and nested input never accidentally resume or address another scope."
+        ]
+      },
+      {
+        "id": "values",
+        "title": "Workspace and typed variable interaction",
+        "task_ids": [
+          "U04",
+          "U06",
+          "V01",
+          "V02",
+          "V03",
+          "K01",
+          "K03"
+        ],
+        "requirements": [
+          "Qualify Workspace sort/filter/rename/delete/save-selected with cancellation and stale-binding protection.",
+          "Inspect exact typed N-D/container/table views and support class-preserving transactional range edits/paste/Undo without partial invalid writes."
+        ]
+      },
+      {
+        "id": "panes",
+        "title": "Files, projects and cross-pane actions",
+        "task_ids": [
+          "U03",
+          "U05",
+          "U06",
+          "V03",
+          "G01",
+          "G02",
+          "G03",
+          "G04",
+          "G05",
+          "K01",
+          "K03"
+        ],
+        "requirements": [
+          "File/project operations and relocation/recovery preserve original content and document identities.",
+          "Figure/tree/inspector selection, property edits, axes/tips, callbacks and export target correct live objects and focused tools.",
+          "Keep text, file, workspace and graphics persistence distinct; unsupported actions are explicit."
+        ]
+      },
+      {
+        "id": "installed",
+        "title": "Installed qualification and release traceability",
+        "task_ids": [
+          "Q05",
+          "Q12",
+          "U06"
+        ],
+        "requirements": [
+          "Complete selected keyboard/pointer journeys using identified installed binaries/runtime/profile/targets.",
+          "Actual source, focus, buffer, file and engine evidence is required; static inventory or an acceptance overlay is not a pass."
+        ]
+      }
+    ],
+    "source_urls": [
+      "https://www.mathworks.com/help/matlab/matlab_prog/editor-keyboard-shortcuts.html",
+      "https://www.mathworks.com/help/matlab/matlab_prog/save-and-back-up-code.html",
+      "https://www.mathworks.com/help/matlab/matlab_env/manage-files-and-folders.html",
+      "https://www.mathworks.com/help/matlab/matlab_env/accessibility-use-a-screen-reader-to-access-matlab.html",
+      "https://www.mathworks.com/help/matlab/matlab_env/accessibility-use-keyboard-shortcuts-to-navigate-matlab.html",
+      "https://www.mathworks.com/help/matlab/matlab_env/keyboard-shortcuts.html",
+      "https://www.mathworks.com/help/matlab/matlab_env/change-the-desktop-layout.html",
+      "https://www.mathworks.com/help/matlab/ref/variableseditor.html",
+      "https://www.mathworks.com/help/matlab/matlab_prog/debugging-process-and-features.html",
+      "https://www.mathworks.com/help/matlab/creating_plots/interactively-explore-plotted-data.html",
+      "https://www.mathworks.com/help/matlab/creating_plots/create-callbacks-for-graphics-objects.html",
+      "https://www.mathworks.com/help/matlab/ref/propertyinspector.html",
+      "https://www.mathworks.com/help/matlab/matlab_prog/create-projects.html"
+    ]
   },
   "profiles": [
     {

@@ -2,6 +2,15 @@
 
 This lane hardens the currently implemented application. It does not qualify Core Desktop, Full, exact MATLAB compatibility, a self-contained runtime distribution, or trusted public installation. Internal executable, crate, protocol and environment names remain `mathlab` in this brand iteration.
 
+The four-adapter value source integration passed local synthetic contracts;
+the [validation receipt](VALUE_BRIDGE_SYNTHETIC_VALIDATION.md) records the bounded
+run and its scope. The [versioned package contract](VALUE_BRIDGE_RELEASE_CONTRACT.md)
+defines explicit default omission and required native support. The required lane
+depends on CLI-owner doctor fields reporting the actual loaded value adapter and
+worker capabilities; it fails before publication until those fields are present.
+Launcher/installed checked-API integration remains with its owners. No new app,
+installed qualification or complete CP03 acceptance is established by this work.
+
 From a clean committed checkout on macOS, in a prepared Rust/Apple SDK environment:
 
 ```sh
@@ -26,7 +35,7 @@ Internal evidence: `dist/candidate-2ef9d7806bac/desktop-qa/observations-20261015
 
 Assembly uses an empty private staging directory. A deliberate tracked-source allowlist includes application/build source, original fixtures and conformance source, selected product docs, reviewed Cargo notices and the one original logo. It excludes all research, evidence, generated artifacts, vendor directories, local/private directories, caches, native binaries and MATLAB-generated `.mat`/`.slx` payloads, even if tracked. Untracked intended source must be committed first. Symlinks and unsafe filenames are rejected. Clean candidates export the fixed Git commit and verify it against the captured SHA-256 inventory; they never compile from the moving checkout. An isolated detached Git identity ensures build scripts observe that fixed commit.
 
-`Contents/Resources/release.json` records the product/profile/version, source commit and dirty status, frozen source inventory/digest, actual Cargo command/toolchain/SDK/platform configuration, built executable hashes and linked-library inspection. With adapters, it also records selected Octave/SDK/compiler configuration, runtime-executable and module hashes, and actual protocol load results (debugger 4, scope 2, input 1). Protocol loading is narrower than the native integration suite. Without adapters, their omission is explicit. `checksums.sha256` covers every final file except itself; packaging prints its SHA-256 as the digest of that complete checksum list. Executable permission flags are validated separately. No archive, signing or notarization processing is claimed by these hashes.
+`Contents/Resources/release.json` records the product/profile/version, source commit and dirty status, frozen source inventory/digest, actual Cargo command/toolchain/SDK/platform configuration, built executable hashes and linked-library inspection. The new required native profile records selected Octave/SDK/compiler configuration, runtime-executable and four module hashes, actual protocol load results (debugger 4, scope 2, input 1, value 1), and an identified worker capability observation. Its value probe uses `mathlab_value_bridge('protocol')`; the older adapters use two arguments. Protocol/doctor success is narrower than checked read/edit/history or installed acceptance. Without adapters, their omission is explicit; legacy manifests retain their original three-adapter scope and cannot carry a value module. `checksums.sha256` covers every final file except itself; packaging prints its SHA-256 as the digest of that complete checksum list. Executable permission flags are validated separately. No archive, signing or notarization processing is claimed by these hashes.
 
 Assembly leaves `qualification.status:not_qualified` and installed/native-regression/public-review evidence at `not_run`. `clean_candidate:true` identifies clean build input only. Installed acceptance must examine its actual reports and conformance summary/per-route/oracle statuses; conformance can intentionally exit zero with an `incomplete` summary. Process exit zero and source CI entrypoint counts cannot qualify a final candidate.
 

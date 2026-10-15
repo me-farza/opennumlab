@@ -23,6 +23,8 @@ pub struct VariableEditor {
     pub slice: Option<VariableSlice>,
     pub token: Option<BindingToken>,
     pub typed_page: Option<ValuePage>,
+    /// Transaction uncertainty blocks mutation without disabling pure reads.
+    pub writes_blocked: bool,
     pending_read: Option<PendingRead>,
     selected: Option<(usize, usize)>,
     literal: String,
@@ -264,6 +266,7 @@ impl VariableEditor {
             slice: None,
             token: None,
             typed_page: None,
+            writes_blocked: false,
             pending_read: None,
             selected: None,
             literal: String::new(),
@@ -481,7 +484,8 @@ impl VariableEditor {
     }
 
     fn can_edit(&self) -> bool {
-        !self.pending
+        !self.writes_blocked
+            && !self.pending
             && !self.stale
             && self.token.is_some()
             && self
@@ -1246,5 +1250,24 @@ mod tests {
         assert!(editor.stale);
         assert!(editor.token.is_none());
         assert!(editor.error.as_ref().unwrap().contains("does not match"));
+    }
+
+    #[test]
+    fn transaction_quarantine_blocks_scalar_apply_but_survives_a_successful_read() {
+        let mut editor = VariableEditor::new(variable());
+        editor.begin(1);
+        editor.accept(1, Ok(page(9)));
+        assert!(editor.write_action(31, 13).is_some());
+        editor.writes_blocked = true;
+        assert!(editor.write_action(31, 13).is_none());
+        editor.begin_read(2, Some(token(9)));
+        editor.accept(2, Ok(page(9)));
+        assert!(!editor.stale && editor.token.is_some());
+        assert!(
+            editor.write_action(31, 13).is_none(),
+            "a pure read cannot clear transaction quarantine"
+        );
+        editor.writes_blocked = false;
+        assert!(editor.write_action(31, 13).is_some());
     }
 }

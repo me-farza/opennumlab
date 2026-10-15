@@ -4,7 +4,7 @@ Planning baseline: October 14, 2026. Implementation status: an integrated Rust d
 
 Build an open-source scientific computing platform by integrating an existing MATLAB-compatible engine, tested scientific packages, and a familiar desktop written in Rust. Evaluate GNU Octave as the primary engine before investing in a new interpreter. A MATLAB user should be able to begin ordinary work without learning a different language or rearranging their workflow.
 
-The recommended delivery approach is defined in [Integration strategy](INTEGRATION_STRATEGY.md). A Rust-native interpreter is an optional future project; it is not a prerequisite for the first useful release. An integrated Octave-based distribution will contain multiple implementation languages and must not be marketed as entirely Rust.
+The recommended initial delivery approach is defined in [Integration strategy](INTEGRATION_STRATEGY.md). A Rust-native execution engine remains a required long-term workstream in the complete [product roadmap](ROADMAP.md); it is not a prerequisite for the first useful release. An integrated Octave-based distribution will contain multiple implementation languages and must not be marketed as entirely Rust. An early compatible release does not complete the Rust execution objective.
 
 This is a substantial engineering program. A useful compatible core is feasible; complete compatibility with every MATLAB release, toolbox, binary extension, hardware target, and hosted service cannot responsibly be promised in advance. Performance improvements must be demonstrated on named workloads. Rust does not automatically make numerical algorithms faster.
 
@@ -130,17 +130,17 @@ Proposed module boundaries:
 | `simulation` | Model graph, execution schedule, continuous and discrete solvers. |
 | `conformance` | Reference comparisons, fixtures, regression reports, coverage registry. |
 
-The module table is a responsibility map for the eventual platform. Initially, the selected engine supplies parsing, semantics, values, execution, most numerical functions and graphics objects. Project-owned crates concentrate on the protocol, engine adapter, desktop, packaging and conformance. Compiler/VM replacements remain optional and must not delay the integrated release.
+The module table is a responsibility map for the eventual platform. Initially, the selected engine supplies parsing, semantics, values, execution, most numerical functions and graphics objects. Project-owned crates concentrate on the protocol, engine adapter, desktop, packaging and conformance. The later Rust interpreter/VM workstream follows the roadmap's language and array prerequisites; it need not delay an explicitly scoped integrated release and must not disappear from the full objective.
 
 ### Language and value representation
 
-Initially, preserve the selected engine's values inside its worker and specify a lossless transport representation for desktop inspection and service calls. If a Rust-native runtime is later justified, build one MATLAB-aware array model instead of exposing a numerical library's array semantics directly. It must represent at least two dimensions, column-major linear indexing, element class, complex values, sparse storage, shape, strides, and ownership. An internal view is allowed only when it preserves observable value semantics.
+Initially, preserve the selected engine's values inside its worker and specify a lossless transport representation for desktop inspection and service calls. For the required Rust-native runtime, build one MATLAB-aware array model instead of exposing a numerical library's array semantics directly. It must represent at least two dimensions, column-major linear indexing, element class, complex values, sparse storage, shape, strides, and ownership. An internal view is allowed only when it preserves observable value semantics.
 
 Use copy-on-write where appropriate for ordinary arrays. Design handle-object identity and shared mutation separately. Closures and handle graphs can contain cycles, so reference counting alone is not a complete memory-management design. Select and test cycle handling before exposing unrestricted object graphs.
 
 The parser must handle context-sensitive ambiguities such as apostrophe versus string delimiters, command syntax, matrix concatenation whitespace, and indexing versus function calls. Do not implement the language as regular-expression substitution or a direct text translation to Rust.
 
-Reuse the existing interpreter first. Close demonstrated compatibility gaps in adapters, packages or upstream engine changes. If a replacement becomes justified, implement a correct interpreter before specializing hot paths. Compiled paths need guards for types, shapes, function resolution, and mutable definitions, with a tested fallback to interpreted execution. Preserve debugger source mapping.
+Reuse the existing interpreter first. Close demonstrated compatibility gaps in adapters, packages or upstream engine changes while developing the Rust execution workstream against the same conformance corpus. Implement a correct Rust interpreter before specializing its hot paths. Compiled paths need guards for types, shapes, function resolution, and mutable definitions, with a tested fallback to interpreted execution. Preserve debugger source mapping. Changing the default engine requires separate semantic, numerical and performance evidence.
 
 ### Numerical backends
 
@@ -162,7 +162,7 @@ faer is a Rust linear algebra library; RustFFT is implemented in Rust; Cranelift
 
 Use one scheduling policy across numerical calls to avoid nested thread-pool oversubscription. GPU rendering and GPU numerical computation are separate capabilities. Do not assume a portable graphics backend supplies the double-precision performance or numerical operations required by every computation.
 
-A future Rust-only computational build would need its own interpreter and explicit feature matrix; it is not part of the initial Octave-based distribution. The recommended distribution contains non-Rust dependencies and must be described accurately as Rust-based, not 100% Rust. Replacing proven numerical or file-format libraries is a separately justified project, not an automatic priority.
+The required Rust execution workstream needs its own interpreter and explicit feature matrix; it is not part of the initial Octave-based distribution. The initial distribution contains non-Rust dependencies and must be described accurately as Rust-based, not 100% Rust. Native numerical and file-format dependencies must be declared separately for each edition. A Rust-only claim requires evidence for the shipped implementation and dependency boundary, in addition to compatible behavior.
 
 ### Kernel and graphics
 

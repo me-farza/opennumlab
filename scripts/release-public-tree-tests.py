@@ -224,6 +224,39 @@ class PublicTreeTests(unittest.TestCase):
         self.assertNotIn(str(self.root), serialized)
         self.assertEqual(manifest["scope"]["binary_correspondence"], "not_claimed")
 
+    def test_value_provisioning_inputs_are_inherited_from_source_with_exact_modes_and_exclusions(self):
+        selected = {
+            "scripts/build-value-bridge.sh": ("#!/bin/sh\n# owned value builder fixture\n", 0o755),
+            "scripts/verify-value-provisioning-test.sh": ("#!/bin/sh\n# owned provisioning contract fixture\n", 0o755),
+            "scripts/release-launcher-value-test.sh": ("#!/bin/sh\n# owned launcher value contract fixture\n", 0o755),
+            "docs/VALUE_EDIT_PROTOCOL.md": ("# Owned value edit protocol fixture\n", 0o644),
+        }
+        denied = ("scripts/build-value-bridge-local.sh", "scripts/verify-value-provisioning-test-private.sh",
+                  "scripts/private/build-value-bridge.sh", "docs/VALUE_EDIT_PROTOCOL_PRIVATE.md",
+                  "docs/private/VALUE_EDIT_PROTOCOL.md", "native/mathlab_value_bridge.oct")
+        for name, (text, mode) in selected.items():
+            self.write(name, text).chmod(mode)
+        for name in denied:
+            self.write(name, "VALUE_PROVISIONING_PRIVATE_SENTINEL\n").chmod(0o755)
+        selected_source_set = self.root / "value-provisioning-source"
+        source_manifest = source.create(self.repo, self.commit_all(), selected_source_set)
+        manifest = self.create(source_set=selected_source_set)
+        source_records = {record["path"]: record for record in source_manifest["files"]}
+        records = {record["path"]: record for record in manifest["files"]}
+        for name, (text, mode) in selected.items():
+            with self.subTest(path=name):
+                path = self.output / public.TREE / name
+                self.assertEqual(path.read_bytes(), text.encode())
+                self.assertEqual(path.stat().st_mode & 0o777, mode)
+                self.assertEqual(records[name]["origin"], "source_archive")
+                self.assertEqual({key: records[name][key] for key in public.SOURCE_FIELDS}, source_records[name])
+                self.assertEqual(records[name]["mode"], format(mode, "04o"))
+                self.assertEqual(records[name]["executable"], mode == 0o755)
+        self.assertFalse(set(records).intersection(denied))
+        self.assertEqual(set(records), set(source_records) | set(public.CONFIGS))
+        self.assertFalse(any(b"VALUE_PROVISIONING_PRIVATE_SENTINEL" in data for data in self.output_bytes().values()))
+        self.assertEqual(public.verify(self.output), manifest)
+
     def test_fixed_configs_despite_dirty_extra_replacement_and_moving_head(self):
         self.write(".gitignore", "later committed ignore\n")
         self.write(".github/workflows/ci.yml", "name: Later committed CI\n")

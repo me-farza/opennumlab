@@ -5,6 +5,10 @@ mod debugging;
 mod editor_gutter;
 mod input;
 mod prepared_debug;
+pub mod range_paste;
+#[cfg(test)]
+mod range_transaction_tests;
+pub mod range_transactions;
 mod search;
 mod session;
 mod source_navigation;
@@ -154,6 +158,7 @@ pub struct MathLabApp {
     inspected: Option<VariableEditor>,
     selected_variable: Option<String>,
     inspector_request: u64,
+    range_transactions: range_transactions::RangeTransactions,
     force_restart_confirmation: bool,
     figures: Vec<FigureView>,
     selected_figure: usize,
@@ -291,6 +296,7 @@ impl MathLabApp {
             inspected: None,
             selected_variable: None,
             inspector_request: 0,
+            range_transactions: Default::default(),
             force_restart_confirmation: false,
             figures: Vec::new(),
             selected_figure: 0,
@@ -679,6 +685,7 @@ impl MathLabApp {
                     self.figures.clear();
                     self.packages.clear();
                     self.inspected = None;
+                    self.range_transactions.restarted();
                     self.selected_variable = None;
                     self.debugger = None;
                     self.pending_prepared_breakpoint = None;
@@ -789,6 +796,7 @@ impl MathLabApp {
                     if self.restarting {
                         continue;
                     }
+                    self.range_transactions.invalidate_context();
                     self.directory_input = directory.display().to_string();
                     self.directory = directory;
                     self.busy = false;
@@ -811,6 +819,7 @@ impl MathLabApp {
                     self.packages.clear();
                     self.inspected = None;
                     self.selected_variable = None;
+                    self.range_transactions.restarted();
                     self.status = "Ready".into();
                     self.notice("Engine restarted. Workspace variables and figures were cleared.");
                     self.debugger =
@@ -954,6 +963,7 @@ impl MathLabApp {
                     self.disconnected(error);
                 }
                 Event::Unavailable(error) => {
+                    self.range_transactions.disconnected();
                     self.input.disconnect();
                     self.busy = false;
                     self.restarting = false;
@@ -973,10 +983,30 @@ impl MathLabApp {
                     self.screenshot_ready = true;
                     self.screenshot_ready_at = Some(std::time::Instant::now());
                 }
+                Event::RangeTransactionFinished { envelope, outcome } => {
+                    self.finish_range_transaction(*envelope, *outcome);
+                }
                 Event::VariableRead { request_id, result } => {
                     if self.connected && !self.busy && !self.restarting {
                         if let Some(editor) = &mut self.inspected {
-                            editor.accept(request_id, result);
+                            // Only accepted active reads can retire history or
+                            // observe a page. A stale preview cannot replace either.
+                            if editor.pending && editor.request_id == request_id {
+                                let preview = matches!(
+                                    &result,
+                                    Ok(variable_editor::VariablePage::Preview(_))
+                                );
+                                editor.accept(request_id, result);
+                                if !editor.stale {
+                                    if preview {
+                                        self.range_transactions.invalidate_context();
+                                    }
+                                    if let Some(page) = &editor.typed_page {
+                                        self.range_transactions
+                                            .observe_page(editor.request_id, page);
+                                    }
+                                }
+                            }
                         }
                     }
                     self.screenshot_ready = true;
@@ -1033,6 +1063,7 @@ impl MathLabApp {
     }
 
     fn disconnected(&mut self, error: String) {
+        self.range_transactions.disconnected();
         self.input.disconnect();
         self.busy = false;
         self.connected = false;
@@ -1064,9 +1095,11 @@ impl MathLabApp {
     }
 
     fn dispatch(&mut self, request: Request, label: String) {
-        if !self.connected || self.busy || self.input.active() {
+        if !self.connected || self.busy || self.input.active() || self.range_transactions.pending()
+        {
             return;
         }
+        self.range_transactions.invalidate_context();
         if matches!(
             &request,
             Request::Execute(_) | Request::RunFile(_) | Request::RunBuffer { .. }
@@ -1253,6 +1286,7 @@ impl MathLabApp {
                 return;
             }
         }
+        self.range_transactions.invalidate_context();
         self.input.disconnect();
         self.invalidate_inspector();
         self.force_restart_confirmation = false;
@@ -1268,8 +1302,243 @@ impl MathLabApp {
     }
 
     fn open_variable(&mut self, variable: Variable) {
+        self.range_transactions.clear_page();
         self.inspected = Some(VariableEditor::new(variable));
         self.read_variable();
+    }
+
+    /// Controller seam only: no current widget, shortcut or clipboard event
+    /// calls these transaction methods. Interaction design remains unenabled.
+    pub fn submit_range_paste(
+        &mut self,
+        paste: range_paste::ParsedRangePaste,
+    ) -> Result<(), String> {
+        let request_id = self.range_request_id()?;
+        let envelope = self.range_transactions.begin_paste(request_id, paste)?;
+        self.queue_range_transaction(envelope)
+    }
+
+    pub fn undo_range_edit(&mut self) -> Result<(), String> {
+        self.submit_range_history(mathlab_engine::value_edit::EditOperation::Undo)
+    }
+
+    pub fn redo_range_edit(&mut self) -> Result<(), String> {
+        self.submit_range_history(mathlab_engine::value_edit::EditOperation::Redo)
+    }
+
+    fn submit_range_history(
+        &mut self,
+        operation: mathlab_engine::value_edit::EditOperation,
+    ) -> Result<(), String> {
+        let request_id = self.range_request_id()?;
+        let envelope = self
+            .range_transactions
+            .begin_history(request_id, operation)?;
+        self.queue_range_transaction(envelope)
+    }
+
+    /// Explicit reset requires an accepted current page, even in quarantine.
+    /// It never retries the operation which caused uncertainty.
+    pub fn reset_range_edit_history(&mut self) -> Result<(), String> {
+        let request_id = self.range_request_id()?;
+        let envelope = self.range_transactions.begin_reset(request_id)?;
+        self.queue_range_transaction(envelope)
+    }
+
+    pub fn range_edit_state(&self) -> &range_transactions::RangeTransactions {
+        &self.range_transactions
+    }
+
+    fn range_request_id(&self) -> Result<u64, String> {
+        if !self.connected || self.busy || self.restarting || self.input.active() {
+            return Err("Wait for a connected idle engine before this transaction.".into());
+        }
+        let editor = self
+            .inspected
+            .as_ref()
+            .ok_or_else(|| "Open and refresh a typed variable page first.".to_owned())?;
+        let page = editor
+            .typed_page
+            .as_ref()
+            .ok_or_else(|| "This view has no accepted typed page.".to_owned())?;
+        if editor.pending
+            || editor.stale
+            || self.range_transactions.accepted_page()
+                != Some(&range_transactions::PageIdentity::accepted(
+                    editor.request_id,
+                    page,
+                ))
+            || u64::try_from(editor.row_start).ok() != Some(page.selection.row_start.get())
+            || u64::try_from(editor.column_start).ok() != Some(page.selection.column_start.get())
+            || !editor.higher_indices.iter().copied().eq(page
+                .selection
+                .higher_indices
+                .iter()
+                .map(|index| index.get()))
+        {
+            return Err(
+                "The accepted variable page changed. Refresh before this transaction.".into(),
+            );
+        }
+        self.inspector_request
+            .checked_add(1)
+            .ok_or_else(|| "Inspector request counter exhausted; restart the application.".into())
+    }
+
+    fn queue_range_transaction(
+        &mut self,
+        envelope: range_transactions::TransactionEnvelope,
+    ) -> Result<(), String> {
+        self.inspector_request = envelope.request_id;
+        if let Some(editor) = &mut self.inspected {
+            editor.begin(envelope.request_id);
+        }
+        self.busy = true;
+        self.status = "Updating variable…".into();
+        if self
+            .requests
+            .send(Request::RangeTransaction(Box::new(envelope.clone())))
+            .is_err()
+        {
+            self.range_transactions.finish(
+                &envelope,
+                range_transactions::TransactionOutcome::Failed(
+                    range_transactions::TransactionFailure {
+                        message: "The engine worker stopped before accepting the transaction."
+                            .into(),
+                        uncertain: false,
+                        disconnected: true,
+                    },
+                ),
+            );
+            self.disconnected("The engine worker stopped before accepting the transaction.".into());
+            return Err("The engine worker stopped before accepting the transaction.".into());
+        }
+        Ok(())
+    }
+
+    fn finish_range_transaction(
+        &mut self,
+        envelope: range_transactions::TransactionEnvelope,
+        outcome: range_transactions::TransactionOutcome,
+    ) {
+        use range_transactions::TransactionOutcome;
+        if self.restarting {
+            self.range_transactions.invalidate_context();
+            return;
+        }
+        let Some(outcome) = self.range_transactions.finish(&envelope, outcome) else {
+            return;
+        };
+        self.busy = false;
+        match outcome {
+            TransactionOutcome::Applied {
+                receipt,
+                refresh: Ok(refresh),
+            } => {
+                let metadata = refresh
+                    .snapshot
+                    .variables
+                    .iter()
+                    .find(|binding| binding.token == receipt.token)
+                    .map(|binding| binding.variable.clone());
+                self.workspace = refresh
+                    .snapshot
+                    .variables
+                    .into_iter()
+                    .map(|binding| binding.variable)
+                    .collect();
+                if let Some(editor) = &mut self.inspected {
+                    let same_view = editor.request_id == envelope.request_id
+                        && editor.variable.name == receipt.token.name
+                        && u64::try_from(editor.row_start).ok()
+                            == Some(envelope.page.window.row_start.get())
+                        && u64::try_from(editor.column_start).ok()
+                            == Some(envelope.page.window.column_start.get())
+                        && editor.higher_indices.iter().copied().eq(envelope
+                            .page
+                            .window
+                            .higher_indices
+                            .iter()
+                            .map(|index| index.get()))
+                        && editor.typed_page.as_ref().is_some_and(|before| {
+                            range_transactions::PageIdentity::accepted(
+                                envelope.page.view_id,
+                                before,
+                            ) == envelope.page
+                        });
+                    if same_view {
+                        editor.invalidate(metadata.clone());
+                        editor.begin_read(envelope.request_id, Some(receipt.token));
+                        editor.accept(
+                            envelope.request_id,
+                            Ok(variable_editor::VariablePage::Typed {
+                                page: Box::new(refresh.page),
+                                metadata,
+                            }),
+                        );
+                        if !editor.stale {
+                            if let Some(page) = &editor.typed_page {
+                                self.range_transactions
+                                    .observe_page(editor.request_id, page);
+                            }
+                        }
+                    } else if editor.request_id == envelope.request_id {
+                        // The operation settled, but the user changed the view's
+                        // selection/path. Keep the receipt/history, never its old page.
+                        editor.pending = false;
+                        editor.stale = true;
+                        editor.token = None;
+                        editor.error = Some(
+                            "The edit committed. Refresh the newly selected view before editing."
+                                .into(),
+                        );
+                    }
+                }
+                self.status = "Variable transaction completed".into();
+            }
+            TransactionOutcome::Applied {
+                refresh: Err(failure),
+                ..
+            } => {
+                let message = format!("The edit committed, but its refresh failed: {}. Refresh explicitly; do not repeat the edit.", failure.message);
+                if let Some(editor) = &mut self.inspected {
+                    editor.accept(envelope.request_id, Err(message.clone()));
+                }
+                self.status = "Edit committed; refresh required".into();
+                if failure.disconnected {
+                    self.disconnected(message);
+                } else {
+                    self.error(message);
+                }
+            }
+            TransactionOutcome::Reset(snapshot) => {
+                self.workspace = snapshot
+                    .variables
+                    .into_iter()
+                    .map(|binding| binding.variable)
+                    .collect();
+                if let Some(editor) = &mut self.inspected {
+                    let metadata = self
+                        .workspace
+                        .iter()
+                        .find(|variable| variable.name == editor.variable.name)
+                        .cloned();
+                    editor.invalidate(metadata);
+                }
+                self.status = "Edit history reset; refresh values before editing".into();
+            }
+            TransactionOutcome::Failed(failure) => {
+                if let Some(editor) = &mut self.inspected {
+                    editor.accept(envelope.request_id, Err(failure.message.clone()));
+                }
+                if failure.disconnected {
+                    self.disconnected(failure.message);
+                } else {
+                    self.error(failure.message);
+                }
+            }
+        }
     }
 
     fn read_variable(&mut self) {
@@ -1281,9 +1550,10 @@ impl MathLabApp {
     }
 
     fn read_variable_with_token(&mut self, token: Option<mathlab_engine::BindingToken>) {
-        if self.busy || !self.connected {
+        if self.busy || !self.connected || self.range_transactions.pending() {
             return;
         }
+        self.range_transactions.clear_page();
         if let Some(editor) = &mut self.inspected {
             self.inspector_request = self.inspector_request.wrapping_add(1);
             editor.stale = true;
@@ -1330,6 +1600,7 @@ impl MathLabApp {
     }
 
     fn invalidate_inspector(&mut self) {
+        self.range_transactions.clear_page();
         self.inspector_request = self.inspector_request.wrapping_add(1);
         if let Some(editor) = &mut self.inspected {
             editor.request_id = self.inspector_request;
@@ -1341,8 +1612,10 @@ impl MathLabApp {
         let Some(editor) = &mut self.inspected else {
             return;
         };
+        editor.writes_blocked = self.range_transactions.writes_blocked();
         let (open, action) = editor.show(ctx, self.connected && !self.busy);
         if !open {
+            self.range_transactions.clear_page();
             self.inspected = None;
             return;
         }
@@ -1358,6 +1631,10 @@ impl MathLabApp {
                 column,
                 literal,
             }) => {
+                if self.range_transactions.writes_blocked() {
+                    return;
+                }
+                self.range_transactions.invalidate_context();
                 self.inspector_request = self.inspector_request.wrapping_add(1);
                 if let Some(editor) = &mut self.inspected {
                     editor.begin(self.inspector_request);
@@ -1386,6 +1663,7 @@ impl MathLabApp {
         if self.busy {
             return;
         }
+        self.range_transactions.invalidate_context();
         self.input.disconnect();
         self.clear_source_links();
         self.invalidate_inspector();

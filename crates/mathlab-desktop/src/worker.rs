@@ -1,3 +1,7 @@
+use crate::range_transactions::{
+    TransactionCommand, TransactionEnvelope, TransactionFailure, TransactionOutcome,
+    TransactionRefresh,
+};
 use crate::variable_editor::VariablePage;
 use mathlab_engine::{
     discover_octave, BindingToken, CancellationHandle, DecimalU64, Engine, EngineConfig,
@@ -7,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 pub enum Request {
+    RangeTransaction(Box<TransactionEnvelope>),
     Start {
         executable: Option<PathBuf>,
         directory: PathBuf,
@@ -46,6 +51,10 @@ pub enum Request {
 }
 
 pub enum Event {
+    RangeTransactionFinished {
+        envelope: Box<TransactionEnvelope>,
+        outcome: Box<TransactionOutcome>,
+    },
     ConsoleConnected {
         subscription: mathlab_engine::ConsoleSubscription,
         generation: u64,
@@ -100,6 +109,17 @@ pub fn spawn(ctx: eframe::egui::Context) -> (Sender<Request>, Receiver<Event>) {
             let mut engine: Option<Engine> = None;
             while let Ok(request) = requests_rx.recv() {
                 let event = match request {
+                    Request::RangeTransaction(envelope) => {
+                        let outcome = match engine.as_mut() {
+                            Some(engine) => run_range_transaction(engine, &envelope),
+                            None => TransactionOutcome::Failed(TransactionFailure {
+                                message: "The engine is not connected.".into(),
+                                uncertain: false,
+                                disconnected: true,
+                            }),
+                        };
+                        Event::RangeTransactionFinished { envelope, outcome: Box::new(outcome) }
+                    }
                     Request::Start { executable, directory } => {
                         engine = None;
                         match executable.or_else(discover_octave) {
@@ -225,6 +245,71 @@ pub fn spawn(ctx: eframe::egui::Context) -> (Sender<Request>, Receiver<Event>) {
         })
         .expect("could not create engine worker thread");
     (requests_tx, events_rx)
+}
+
+/// Commit and refresh are separate outcomes: a successful receipt is never
+/// replaced by a follow-up read error, and a failed edit is never retried.
+fn run_range_transaction(
+    engine: &mut Engine,
+    envelope: &TransactionEnvelope,
+) -> TransactionOutcome {
+    if let Err(message) = envelope.validate() {
+        return TransactionOutcome::Failed(TransactionFailure::rejected(message));
+    }
+    if let TransactionCommand::Reset { expected } = &envelope.command {
+        let snapshot = match engine.workspace_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => return TransactionOutcome::Failed(range_failure(engine, error)),
+        };
+        if &snapshot.context != expected {
+            return TransactionOutcome::Failed(TransactionFailure::rejected(
+                "The session changed before the explicit history reset. Refresh before resetting again.",
+            ));
+        }
+        return match engine.reset_value_edit_history() {
+            Ok(snapshot) => TransactionOutcome::Reset(snapshot),
+            Err(error) => TransactionOutcome::Failed(range_failure(engine, error)),
+        };
+    }
+    let result = match &envelope.command {
+        TransactionCommand::Write(request) => engine.write_value_range_checked(request),
+        TransactionCommand::Undo(request) => engine.undo_value_edit_checked(request),
+        TransactionCommand::Redo(request) => engine.redo_value_edit_checked(request),
+        TransactionCommand::Reset { .. } => unreachable!(),
+    };
+    let receipt = match result {
+        Ok(receipt) => receipt,
+        Err(error) => return TransactionOutcome::Failed(range_failure(engine, error)),
+    };
+    let refresh = (|| {
+        let snapshot = engine.workspace_snapshot()?;
+        let mut path = envelope.page.path.clone();
+        path.root = receipt.token.clone();
+        let page = engine.read_value_page_checked(&ValuePageRequest {
+            path,
+            window: envelope.page.window.clone(),
+        })?;
+        Ok::<_, mathlab_engine::Error>(Box::new(TransactionRefresh { snapshot, page }))
+    })()
+    .map_err(|error| range_failure(engine, error));
+    TransactionOutcome::Applied {
+        receipt: Box::new(receipt),
+        refresh,
+    }
+}
+
+fn range_failure(engine: &Engine, error: mathlab_engine::Error) -> TransactionFailure {
+    TransactionFailure {
+        uncertain: engine.has_value_edit_uncertainty()
+            || matches!(
+                &error,
+                mathlab_engine::Error::ValueEdit(
+                    mathlab_engine::value_edit::EditError::UncertainCommit(_)
+                )
+            ),
+        disconnected: !engine.is_transport_open() || disconnected(&error),
+        message: error.to_string(),
+    }
 }
 
 fn read_variable_page(
@@ -1164,5 +1249,251 @@ mod tests {
             ))
             .unwrap();
         assert!(completed(&runtime).error.is_none());
+    }
+
+    /// Authored, unrun real-worker actor journey. Integer-only fixtures retain
+    /// portable coverage when the optional native complex adapter is absent.
+    #[test]
+    fn desktop_range_actor_routes_exact_nd_paste_history_and_stale_reset_without_retry() {
+        use crate::range_paste::{parse_range_paste, PasteLimits, PasteTarget};
+        use crate::range_transactions::RangeTransactions;
+        use mathlab_engine::value_edit::EditOperation;
+        use mathlab_engine::{NumericComponents, PageData, ValuePage};
+        use std::time::Duration;
+
+        let Some(executable) = discover_octave() else {
+            assert_ne!(
+                std::env::var("MATHLAB_REQUIRE_DESKTOP_RANGE_TESTS").as_deref(),
+                Ok("1"),
+                "required desktop range actor test needs installed Octave"
+            );
+            eprintln!("SKIP desktop range actor test: no installed Octave.");
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let (requests, events) = spawn(eframe::egui::Context::default());
+        requests
+            .send(Request::Start {
+                executable: Some(executable),
+                directory: directory.path().into(),
+            })
+            .unwrap();
+        let cancel = loop {
+            match events.recv_timeout(Duration::from_secs(30)).unwrap() {
+                Event::ConsoleConnected { .. } => {}
+                Event::Ready { cancel, .. } => break cancel,
+                Event::Unavailable(error) => panic!("worker startup: {error}"),
+                _ => panic!("unexpected startup event"),
+            }
+        };
+        struct TerminateOnDrop(CancellationHandle);
+        impl Drop for TerminateOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.terminate();
+            }
+        }
+        let _terminate = TerminateOnDrop(cancel);
+        let read = |request_id| {
+            requests
+                .send(Request::ReadVariable {
+                    request_id,
+                    name: "A".into(),
+                    token: None,
+                    row_start: 1,
+                    column_start: 1,
+                    higher_indices: vec![4],
+                })
+                .unwrap();
+            match events.recv_timeout(Duration::from_secs(15)).unwrap() {
+                Event::VariableRead {
+                    request_id: actual,
+                    result: Ok(VariablePage::Typed { page, .. }),
+                } => {
+                    assert_eq!(actual, request_id);
+                    *page
+                }
+                _ => panic!("expected typed N-D page"),
+            }
+        };
+        let operation = |envelope: &TransactionEnvelope| {
+            requests
+                .send(Request::RangeTransaction(Box::new(envelope.clone())))
+                .unwrap();
+            match events.recv_timeout(Duration::from_secs(20)).unwrap() {
+                Event::RangeTransactionFinished {
+                    envelope: echoed,
+                    outcome,
+                } => {
+                    assert_eq!(echoed.as_ref(), envelope);
+                    *outcome
+                }
+                _ => panic!("expected range actor response"),
+            }
+        };
+        let values = |page: &ValuePage| match &page.data {
+            PageData::Dense {
+                real: NumericComponents::Uint64(values),
+                imag: None,
+            } => values.clone(),
+            _ => panic!("expected exact uint64 components"),
+        };
+        requests
+            .send(Request::Execute("A=reshape(uint64(1:60),[3,4,5]);".into()))
+            .unwrap();
+        match events.recv_timeout(Duration::from_secs(15)).unwrap() {
+            Event::Executed(result) => assert!(result.error.is_none()),
+            _ => panic!("expected initialization"),
+        }
+        let before = read(1);
+        assert_eq!(values(&before), (37..=48).collect::<Vec<_>>());
+        let mut state = RangeTransactions::default();
+        state.observe_page(1, &before);
+        let target = |page: &ValuePage| {
+            let mut selection = page.selection.clone();
+            selection.rows = 2;
+            selection.columns = 2;
+            PasteTarget {
+                path: ValuePath {
+                    root: page.token.clone(),
+                    steps: page.path.clone(),
+                },
+                class: page.class,
+                source_shape: page.source_shape.clone(),
+                source_storage: page.source_storage,
+                complex: page.complex,
+                selection,
+            }
+        };
+        let pasted = parse_range_paste(
+            "9007199254740993\t18446744073709551615\n7\t8",
+            &target(&before),
+            PasteLimits::default(),
+        )
+        .unwrap();
+        let command = state.begin_paste(2, pasted).unwrap();
+        let Some(TransactionOutcome::Applied {
+            receipt,
+            refresh: Ok(refresh),
+        }) = state.finish(&command, operation(&command))
+        else {
+            panic!("paste failed");
+        };
+        assert_eq!(
+            receipt.token.context.revision,
+            before.token.context.revision + 1
+        );
+        let data = values(&refresh.page);
+        assert_eq!(
+            [data[0], data[1], data[3], data[4]],
+            [9_007_199_254_740_993, 7, u64::MAX, 8]
+        );
+        assert_eq!(refresh.page.selection.higher_indices, vec![4.into()]);
+        state.observe_page(2, &refresh.page);
+        let undo = state.begin_history(3, EditOperation::Undo).unwrap();
+        let Some(TransactionOutcome::Applied {
+            refresh: Ok(refresh),
+            ..
+        }) = state.finish(&undo, operation(&undo))
+        else {
+            panic!("undo failed");
+        };
+        assert_eq!(values(&refresh.page), values(&before));
+        state.observe_page(3, &refresh.page);
+        let redo = state.begin_history(4, EditOperation::Redo).unwrap();
+        let Some(TransactionOutcome::Applied {
+            refresh: Ok(refresh),
+            ..
+        }) = state.finish(&redo, operation(&redo))
+        else {
+            panic!("redo failed");
+        };
+        let data = values(&refresh.page);
+        assert_eq!(
+            [data[0], data[1], data[3], data[4]],
+            [9_007_199_254_740_993, 7, u64::MAX, 8]
+        );
+        state.observe_page(4, &refresh.page);
+        let stale_page = refresh.page;
+        let parsed =
+            parse_range_paste("1\t2\n3\t4", &target(&stale_page), PasteLimits::default()).unwrap();
+        let stale = state.begin_paste(5, parsed).unwrap();
+        // Deliberately queue an external replacement before the old-token write.
+        requests
+            .send(Request::Execute("A=zeros(3,4,5,'uint64');".into()))
+            .unwrap();
+        requests
+            .send(Request::RangeTransaction(Box::new(stale.clone())))
+            .unwrap();
+        match events.recv_timeout(Duration::from_secs(15)).unwrap() {
+            Event::Executed(result) => assert!(result.error.is_none()),
+            _ => panic!("expected replacement before stale edit"),
+        }
+        let failed = match events.recv_timeout(Duration::from_secs(15)).unwrap() {
+            Event::RangeTransactionFinished { envelope, outcome } => {
+                assert_eq!(*envelope, stale);
+                let TransactionOutcome::Failed(failure) = *outcome else {
+                    panic!("old-token edit unexpectedly succeeded");
+                };
+                assert!(!failure.uncertain);
+                failure
+            }
+            _ => panic!("old-token edit must fail without a preview or refreshed retry"),
+        };
+        assert!(failed.message.contains("binding"));
+        state.finish(&stale, TransactionOutcome::Failed(failed));
+        assert!(
+            events.try_recv().is_err(),
+            "no automatic edit retry/refresh after rejection"
+        );
+        let fresh = read(6);
+        assert!(values(&fresh).iter().all(|value| *value == 0));
+        let stale_reset = TransactionEnvelope {
+            request_id: 7,
+            page: crate::range_transactions::PageIdentity::accepted(4, &stale_page),
+            command: TransactionCommand::Reset {
+                expected: stale_page.token.context.clone(),
+            },
+        };
+        assert!(matches!(
+            operation(&stale_reset),
+            TransactionOutcome::Failed(TransactionFailure {
+                uncertain: false,
+                ..
+            })
+        ));
+        let after_rejection = read(8);
+        assert_eq!(
+            after_rejection.token.context, fresh.token.context,
+            "stale reset must not revoke current bindings/history"
+        );
+        state.observe_page(8, &after_rejection);
+        let reset = state.begin_reset(9).unwrap();
+        let Some(TransactionOutcome::Reset(snapshot)) = state.finish(&reset, operation(&reset))
+        else {
+            panic!("explicit fresh reset failed");
+        };
+        assert_eq!(snapshot.context.revision, fresh.token.context.revision + 1);
+        assert!(state.history().is_none());
+        let current = read(10);
+        state.observe_page(10, &current);
+        let parsed =
+            parse_range_paste("1\t2\n3\t4", &target(&current), PasteLimits::default()).unwrap();
+        let dead_transport = state.begin_paste(11, parsed).unwrap();
+        _terminate.0.terminate().unwrap();
+        let outcome = operation(&dead_transport);
+        assert!(
+            matches!(
+                &outcome,
+                TransactionOutcome::Failed(TransactionFailure {
+                    uncertain: true,
+                    disconnected: true,
+                    ..
+                })
+            ),
+            "wrapped edit transport failure must retain typed closed-session state"
+        );
+        state.finish(&dead_transport, outcome);
+        assert!(state.quarantine().is_some());
+        assert!(events.try_recv().is_err(), "no retry after dead transport");
     }
 }

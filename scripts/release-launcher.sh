@@ -56,11 +56,12 @@ mathlab_state="${mathlab_state:-.mathlab/session.json}"
 if ! "$mathlab_custom_directory" && ! "$mathlab_has_source" && [[ ! -e "$mathlab_state" ]]; then
   mathlab_defaults+=(--open "$PWD/getting_started.m")
 fi
-for mathlab_adapter in DEBUG SCOPE INPUT; do
+for mathlab_adapter in DEBUG SCOPE INPUT VALUE; do
   case "$mathlab_adapter" in
     DEBUG) mathlab_module=mathlab_debug_bridge ;;
     SCOPE) mathlab_module=mathlab_scope_bridge ;;
     INPUT) mathlab_module=mathlab_input_bridge ;;
+    VALUE) mathlab_module=mathlab_value_bridge ;;
   esac
   mathlab_variable="MATHLAB_${mathlab_adapter}_BRIDGE"
   if [[ -f "$mathlab_contents/Resources/native/$mathlab_module.oct" && -z "${!mathlab_variable:-}" ]]; then

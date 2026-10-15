@@ -3,6 +3,7 @@
 SPDX-License-Identifier: GPL-3.0-or-later
 """
 import errno
+import copy
 import hashlib
 import importlib.util
 import json
@@ -33,6 +34,14 @@ import zlib
 mode = os.environ.get("QA_FAKE_MODE", "pass")
 if os.environ.get("QA_FAKE_LAUNCH_MARKER"):
     Path(os.environ["QA_FAKE_LAUNCH_MARKER"]).write_text("fake CLI launched")
+expected_value = Path(__file__).resolve().parents[1] / "Resources/native/mathlab_value_bridge.oct"
+if "MATHLAB_VALUE_BRIDGE" in os.environ:
+    if os.environ.get("QA_FAKE_EXPECT_VALUE") != "required" or os.environ["MATHLAB_VALUE_BRIDGE"] != str(expected_value):
+        print("Synthetic CLI rejected inherited MATHLAB_VALUE_BRIDGE", file=sys.stderr)
+        sys.exit(97)
+elif os.environ.get("QA_FAKE_EXPECT_VALUE") == "required":
+    print("Synthetic CLI did not receive the required installed value adapter", file=sys.stderr)
+    sys.exit(98)
 args = sys.argv[1:]
 if args == ["--version"]:
     print("mathlab 0.1.0")
@@ -77,9 +86,35 @@ if action == "doctor":
         child = "import pathlib,time; time.sleep(1); pathlib.Path("+repr(os.environ["QA_FAKE_CHILD_MARKER"])+").write_text('survived')"
         subprocess.Popen([sys.executable,"-c",child])
         time.sleep(10)
-    print(json.dumps({"application":"MathLab","version":"0.1.0","ready":True,"runtime":str(runtime),
+    capabilities = ["typed_nd_page.v1", "atomic_range_edit.v1"]
+    if os.environ.get("MATHLAB_VALUE_BRIDGE") or mode == "undeclared-value-capability":
+        capabilities.append("dense_complex_native_components.v1")
+    doctor = {"application":"MathLab","version":"0.1.0","ready":True,"runtime":str(runtime),
           "runtime_version":"GNU Octave version 11.3.0","working_directory":str(directory),"packages":[],
-          "scope_adapter":os.environ.get("MATHLAB_SCOPE_BRIDGE"),"input_adapter":os.environ.get("MATHLAB_INPUT_BRIDGE")}))
+          "scope_adapter":os.environ.get("MATHLAB_SCOPE_BRIDGE"),"input_adapter":os.environ.get("MATHLAB_INPUT_BRIDGE"),
+          "value_adapter":os.environ.get("MATHLAB_VALUE_BRIDGE"),"worker_capabilities":capabilities}
+    if mode == "missing-value-path":
+        doctor.pop("value_adapter")
+    elif mode == "wrong-value-path":
+        doctor["value_adapter"] = "/not-the-installed-bundle/mathlab_value_bridge.oct"
+    elif mode == "noncanonical-value-path":
+        doctor["value_adapter"] = str(expected_value.parent) + "/../native/mathlab_value_bridge.oct"
+    elif mode == "missing-value-capabilities":
+        doctor.pop("worker_capabilities")
+    elif mode == "missing-runtime-path":
+        doctor.pop("runtime")
+    elif mode == "incomplete-value-capabilities":
+        doctor["worker_capabilities"] = ["typed_nd_page.v1", "atomic_range_edit.v1"]
+    elif mode == "duplicate-value-capabilities":
+        doctor["worker_capabilities"].append(doctor["worker_capabilities"][0])
+    elif mode == "invalid-value-capabilities":
+        doctor["worker_capabilities"] = ["typed_nd_page.v1", 7, "dense_complex_native_components.v1"]
+    elif mode == "relative-runtime-path":
+        doctor["runtime"] = os.path.relpath(runtime, directory)
+    elif mode == "legacy-doctor-fields":
+        doctor.pop("value_adapter")
+        doctor.pop("worker_capabilities")
+    print(json.dumps(doctor))
 elif action == "repl":
     text=sys.stdin.read()
     assert "qa_session_seed=41" in text and ":workspace" in text and ":quit" in text
@@ -178,6 +213,49 @@ class InstalledQATests(unittest.TestCase):
         self.manifest["build"]["native"] = {"status": "enabled_protocol_load_passed", "artifact_sha256": hashes,
                                               "runtime_executable_sha256": qa.digest(self.runtime)}
         self.seal()
+
+    def required_value(self):
+        self.native()
+        self.write("Contents/Resources/native/mathlab_value_bridge.oct", "synthetic required value adapter")
+        self.write("Contents/Resources/native/runtime-version.txt", "11.3.0\n")
+        names = ("mathlab_debug_bridge.oct", "mathlab_scope_bridge.oct", "mathlab_input_bridge.oct",
+                 "mathlab_value_bridge.oct", "runtime-version.txt")
+        hashes = {name: qa.digest(self.bundle / "Contents/Resources/native" / name) for name in names}
+        self.manifest["build"]["native"] = {
+            "status": "enabled_protocol_load_passed",
+            "adapter_profile": {"schema_version": 1, "name": "four-adapter-value-v1"},
+            "value_component": {"status": "required", "path": "Contents/Resources/native/mathlab_value_bridge.oct",
+                                "capability": "dense_complex_native_components.v1", "sha256": hashes["mathlab_value_bridge.oct"]},
+            "artifact_sha256": hashes, "runtime_version": "11.3.0", "sdk": {"OCTAVE_VERSION": "11.3.0"},
+            "runtime_executable_sha256": qa.digest(self.runtime),
+            "protocols": {"debug": {"protocol": "mathlab-debugger", "version": 4},
+                          "scope": {"protocol": "mathlab-scope", "version": 2},
+                          "input": {"protocol": "mathlab-input", "version": 1},
+                          "value": {"protocol": "mathlab-value", "version": 1, "dense_complex_components": True,
+                                    "max_cells": 2000, "max_rank": 32, "max_replace_leaf_bytes": 134217728}},
+            "worker_observation": {"method": "built-cli-doctor", "ready": True,
+                                   "cli_executable_sha256": qa.digest(self.bundle / qa.CLI_PATH),
+                                   "value_adapter": "/vanished-build/native/mathlab_value_bridge.oct",
+                                   "runtime": "/vanished-build/runtime/octave",
+                                   "worker_capabilities": ["typed_nd_page.v1", "atomic_range_edit.v1",
+                                                           "dense_complex_native_components.v1", "future_extra.v1"],
+                                   "module_sha256": hashes["mathlab_value_bridge.oct"],
+                                   "runtime_executable_sha256": qa.digest(self.runtime)}}
+        self.manifest["build"]["linked_libraries"] = {name: "synthetic library inspection" for name in names if name.endswith(".oct")}
+        self.environment["QA_FAKE_EXPECT_VALUE"] = "required"
+        self.seal()
+
+    def omitted_value(self):
+        self.manifest["build"]["native"] = {
+            "status": "not_included", "adapter_profile": {"schema_version": 1, "name": "native-omitted-v1"},
+            "value_component": {"status": "not_included", "reason": "native_profile_not_requested"},
+            "reason": "Native profile was not requested", "artifact_sha256": {}}
+        self.seal()
+
+    def assert_identity_blocks_execution(self):
+        report = self.run_qa()
+        self.assertEqual(report["checks"]["bundle_identity"]["status"], "failed", json.dumps(report, indent=2))
+        self.assertEqual(report["commands"], [])
 
     def run_qa(self, mode="pass", timeout=5, output_limit=2 * 1024 * 1024, octave=None):
         environment = {**self.environment, "QA_FAKE_MODE": mode}
@@ -285,12 +363,248 @@ class InstalledQATests(unittest.TestCase):
     def test_external_native_adapter_environment_cannot_leak_into_an_omitted_profile(self):
         self.environment.update(MATHLAB_SCOPE_BRIDGE="/not-the-bundle/scope.oct",
                                 MATHLAB_INPUT_BRIDGE="/not-the-bundle/input.oct",
-                                MATHLAB_DEBUG_BRIDGE="/not-the-bundle/debug.oct")
+                                MATHLAB_DEBUG_BRIDGE="/not-the-bundle/debug.oct",
+                                MATHLAB_VALUE_BRIDGE="/not-the-bundle/value.oct")
         report = self.run_qa()
-        self.assertEqual(report["status"], "passed")
+        self.assertEqual(report["status"], "passed", json.dumps(report["checks"], indent=2))
         doctor = report["checks"]["doctor"]["evidence"]
         self.assertIsNone(doctor["input_adapter"])
         self.assertIsNone(doctor["scope_adapter"])
+        self.assertIsNone(doctor["value_adapter"])
+
+    def test_legacy_native_profile_does_not_inherit_an_external_value_adapter(self):
+        self.native()
+        self.environment.update(MATHLAB_SCOPE_BRIDGE="/not-the-bundle/scope.oct",
+                                MATHLAB_INPUT_BRIDGE="/not-the-bundle/input.oct",
+                                MATHLAB_VALUE_BRIDGE="/not-the-bundle/value.oct")
+        report = self.run_qa()
+        self.assertEqual(report["status"], "passed", json.dumps(report["checks"], indent=2))
+        doctor = report["checks"]["doctor"]["evidence"]
+        self.assertEqual(doctor["scope_adapter"], str(self.bundle / "Contents/Resources/native/mathlab_scope_bridge.oct"))
+        self.assertEqual(doctor["input_adapter"], str(self.bundle / "Contents/Resources/native/mathlab_input_bridge.oct"))
+        self.assertIsNone(doctor["value_adapter"])
+        self.assertEqual(report["qualification"]["native_input_coverage"], "passed")
+
+    def test_required_value_profile_uses_only_its_installed_adapter_and_keeps_value_journeys_pending(self):
+        self.required_value()
+        self.environment["MATHLAB_VALUE_BRIDGE"] = "/external/untrusted/mathlab_value_bridge.oct"
+        report = self.run_qa()
+        self.assertEqual(report["status"], "passed", json.dumps(report["checks"], indent=2))
+        doctor = report["checks"]["doctor"]["evidence"]
+        self.assertEqual(doctor["value_adapter"], str(self.bundle / "Contents/Resources/native/mathlab_value_bridge.oct"))
+        self.assertIn("dense_complex_native_components.v1", doctor["worker_capabilities"])
+        self.assertTrue(report["provenance"]["value_component_required"])
+        self.assertEqual(report["qualification"]["packaged_value_read_edit_history"], "not_run")
+        pending = {item["id"]: item for item in report["pending_release_journeys"]}
+        self.assertEqual(pending["packaged_value_read_edit_history"]["status"], "not_run")
+        self.assertEqual(pending["desktop_ui"]["status"], "not_run")
+        self.assertFalse(report["qualification"]["release_qualified"])
+
+    def test_declared_omitted_profile_scrubs_external_value_and_reports_no_value_support(self):
+        self.omitted_value()
+        self.environment["MATHLAB_VALUE_BRIDGE"] = "/external/untrusted/mathlab_value_bridge.oct"
+        report = self.run_qa()
+        self.assertEqual(report["status"], "passed", json.dumps(report["checks"], indent=2))
+        self.assertIsNone(report["checks"]["doctor"]["evidence"]["value_adapter"])
+        self.assertNotIn("dense_complex_native_components.v1", report["checks"]["doctor"]["evidence"]["worker_capabilities"])
+        self.assertFalse(report["provenance"]["value_component_required"])
+
+    def test_historical_legacy_doctor_without_value_fields_remains_valid(self):
+        for native in (False, True):
+            with self.subTest(native=native):
+                if native:
+                    self.native()
+                    # Historical three-adapter manifests did not require this fingerprint.
+                    self.manifest["build"]["native"].pop("runtime_executable_sha256")
+                    self.seal()
+                report = self.run_qa("legacy-doctor-fields")
+                self.assertEqual(report["status"], "passed", json.dumps(report["checks"], indent=2))
+                self.assertFalse(report["provenance"]["value_component_required"])
+
+    def test_null_unknown_or_extra_key_adapter_profiles_block_before_execution(self):
+        profiles = (None, [], {}, {"schema_version": 1, "name": "future-v2"},
+                    {"schema_version": 2, "name": "native-omitted-v1"},
+                    {"schema_version": True, "name": "native-omitted-v1"},
+                    {"schema_version": 1.0, "name": "native-omitted-v1"},
+                    {"schema_version": 1, "name": "native-omitted-v1", "extra": True})
+        for profile in profiles:
+            with self.subTest(profile=profile):
+                self.omitted_value()
+                self.manifest["build"]["native"]["adapter_profile"] = profile
+                self.seal()
+                self.assert_identity_blocks_execution()
+
+    def test_legacy_and_omitted_reject_bundled_value_modules_anywhere_or_case_aliases(self):
+        for declared in (False, True):
+            if declared:
+                self.omitted_value()
+            for path in ("Contents/Resources/native/mathlab_value_bridge.oct",
+                         "Contents/Resources/relocated/mathlab_value_bridge.oct",
+                         "Contents/Resources/relocated/MathLab_VALUE_bridge.OCT"):
+                with self.subTest(declared=declared, path=path):
+                    module = self.write(path, "undeclared value adapter")
+                    self.seal()
+                    self.assert_identity_blocks_execution()
+                    module.unlink()
+                    self.seal()
+
+    def test_legacy_rejects_value_declarations_even_without_a_module(self):
+        baseline = copy.deepcopy(self.manifest)
+        declarations = ({"value_component": {"status": "not_included"}},
+                        {"worker_observation": {}}, {"protocols": {"VALUE": {}}},
+                        {"artifact_sha256": {"MathLab_VALUE_bridge.OCT": "a" * 64}})
+        for declaration in declarations:
+            with self.subTest(declaration=declaration):
+                self.manifest = copy.deepcopy(baseline)
+                self.manifest["build"]["native"].update(declaration)
+                self.seal()
+                self.assert_identity_blocks_execution()
+
+    def test_omitted_profile_rejects_malformed_or_extra_value_declarations(self):
+        self.omitted_value()
+        baseline = copy.deepcopy(self.manifest)
+        changes = ({"value_component": None},
+                   {"value_component": {"status": "not_included", "reason": "native_profile_not_requested", "extra": True}},
+                   {"value_component": {"status": "required"}}, {"worker_observation": {}},
+                   {"protocols": {"value": {}}}, {"artifact_sha256": {"mathlab_value_bridge.oct": "a" * 64}})
+        for change in changes:
+            with self.subTest(change=change):
+                self.manifest = copy.deepcopy(baseline)
+                self.manifest["build"]["native"].update(change)
+                self.seal()
+                self.assert_identity_blocks_execution()
+
+    def test_required_profile_missing_manifest_prerequisites_block_before_execution(self):
+        self.required_value()
+        baseline = copy.deepcopy(self.manifest)
+        paths = (("native", "adapter_profile"), ("native", "value_component"),
+                 ("native", "runtime_executable_sha256"), ("native", "runtime_version"),
+                 ("native", "sdk"), ("native", "protocols"), ("native", "worker_observation"),
+                 ("linked_libraries",), ("native", "artifact_sha256", "mathlab_value_bridge.oct"),
+                 ("native", "artifact_sha256", "runtime-version.txt"))
+        for path in paths:
+            with self.subTest(path=path):
+                self.manifest = copy.deepcopy(baseline)
+                target = self.manifest["build"]
+                for part in path[:-1]:
+                    target = target[part]
+                del target[path[-1]]
+                self.seal()
+                self.assert_identity_blocks_execution()
+
+    def test_required_profile_rejects_rehashed_component_protocol_and_observation_mismatches(self):
+        self.required_value()
+        baseline = copy.deepcopy(self.manifest)
+        changes = (
+            (("value_component", "sha256"), "b" * 64),
+            (("value_component", "path"), "Contents/Resources/other/mathlab_value_bridge.oct"),
+            (("value_component", "extra"), True),
+            (("protocols", "value", "version"), 1.0),
+            (("protocols", "value", "max_rank"), True),
+            (("protocols", "value", "max_cells"), 2001),
+            (("protocols", "value", "extra"), True),
+            (("sdk", "OCTAVE_VERSION"), "11.2.0"),
+            (("runtime_executable_sha256",), "A" * 64),
+            (("worker_observation", "cli_executable_sha256"), "b" * 64),
+            (("worker_observation", "module_sha256"), "b" * 64),
+            (("worker_observation", "runtime_executable_sha256"), "b" * 64),
+            (("worker_observation", "ready"), 1),
+            (("worker_observation", "method"), "native-protocol-only"),
+            (("worker_observation", "value_adapter"), "relative/mathlab_value_bridge.oct"),
+            (("worker_observation", "value_adapter"), "/build/native/../native/mathlab_value_bridge.oct"),
+            (("worker_observation", "runtime"), "relative/octave"),
+            (("worker_observation", "worker_capabilities"), ["typed_nd_page.v1", "atomic_range_edit.v1"]),
+            (("worker_observation", "worker_capabilities"), ["dense_complex_native_components.v1"] * 3),
+            (("worker_observation", "worker_capabilities"), "dense_complex_native_components.v1"),
+            (("worker_observation", "extra"), True),
+        )
+        for path, replacement in changes:
+            with self.subTest(path=path, replacement=replacement):
+                self.manifest = copy.deepcopy(baseline)
+                target = self.manifest["build"]["native"]
+                for part in path[:-1]:
+                    target = target[part]
+                target[path[-1]] = replacement
+                self.seal()  # Regenerate payload and final hashes; contract consistency must still fail.
+                self.assert_identity_blocks_execution()
+
+    def test_required_profile_rehashed_changed_module_cli_or_version_marker_is_rejected(self):
+        self.required_value()
+        paths = ("Contents/Resources/native/mathlab_value_bridge.oct", qa.CLI_PATH,
+                 "Contents/Resources/native/runtime-version.txt")
+        for path in paths:
+            with self.subTest(path=path):
+                manifest_before = copy.deepcopy(self.manifest)
+                file = self.bundle / path
+                before = file.read_bytes()
+                file.write_bytes(before + b"\nchanged after observed build\n")
+                if path != qa.CLI_PATH:
+                    name = Path(path).name
+                    current_hash = qa.digest(file)
+                    self.manifest["build"]["native"]["artifact_sha256"][name] = current_hash
+                    if name == "mathlab_value_bridge.oct":
+                        self.manifest["build"]["native"]["value_component"]["sha256"] = current_hash
+                self.seal()
+                self.assert_identity_blocks_execution()
+                file.write_bytes(before)
+                self.manifest = manifest_before
+                self.seal()
+
+    def test_required_profile_rejects_duplicate_or_relocated_value_modules_after_resealing(self):
+        self.required_value()
+        canonical = self.bundle / "Contents/Resources/native/mathlab_value_bridge.oct"
+        for relocated in (False, True):
+            with self.subTest(relocated=relocated):
+                alias = self.write("Contents/Resources/other/MathLab_VALUE_bridge.OCT", canonical.read_text())
+                original = canonical.read_bytes()
+                if relocated:
+                    canonical.unlink()
+                self.seal()
+                self.assert_identity_blocks_execution()
+                alias.unlink()
+                canonical.write_bytes(original)
+                self.seal()
+
+    def test_required_doctor_missing_or_inconsistent_observations_fail_prerequisites(self):
+        self.required_value()
+        for mode in ("missing-value-path", "wrong-value-path", "noncanonical-value-path",
+                     "missing-value-capabilities", "missing-runtime-path", "incomplete-value-capabilities", "duplicate-value-capabilities",
+                     "invalid-value-capabilities", "relative-runtime-path"):
+            with self.subTest(mode=mode):
+                report = self.run_qa(mode)
+                self.assertEqual(report["checks"]["bundle_identity"]["status"], "passed")
+                self.assertEqual(report["checks"]["doctor"]["status"], "failed", json.dumps(report, indent=2))
+                self.assertEqual(report["checks"]["numerical_original_script"]["status"], "not_run")
+                self.assertFalse(report["qualification"]["release_qualified"])
+
+    def test_required_profile_current_external_runtime_must_match_observed_build_hash(self):
+        self.required_value()
+        self.runtime.write_text("Different external runtime bytes; same path and reported version\n")
+        report = self.run_qa()
+        self.assertEqual(report["checks"]["bundle_identity"]["status"], "passed")
+        self.assertEqual(report["checks"]["doctor"]["status"], "failed")
+        self.assertIn("External runtime differs", report["checks"]["doctor"]["reason"])
+
+    def test_legacy_and_omitted_doctor_must_not_claim_a_value_path_or_capability(self):
+        for declared in (False, True):
+            if declared:
+                self.omitted_value()
+            for mode in ("wrong-value-path", "undeclared-value-capability"):
+                with self.subTest(declared=declared, mode=mode):
+                    report = self.run_qa(mode)
+                    self.assertEqual(report["checks"]["doctor"]["status"], "failed")
+                    self.assertIn("unexpectedly activated", report["checks"]["doctor"]["reason"])
+
+    def test_duplicate_manifest_json_fields_fail_even_with_fresh_final_checksums(self):
+        self.omitted_value()
+        path = self.bundle / qa.RELEASE_PATH
+        text = path.read_text()
+        text = text.replace('"adapter_profile": {', '"adapter_profile": null, "adapter_profile": {', 1)
+        path.write_text(text)
+        actual = qa.inventory(self.bundle)
+        self.write(qa.CHECKSUM_PATH, "".join(actual[name]["sha256"] + "  " + name + "\n"
+                                            for name in sorted(actual) if name != qa.CHECKSUM_PATH))
+        self.assert_identity_blocks_execution()
 
     def test_repl_execution_error_fails_even_when_the_process_exits_zero(self):
         report = self.run_qa("repl-error")

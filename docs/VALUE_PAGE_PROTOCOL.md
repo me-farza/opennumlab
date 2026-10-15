@@ -1,6 +1,6 @@
 # Typed value pages
 
-This is the CP03 typed-read data-service slice. The Rust codec and private Octave helper
+This records the committed `3aa3db0` CP03 typed-read data-service slice. The Rust codec and private Octave helper
 are connected to Engine's optional checked-page API and the desktop's numeric
 inspector. Its combined macOS arm64/Octave 11.3 regression run passed 302 test
 entrypoints with the scope, debugger and input adapters enabled, including 12
@@ -8,7 +8,21 @@ actual-worker typed-page groups and 84 desktop tests. These results qualify the
 declared read subset. Native visual acceptance and
 installed-package qualification remain separate.
 It extends [the CP02 workspace protocol](WORKSPACE_PROTOCOL.md), committed and
-validated separately as `6c575f5`. Atomic range edits and undo remain unfinished.
+validated separately as `6c575f5`. Complete CP03 acceptance remains unfinished.
+
+The development checkpoint adds a native component route for dense
+complex values to avoid losing imaginary negative zero through native selection.
+It requires the optional `dense_complex_native_components.v1` capability for
+that route and rejects dense complex requests explicitly when the helper is
+unavailable. The [follow-up report](../artifacts/cp03-followup-validation/RESULTS.json)
+records 404 passing entrypoints across all 19 compiled workspace test targets,
+with freshly built scope, debugger, input and value adapters on macOS arm64 /
+Octave 11.3. The original typed-page (12), binding (13) and session (56) targets
+passed, alongside workspace check, strict all-target Clippy and formatting.
+The four crate doctest invocations contained no tests. Exact source manifests,
+preserved executables and earlier failed attempts are retained. These results
+supersede neither historical evidence nor the separate installed, interactive,
+dispatcher, storage-variant and resource gates.
 
 ## Ownership and scope
 
@@ -17,8 +31,9 @@ three required CP02 capabilities or ordinary protocol version 1. The
 `read_value_page_checked` dispatch compares the complete root `BindingToken`
 with the current worker context immediately before resolving the path, in the
 same owned ordinary operation. A stale read fails; it never reacquires a token or
-falls back to an effectful preview. This first slice is a read operation. Atomic
-range writes, accepted transaction receipts and undo remain later CP03 work.
+falls back to an effectful preview. The original checkpoint covers reads;
+the development write/history contract is described in
+[bounded range edits](VALUE_EDIT_PROTOCOL.md). Its desktop actions remain unwired.
 
 Initially supported leaves are primitive double, single, signed/unsigned integer
 and logical arrays. Complex leaves require single or double. Sparse leaves are
