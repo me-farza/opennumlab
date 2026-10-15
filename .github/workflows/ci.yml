@@ -1,0 +1,102 @@
+name: Rust and Octave checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  packaging-contracts:
+    name: Synthetic package contracts (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fresh staging, frozen source, publication and installed launcher contracts
+        run: python3 scripts/release-package-tests.py
+      - name: Installed CLI acceptance harness contracts (synthetic)
+        run: python3 -B scripts/qa-installed-tests.py
+      - name: Deterministic corresponding-source archive contracts (synthetic)
+        run: python3 -B scripts/release-source-tests.py
+      - name: Sanitized public file-tree contracts (synthetic)
+        run: python3 -B scripts/release-public-tree-tests.py
+      - name: Shell syntax
+        run: bash -n scripts/package-macos.sh scripts/release-launcher.sh scripts/release-native-gate.sh
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Install Octave and desktop build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            octave gnuplot-nox fonts-freefont-otf octave-control octave-signal \
+            octave-image octave-statistics octave-optim octave-struct \
+            build-essential pkg-config libx11-dev libxi-dev libxcursor-dev \
+            libxrandr-dev libxinerama-dev libgl1-mesa-dev libwayland-dev libxkbcommon-dev
+      - name: Rust checks, runtime fixtures, and adapter checks
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: ./scripts/verify.sh --require-octave --with-control --with-toolboxes
+
+  native:
+    name: Enabled native adapters (Octave 11.3.0, Linux x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    # GNU Octave's published linux/amd64 image includes its matching headers,
+    # mkoctfile and compiler. Pin the actual image, not the mutable version tag.
+    # https://github.com/gnu-octave/docker/pkgs/container/octave
+    container:
+      image: ghcr.io/gnu-octave/octave:11.3.0@sha256:185db7993e000d4f3f6e7bbbf7fb3f999f52e799ea52231ad8a15353381e0dcb
+      options: --user 0
+    defaults:
+      run:
+        shell: bash
+    env:
+      MATHLAB_EXPECT_OCTAVE_VERSION: "11.3.0"
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+      OPENBLAS_NUM_THREADS: "1"
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - name: Bootstrap checkout and toolchain prerequisites
+        shell: sh
+        timeout-minutes: 3
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git curl bash ca-certificates
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install desktop link dependencies
+        timeout-minutes: 5
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            python3 fonts-freefont-otf pkg-config libx11-dev libxi-dev libxcursor-dev \
+            libxrandr-dev libxinerama-dev libgl1-mesa-dev libwayland-dev libxkbcommon-dev
+      - name: Check native gate failure and skip handling
+        run: python3 scripts/release-native-gate-test.py
+      - name: Build and execute required native and CLI contracts
+        timeout-minutes: 27
+        run: bash scripts/release-native-gate.sh --report-dir target/release-native-gate
+      - name: Retain enabled or failed native evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-linux-x86_64-octave-11.3.0
+          path: target/release-native-gate/
+          if-no-files-found: error
+          retention-days: 14

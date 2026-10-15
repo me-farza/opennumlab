@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "case_id": "intentional_error",
+  "outcome": "error",
+  "values": [
+    {
+      "name": "pre_error",
+      "class": "uint32",
+      "shape": [
+        1,
+        2
+      ],
+      "complex": false,
+      "storage": "dense",
+      "rows": [],
+      "columns": [],
+      "real": [
+        "7",
+        "11"
+      ],
+      "imag": []
+    }
+  ],
+  "error": {
+    "identifier": "MathLab:ConformanceIntentional",
+    "message": "Original conformance failure for transport testing."
+  }
+}

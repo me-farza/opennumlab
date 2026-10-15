@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "reference_profile": "Octave execution smoke tests; no MATLAB reference release has been validated",
+  "features": [
+    {
+      "id": "language.arrays",
+      "category": "language",
+      "apis": ["reshape", "size", "sum", "colon indexing", "end indexing", "logical indexing", "transpose", "ctranspose", "times", "power"],
+      "fixture": "tests/fixtures/language_core.m",
+      "status": "targeted"
+    },
+    {
+      "id": "language.containers-control-flow",
+      "category": "language",
+      "apis": ["cell", "struct", "field access", "for", "if", "anonymous functions", "try/catch", "error", "assert"],
+      "fixture": "tests/fixtures/language_core.m",
+      "status": "targeted"
+    },
+    {
+      "id": "language.functions-and-classes",
+      "category": "language",
+      "apis": ["classdef value and handle classes", "inheritance", "dependent properties", "private properties", "operator methods", "nested closures", "varargin", "varargout", "nargin", "nargout", "integer saturation", "multidimensional indexing", "complex sparse arithmetic"],
+      "fixture": "tests/fixtures/core_types_functions.m",
+      "status": "targeted"
+    },
+    {
+      "id": "language.script-local-functions",
+      "category": "language",
+      "apis": ["forward local calls", "local workspaces", "nested local closures", "private sibling calls", "retained local handles"],
+      "fixture": "tests/fixtures/script_local_functions.m",
+      "status": "targeted"
+    },
+    {
+      "id": "numeric.dense-linear-algebra",
+      "category": "numeric",
+      "apis": ["mldivide", "mtimes", "norm", "qr", "svd", "chol", "eye"],
+      "fixture": "tests/fixtures/linear_algebra.m",
+      "status": "targeted"
+    },
+    {
+      "id": "numeric.sparse-linear-algebra",
+      "category": "numeric",
+      "apis": ["sparse", "nnz", "full", "diag", "mldivide"],
+      "fixture": "tests/fixtures/linear_algebra.m",
+      "status": "targeted"
+    },
+    {
+      "id": "numeric.fft",
+      "category": "numeric",
+      "apis": ["fft", "ifft", "sin", "abs", "max"],
+      "fixture": "tests/fixtures/fft_core.m",
+      "status": "targeted"
+    },
+    {
+      "id": "files.mat-v7-roundtrip",
+      "category": "files",
+      "apis": ["save -v7", "load", "numeric", "complex", "logical", "sparse", "char", "cell", "struct", "uint8"],
+      "fixture": "tests/fixtures/mat_roundtrip.m",
+      "status": "targeted"
+    },
+    {
+      "id": "graphics.line-svg-export",
+      "category": "graphics",
+      "apis": ["figure", "plot", "title", "xlabel", "ylabel", "grid", "get", "set", "print -dsvg", "close"],
+      "fixture": "tests/fixtures/graphics_core.m",
+      "status": "targeted"
+    }
+  ]
+}

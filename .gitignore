@@ -1,0 +1,12 @@
+/target/
+/dist/
+/artifacts/
+/native/*.oct
+/native/*.o
+/native/runtime-version.txt
+/.mathlab/
+.DS_Store
+octave-workspace
+*.swp
+*.swo
+*~

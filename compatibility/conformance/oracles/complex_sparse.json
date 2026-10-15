@@ -1,0 +1,167 @@
+{
+  "schema_version": 1,
+  "case_id": "complex_sparse",
+  "outcome": "success",
+  "values": [
+    {
+      "name": "complex_double",
+      "class": "double",
+      "shape": [
+        2,
+        2
+      ],
+      "complex": true,
+      "storage": "dense",
+      "rows": [],
+      "columns": [],
+      "real": [
+        "1",
+        "0",
+        "-2",
+        "0.5"
+      ],
+      "imag": [
+        "3",
+        "-4",
+        "0",
+        "0.25"
+      ]
+    },
+    {
+      "name": "complex_single",
+      "class": "single",
+      "shape": [
+        2,
+        2
+      ],
+      "complex": true,
+      "storage": "dense",
+      "rows": [],
+      "columns": [],
+      "real": [
+        "1",
+        "0",
+        "-2",
+        "0.5"
+      ],
+      "imag": [
+        "3",
+        "-4",
+        "0",
+        "0.25"
+      ]
+    },
+    {
+      "name": "empty",
+      "class": "double",
+      "shape": [
+        0,
+        3
+      ],
+      "complex": false,
+      "storage": "dense",
+      "rows": [],
+      "columns": [],
+      "real": [],
+      "imag": []
+    },
+    {
+      "name": "logical",
+      "class": "logical",
+      "shape": [
+        2,
+        2
+      ],
+      "complex": false,
+      "storage": "dense",
+      "rows": [],
+      "columns": [],
+      "real": [
+        "1",
+        "0",
+        "0",
+        "1"
+      ],
+      "imag": []
+    },
+    {
+      "name": "sparse_complex",
+      "class": "double",
+      "shape": [
+        3,
+        4
+      ],
+      "complex": true,
+      "storage": "sparse",
+      "rows": [
+        1,
+        3
+      ],
+      "columns": [
+        2,
+        4
+      ],
+      "real": [
+        "2",
+        "-1"
+      ],
+      "imag": [
+        "3",
+        "4"
+      ]
+    },
+    {
+      "name": "sparse_logical",
+      "class": "logical",
+      "shape": [
+        3,
+        4
+      ],
+      "complex": false,
+      "storage": "sparse",
+      "rows": [
+        1,
+        3
+      ],
+      "columns": [
+        2,
+        4
+      ],
+      "real": [
+        "1",
+        "1"
+      ],
+      "imag": []
+    },
+    {
+      "name": "sparse_real",
+      "class": "double",
+      "shape": [
+        3,
+        4
+      ],
+      "complex": false,
+      "storage": "sparse",
+      "rows": [
+        1,
+        3,
+        2
+      ],
+      "columns": [
+        1,
+        2,
+        4
+      ],
+      "real": [
+        "3",
+        "-4",
+        "0.5"
+      ],
+      "imag": []
+    }
+  ],
+  "error": {
+    "identifier": "",
+    "message": ""
+  }
+}

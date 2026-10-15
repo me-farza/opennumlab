@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "profile": {
+    "octave_version": "11.3.0",
+    "matlab_release": "R2026b"
+  },
+  "support": "support",
+  "cases": [
+    {
+      "id": "exact_nd_uint64",
+      "fixture": "fixtures/exact_nd_uint64.m",
+      "oracle": "oracles/exact_nd_uint64.json",
+      "expected_outcome": "success",
+      "float_absolute_tolerance": 0,
+      "float_relative_tolerance": 0,
+      "raw_octave_unsupported_identifiers": []
+    },
+    {
+      "id": "complex_sparse",
+      "fixture": "fixtures/complex_sparse.m",
+      "oracle": "oracles/complex_sparse.json",
+      "expected_outcome": "success",
+      "float_absolute_tolerance": 0,
+      "float_relative_tolerance": 0,
+      "raw_octave_unsupported_identifiers": []
+    },
+    {
+      "id": "closure_forward_local",
+      "fixture": "fixtures/closure_forward_local.m",
+      "oracle": "oracles/closure_forward_local.json",
+      "expected_outcome": "success",
+      "float_absolute_tolerance": 0,
+      "float_relative_tolerance": 0,
+      "raw_octave_unsupported_identifiers": ["Octave:undefined-function"]
+    },
+    {
+      "id": "intentional_error",
+      "fixture": "fixtures/intentional_error.m",
+      "oracle": "oracles/intentional_error.json",
+      "expected_outcome": "error",
+      "expected_error_identifier": "MathLab:ConformanceIntentional",
+      "float_absolute_tolerance": 0,
+      "float_relative_tolerance": 0,
+      "raw_octave_unsupported_identifiers": []
+    },
+    {
+      "id": "mat_v7",
+      "fixture": "fixtures/mat_v7.m",
+      "oracle": "oracles/mat_v7.json",
+      "expected_outcome": "success",
+      "float_absolute_tolerance": 0,
+      "float_relative_tolerance": 0,
+      "raw_octave_unsupported_identifiers": []
+    }
+  ]
+}

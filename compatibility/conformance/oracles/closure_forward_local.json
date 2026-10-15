@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "case_id": "closure_forward_local",
+  "outcome": "success",
+  "values": [
+    {
+      "name": "anonymous_capture",
+      "class": "double",
+      "shape": [
+        1,
+        1
+      ],
+      "complex": false,
+      "storage": "dense",
+      "rows": [],
+      "columns": [],
+      "real": [
+        "12"
+      ],
+      "imag": []
+    },
+    {
+      "name": "first",
+      "class": "double",
+      "shape": [
+        1,
+        1
+      ],
+      "complex": false,
+      "storage": "dense",
+      "rows": [],
+      "columns": [],
+      "real": [
+        "7"
+      ],
+      "imag": []
+    },
+    {
+      "name": "forward",
+      "class": "double",
+      "shape": [
+        1,
+        1
+      ],
+      "complex": false,
+      "storage": "dense",
+      "rows": [],
+      "columns": [],
+      "real": [
+        "9"
+      ],
+      "imag": []
+    },
+    {
+      "name": "initial",
+      "class": "double",
+      "shape": [
+        1,
+        1
+      ],
+      "complex": false,
+      "storage": "dense",
+      "rows": [],
+      "columns": [],
+      "real": [
+        "4"
+      ],
+      "imag": []
+    },
+    {
+      "name": "second",
+      "class": "double",
+      "shape": [
+        1,
+        1
+      ],
+      "complex": false,
+      "storage": "dense",
+      "rows": [],
+      "columns": [],
+      "real": [
+        "9"
+      ],
+      "imag": []
+    }
+  ],
+  "error": {
+    "identifier": "",
+    "message": ""
+  }
+}

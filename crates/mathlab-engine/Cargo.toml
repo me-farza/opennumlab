@@ -1,0 +1,16 @@
+[package]
+name = "mathlab-engine"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "Persistent GNU Octave execution engine for Open MathLab"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+tempfile = "3"
+mathlab-language = { path = "../mathlab-language" }
+mathlab-debugger = { path = "../mathlab-debugger" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

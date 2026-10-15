@@ -1,0 +1,8 @@
+[package]
+name = "mathlab-language"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "Lexical MATLAB script preparation for Open MathLab"
+
+[dependencies]

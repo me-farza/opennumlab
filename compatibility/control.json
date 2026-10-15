@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "reference_profile": "Optional Octave control-package smoke test; no MATLAB toolbox reference has been validated",
+  "features": [
+    {
+      "id": "control.first-order-step",
+      "category": "optional-package",
+      "apis": ["tf", "step", "dcgain"],
+      "fixture": "tests/fixtures/control_optional.m",
+      "status": "targeted"
+    }
+  ]
+}

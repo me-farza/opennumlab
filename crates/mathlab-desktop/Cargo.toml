@@ -1,0 +1,23 @@
+[package]
+name = "mathlab-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A native Rust scientific desktop for the Open MathLab engine"
+
+[dependencies]
+mathlab-engine = { path = "../mathlab-engine" }
+mathlab-debugger = { path = "../mathlab-debugger" }
+eframe.workspace = true
+rfd.workspace = true
+image.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[bin]]
+name = "mathlab-desktop"
+path = "src/main.rs"

@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "case_id": "mat_sparse_logical",
+  "outcome": "success",
+  "values": [
+    {
+      "name": "loaded",
+      "class": "logical",
+      "shape": [
+        3,
+        4
+      ],
+      "complex": false,
+      "storage": "sparse",
+      "rows": [
+        1,
+        3
+      ],
+      "columns": [
+        2,
+        4
+      ],
+      "real": [
+        "1",
+        "1"
+      ],
+      "imag": []
+    },
+    {
+      "name": "original",
+      "class": "logical",
+      "shape": [
+        3,
+        4
+      ],
+      "complex": false,
+      "storage": "sparse",
+      "rows": [
+        1,
+        3
+      ],
+      "columns": [
+        2,
+        4
+      ],
+      "real": [
+        "1",
+        "1"
+      ],
+      "imag": []
+    }
+  ],
+  "error": {
+    "identifier": "",
+    "message": ""
+  }
+}

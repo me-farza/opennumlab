@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "kind": "raw-octave-known-gap-observation",
+  "observed_at": "2026-10-15T15:58:03.673231+00:00",
+  "runtime": {
+    "name": "GNU Octave",
+    "version": "11.3.0",
+    "executable": "/opt/homebrew/bin/octave-cli"
+  },
+  "reference_status": "not_run",
+  "mathlab_status": "not_run",
+  "expected_outcome": "success",
+  "observed_outcome": "error",
+  "fixture": "fixtures/mat_sparse_logical.m",
+  "fixture_sha256": "0515f98b3efeddfbd1c003fa17d2a0ae70ab8ca83eeabf551a05a01868201ec1",
+  "writer_sha256": "f139979cc86fb7fd872dbf961c21aca621a1e1ba8d0a92b56bb64f488b7bd099",
+  "oracle": "oracles/mat_sparse_logical.json",
+  "oracle_sha256": "c9ccc5690c6284ae600be1c5071b1944e332db43589390bc1d0d3e536aaa7e11",
+  "record": {
+    "schema_version": 1,
+    "case_id": "mat_sparse_logical",
+    "outcome": "error",
+    "values": [
+      {
+        "name": "loaded",
+        "class": "logical",
+        "shape": [
+          3,
+          4
+        ],
+        "complex": false,
+        "storage": "dense",
+        "rows": [],
+        "columns": [],
+        "real": [
+          "0",
+          "1",
+          "1",
+          "1",
+          "0",
+          "0",
+          "1",
+          "1",
+          "1",
+          "0",
+          "1",
+          "1"
+        ],
+        "imag": []
+      },
+      {
+        "name": "original",
+        "class": "logical",
+        "shape": [
+          3,
+          4
+        ],
+        "complex": false,
+        "storage": "sparse",
+        "rows": [
+          1,
+          3
+        ],
+        "columns": [
+          2,
+          4
+        ],
+        "real": [
+          "1",
+          "1"
+        ],
+        "imag": []
+      }
+    ],
+    "error": {
+      "identifier": "",
+      "message": "MAT7 sparse logical storage must be preserved."
+    }
+  },
+  "process_exit_code": 0,
+  "interpretation": "The driver caught the fixture assertion and wrote its failed record. Driver exit zero is not a passing fixture. This Octave-only observation is not a MATLAB saved reference."
+}

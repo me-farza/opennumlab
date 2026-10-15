@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "reference_profile": "Optional Octave package smoke tests; no MATLAB toolbox reference release has been validated",
+  "features": [
+    {
+      "id": "signal.filter-response",
+      "category": "optional-package",
+      "apis": ["butter", "freqz", "filter"],
+      "fixture": "tests/fixtures/toolboxes_optional.m",
+      "status": "targeted"
+    },
+    {
+      "id": "control.first-order-step",
+      "category": "optional-package",
+      "apis": ["tf", "step", "dcgain"],
+      "fixture": "tests/fixtures/toolboxes_optional.m",
+      "status": "targeted"
+    },
+    {
+      "id": "image.binary-connectivity-morphology",
+      "category": "optional-package",
+      "apis": ["bwlabel", "strel", "imdilate"],
+      "fixture": "tests/fixtures/toolboxes_optional.m",
+      "status": "targeted"
+    },
+    {
+      "id": "statistics.normal-regression",
+      "category": "optional-package",
+      "apis": ["normcdf", "normpdf", "norminv", "regress"],
+      "fixture": "tests/fixtures/toolboxes_optional.m",
+      "status": "targeted"
+    },
+    {
+      "id": "optim.least-squares-fit",
+      "category": "optional-package",
+      "apis": ["lsqnonlin", "optimset"],
+      "fixture": "tests/fixtures/toolboxes_optional.m",
+      "status": "targeted"
+    }
+  ]
+}

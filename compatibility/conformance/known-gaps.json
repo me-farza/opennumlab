@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "profile": {
+    "octave_version": "11.3.0",
+    "matlab_release": "R2026b"
+  },
+  "support": "support",
+  "cases": [
+    {
+      "id": "mat_sparse_logical",
+      "fixture": "fixtures/mat_sparse_logical.m",
+      "oracle": "oracles/mat_sparse_logical.json",
+      "expected_outcome": "success",
+      "float_absolute_tolerance": 0,
+      "float_relative_tolerance": 0,
+      "raw_octave_unsupported_identifiers": []
+    }
+  ]
+}
