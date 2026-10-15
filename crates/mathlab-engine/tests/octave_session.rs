@@ -1211,7 +1211,7 @@ fn optional_prepared_debugger_uses_unsaved_plain_snapshot_then_restores_saved_so
     assert!(result.unwrap().error.is_none());
     assert_eq!(fs::read_to_string(&original).unwrap(), saved);
     debugger.clear_breakpoint(&original, 2).unwrap();
-    assert!(!engine.prepare_debug_file(&original).unwrap().prepared);
+    assert!(engine.prepare_debug_file(&original).unwrap().prepared);
     assert_eq!(debugger.set_breakpoint(&original, 2).unwrap(), vec![2]);
     let mut cleanup = RunningRequestGuard(Some(engine.cancellation_handle()));
     let run_path = original.clone();
@@ -3258,4 +3258,264 @@ fn optional_native_plain_buffer_entry_uses_original_script_path_and_resources() 
             .unwrap();
         assert!(result.error.is_none(), "{:?}", result.error);
     }
+}
+
+// Keep file size and modification time unchanged so source identity cannot be
+// inferred from timestamps, timestamp resolution, size, or a sleep in the test.
+fn rewrite_saved_source_same_size_and_mtime(path: &std::path::Path, before: &str, after: &str) {
+    assert_eq!(before.len(), after.len());
+    assert_ne!(before, after);
+    let modified = fs::metadata(path).unwrap().modified().unwrap();
+    fs::write(path, after).unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), modified);
+    assert_eq!(fs::read_to_string(path).unwrap(), after);
+}
+
+#[test]
+fn optional_debugger_saved_plain_source_reloads_after_step_clear_and_same_identity_rewrite() {
+    let Some(bridge) = std::env::var_os("MATHLAB_DEBUG_BRIDGE") else {
+        eprintln!(
+            "Skipping saved-source debugger regression: set MATHLAB_DEBUG_BRIDGE to the locally compiled adapter."
+        );
+        return;
+    };
+    let Some((mut engine, directory)) = engine() else {
+        return;
+    };
+    let original = fs::canonicalize(directory.path())
+        .unwrap()
+        .join("debug_check.m");
+    let prefix = "qa_debug=10;\nqa_debug=qa_debug+5;\nqa_result=qa_debug*2;\nfprintf('QA_RESULT=%d\\n',qa_result);\n";
+    let marker = "qa_saved_marker=77;\nfprintf('QA_SAVED_MARKER=%d\\n',qa_saved_marker);\n";
+    // The old inert comment has exactly the marker block's byte length. The
+    // rewrite changes 10->77 and enables the marker without changing file size.
+    let before = format!("{prefix}%{}\n", " ".repeat(marker.len() - 2));
+    let after = format!(
+        "{}{marker}",
+        prefix.replacen("qa_debug=10;", "qa_debug=77;", 1)
+    );
+    assert_eq!(before.len(), after.len());
+    fs::write(&original, &before).unwrap();
+    let unrelated_counter = original.with_file_name("saved_source_unrelated_counter.m");
+    fs::write(
+        &unrelated_counter,
+        "function value=saved_source_unrelated_counter()\n persistent count=0;\n count=count+1;\n value=count;\nend\n",
+    )
+    .unwrap();
+    let initialized = engine
+        .execute("qa_retained_counter=@saved_source_unrelated_counter; assert(qa_retained_counter()==1);")
+        .unwrap();
+    assert!(initialized.error.is_none(), "{:?}", initialized.error);
+    let debugger = engine
+        .enable_debugger(std::path::Path::new(&bridge))
+        .unwrap();
+    let process_id = engine.process_id();
+    engine.prepare_debug_file(&original).unwrap();
+    assert_eq!(debugger.set_breakpoint(&original, 2).unwrap(), vec![2]);
+    let mut cleanup = RunningRequestGuard(Some(engine.cancellation_handle()));
+    let run_path = original.clone();
+    let mut task = Some(thread::spawn(move || {
+        let result = engine.run_file_with_timeout(&run_path, Duration::from_secs(20));
+        (engine, result)
+    }));
+    let pause = wait_debug_pause_or_finished(&debugger, 2, 0, &mut task);
+    assert_eq!(pause.file, original);
+    let locals = debugger.workspace(pause.revision).unwrap();
+    assert!(locals.iter().any(|variable| variable.name == "qa_debug"));
+    assert_eq!(
+        debugger
+            .evaluate("disp(qa_debug);", pause.revision)
+            .unwrap(),
+        "10\n"
+    );
+    assert_eq!(
+        debugger
+            .evaluate("disp(qa_debug+2);", pause.revision)
+            .unwrap(),
+        "12\n"
+    );
+    debugger.resume(ResumeAction::Step, pause.revision).unwrap();
+    let stepped = wait_debug_pause_or_finished(&debugger, 3, pause.revision, &mut task);
+    assert_eq!(
+        debugger
+            .evaluate("disp(qa_debug);", stepped.revision)
+            .unwrap(),
+        "15\n"
+    );
+    debugger
+        .resume(ResumeAction::Continue, stepped.revision)
+        .unwrap();
+    let (mut engine, result) = task.take().unwrap().join().unwrap();
+    cleanup.disarm();
+    let result = result.unwrap();
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert!(
+        result.output.contains("QA_RESULT=30\n"),
+        "{}",
+        result.output
+    );
+    assert!(
+        !result.output.contains("QA_SAVED_MARKER="),
+        "{}",
+        result.output
+    );
+    assert!(
+        !result
+            .workspace
+            .iter()
+            .any(|value| value.name == "qa_saved_marker")
+    );
+    debugger.clear_breakpoint(&original, 2).unwrap();
+
+    rewrite_saved_source_same_size_and_mtime(&original, &before, &after);
+    // No clear-functions, restart, extra timestamp delay or explicit reprepare
+    // is allowed to hide run_file's responsibility to observe the saved bytes.
+    let rerun = engine
+        .run_file_with_timeout(&original, Duration::from_secs(15))
+        .unwrap();
+    assert!(rerun.error.is_none(), "{:?}", rerun.error);
+    assert_eq!(
+        rerun.output, "QA_RESULT=164\nQA_SAVED_MARKER=77\n",
+        "saved source executed a previously cached AST"
+    );
+    assert!(
+        rerun
+            .workspace
+            .iter()
+            .any(|value| value.name == "qa_saved_marker")
+    );
+    assert_eq!(engine.process_id(), process_id);
+    // A named lookup and the retained handle must still share the original
+    // persistent scope. A blanket function-cache clear could split/reset them.
+    let checked = engine
+        .execute("assert(qa_debug==82 && qa_result==164 && qa_saved_marker==77); assert(saved_source_unrelated_counter()==2); assert(qa_retained_counter()==3);")
+        .unwrap();
+    assert!(checked.error.is_none(), "{:?}", checked.error);
+    assert_eq!(engine.process_id(), process_id);
+}
+
+#[test]
+fn optional_debugger_saved_plain_generations_rebind_breakpoints_and_keep_old_snapshots() {
+    let Some(bridge) = std::env::var_os("MATHLAB_DEBUG_BRIDGE") else {
+        eprintln!(
+            "Skipping saved-source generation regression: set MATHLAB_DEBUG_BRIDGE to the locally compiled adapter."
+        );
+        return;
+    };
+    let Some((mut engine, directory)) = engine() else {
+        return;
+    };
+    let original = fs::canonicalize(directory.path())
+        .unwrap()
+        .join("saved_generation.m");
+    let before =
+        "qa_migrate=10;\nqa_migrated=qa_migrate+5;\nfprintf('QA_MIGRATED=%d\\n',qa_migrated);\n";
+    let after = before.replacen("qa_migrate=10;", "qa_migrate=77;", 1);
+    fs::write(&original, before).unwrap();
+    let debugger = engine
+        .enable_debugger(std::path::Path::new(&bridge))
+        .unwrap();
+    let process_id = engine.process_id();
+    let first = engine.prepare_debug_file(&original).unwrap();
+    assert_eq!(debugger.set_breakpoint(&original, 2).unwrap(), vec![2]);
+    let mut cleanup = RunningRequestGuard(Some(engine.cancellation_handle()));
+    let run_path = original.clone();
+    let mut task = Some(thread::spawn(move || {
+        let result = engine.run_file_with_timeout(&run_path, Duration::from_secs(20));
+        (engine, result)
+    }));
+    let old_pause = wait_debug_pause_or_finished(&debugger, 2, 0, &mut task);
+    assert_eq!(old_pause.file, original);
+    assert_eq!(
+        debugger
+            .evaluate("disp(qa_migrate);", old_pause.revision)
+            .unwrap(),
+        "10\n"
+    );
+    debugger
+        .resume(ResumeAction::Continue, old_pause.revision)
+        .unwrap();
+    let (mut engine, result) = task.take().unwrap().join().unwrap();
+    cleanup.disarm();
+    let result = result.unwrap();
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert!(
+        result.output.contains("QA_MIGRATED=15\n"),
+        "{}",
+        result.output
+    );
+
+    rewrite_saved_source_same_size_and_mtime(&original, before, &after);
+    // Preparing changed saved source must migrate the still-enabled original
+    // breakpoint group automatically. Do not set the breakpoint again: an
+    // explicit rebind would hide a lost stop during source generation changes.
+    let second = engine.prepare_debug_file(&original).unwrap();
+    assert!(
+        first.prepared && second.prepared,
+        "debugged saved plain scripts require immutable source generations"
+    );
+    assert_ne!(
+        first.script_path, second.script_path,
+        "different saved bytes reused the old execution identity"
+    );
+    assert_eq!(
+        engine.prepare_debug_file(&original).unwrap().script_path,
+        second.script_path,
+        "unchanged saved bytes should reuse their immutable generation"
+    );
+    let mut cleanup = RunningRequestGuard(Some(engine.cancellation_handle()));
+    let run_path = original.clone();
+    let mut task = Some(thread::spawn(move || {
+        let result = engine.run_file_with_timeout(&run_path, Duration::from_secs(20));
+        (engine, result)
+    }));
+    let fresh_pause = wait_debug_pause_or_finished(&debugger, 2, old_pause.revision, &mut task);
+    assert_eq!(fresh_pause.file, original);
+    assert_ne!(fresh_pause.runtime_file, old_pause.runtime_file);
+    assert_eq!(
+        debugger
+            .evaluate("disp(qa_migrate);", fresh_pause.revision)
+            .unwrap(),
+        "77\n"
+    );
+    let current_snapshot = debugger
+        .source_snapshot(&fresh_pause.runtime_file)
+        .unwrap()
+        .expect("saved current source snapshot is unavailable");
+    assert_eq!(current_snapshot.original_path, original);
+    assert_eq!(current_snapshot.source, after);
+    let old_snapshot = debugger
+        .source_snapshot(&old_pause.runtime_file)
+        .unwrap()
+        .expect("old saved source snapshot was discarded");
+    assert_eq!(old_snapshot.original_path, original);
+    assert_eq!(old_snapshot.source, before);
+    debugger
+        .resume(ResumeAction::Continue, fresh_pause.revision)
+        .unwrap();
+    let (mut engine, result) = task.take().unwrap().join().unwrap();
+    cleanup.disarm();
+    let result = result.unwrap();
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert!(
+        result.output.contains("QA_MIGRATED=82\n"),
+        "{}",
+        result.output
+    );
+    assert_eq!(engine.process_id(), process_id);
+    // Rebinding belongs to one original-file group; clearing once must retire
+    // both generations' marks and allow an uninterrupted same-source rerun.
+    debugger.clear_breakpoint(&original, 2).unwrap();
+    let result = engine
+        .run_file_with_timeout(&original, Duration::from_secs(15))
+        .unwrap();
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert_eq!(result.output, "QA_MIGRATED=82\n");
+    assert_eq!(engine.process_id(), process_id);
 }

@@ -1,6 +1,6 @@
 # Prospective OpenNumLab release identity
 
-The user selected **OpenNumLab**, repository slug `opennumlab`, and the private destination [me-farza/opennumlab](https://github.com/me-farza/opennumlab). Root created that empty private repository and owns the later reviewed standalone-history upload. Release prepares a sanitized coherent file tree only; it does not upload content or change visibility. Public publication is not authorized.
+The user selected **OpenNumLab**, repository slug `opennumlab`, and the private destination [me-farza/opennumlab](https://github.com/me-farza/opennumlab). Root completed the [reviewed initial standalone-history upload](OPENNUMLAB_SOURCE_8FC746A.md), using the sanitized source tree prepared by release. The [first hosted CI run failed](PRIVATE_CI_38784271685.md). Public publication is not authorized; repository visibility remains private.
 
 Prospective packaging uses `dist/OpenNumLab.app`, OpenNumLab bundle display/product fields and `~/Library/Application Support/OpenNumLab/Projects/Getting Started`. The canonical source asset is `assets/opennumlab-logo.png`, preserving the original 1,210,321-byte PNG, SHA-256 `157621469bfae6f190bfc02fd823f61ee23bef365e43632a2950ade537e75aac`. No image edits or generated replacement were made. Existing `mathlab` commands, crate/protocol/environment names, the `.mathlab` project-local recovery convention and stable `org.openmathlab.desktop` bundle identifier remain unchanged. Existing MathLab/NumJinn app and user-project paths are not migrated or deleted.
 

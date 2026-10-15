@@ -140,8 +140,25 @@ struct BreakpointGroup {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct InstalledBreakpoint {
     group_id: u64,
+    anchor_line: usize,
     actual_line: usize,
     mapping: Option<SourceMapping>,
+    confirmed: bool,
+}
+
+impl BreakpointRegistry {
+    fn confirm_installation(&mut self, point: InstalledBreakpoint) {
+        if let Some(existing) = self.installed.iter_mut().find(|existing| {
+            existing.group_id == point.group_id
+                && existing.anchor_line == point.anchor_line
+                && existing.actual_line == point.actual_line
+                && existing.mapping == point.mapping
+        }) {
+            existing.confirmed = true;
+        } else {
+            self.installed.push(point);
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -228,6 +245,10 @@ impl Debugger {
                 );
             }
         }
+        let registered_originals: Vec<_> = mappings
+            .iter()
+            .map(|mapping| mapping.original_path.clone())
+            .collect();
         let mut sources = self
             .inner
             .sources
@@ -239,6 +260,81 @@ impl Debugger {
                 .any(|new| new.generated_path == old.generated_path)
         });
         sources.extend(mappings);
+        let routing = sources.clone();
+        // A breakpoint request can wait for the interpreter. Do not retain the
+        // source lock across it: concurrent state reads still need old mappings.
+        drop(sources);
+        self.rebind_registered_breakpoints(&routing, &registered_originals)
+    }
+
+    fn rebind_registered_breakpoints(
+        &self,
+        sources: &[SourceMapping],
+        originals: &[PathBuf],
+    ) -> Result<()> {
+        let mut installed = self
+            .inner
+            .breakpoints
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Breakpoint lock is poisoned"))?;
+        let groups: Vec<_> = installed
+            .groups
+            .iter()
+            .filter(|group| originals.contains(&group.original_path))
+            .map(|group| {
+                (
+                    group.id,
+                    group.original_path.clone(),
+                    group.active_lines.clone(),
+                )
+            })
+            .collect();
+        for (group_id, original, lines) in groups {
+            for line in lines {
+                let mapping = source_for_breakpoint_in(sources, &original, line);
+                if mapping.is_none()
+                    && !installed.installed.iter().any(|point| {
+                        point.group_id == group_id
+                            && point.anchor_line == line
+                            && point.mapping.is_none()
+                            && !point.confirmed
+                    })
+                {
+                    // Ordinary source registration keeps its direct identity
+                    // and normally sends no command. Repair only a known
+                    // ordinary target whose earlier clear became uncertain.
+                    continue;
+                }
+                if installed.installed.iter().any(|point| {
+                    point.confirmed
+                        && point.group_id == group_id
+                        && point.anchor_line == line
+                        && point.mapping == mapping
+                }) {
+                    continue;
+                }
+                let value = self.breakpoint_request(&original, line, false, mapping.as_ref())?;
+                let actual_lines: Vec<usize> = decode_array_or_single(value)?;
+                ensure!(
+                    !actual_lines.is_empty() && actual_lines.iter().all(|line| *line > 0),
+                    "The runtime did not install a breakpoint in the registered source"
+                );
+                for actual_line in actual_lines {
+                    installed.confirm_installation(InstalledBreakpoint {
+                        group_id,
+                        anchor_line: line,
+                        actual_line,
+                        mapping: mapping.clone(),
+                        confirmed: true,
+                    });
+                }
+                // Keep the existing editor marker as the group's anchor. If a
+                // new blank/comment line moves the runtime's actual location,
+                // clearing that marker must still remove every generation.
+                // Record each successful target immediately so a later failed
+                // group does not leave untracked marks behind.
+            }
+        }
         Ok(())
     }
 
@@ -277,27 +373,7 @@ impl Debugger {
             .sources
             .lock()
             .map_err(|_| anyhow::anyhow!("Source mapping lock is poisoned"))?;
-        let Some(latest) = sources
-            .iter()
-            .rev()
-            .find(|mapping| mapping.original_path == normalized)
-        else {
-            return Ok(None);
-        };
-        if latest.generated_path == latest.original_path {
-            return Ok(None);
-        }
-        let active = sources.iter().filter(|mapping| {
-            mapping.original_path == normalized && mapping.scope_file == latest.scope_file
-        });
-        let selected = active.clone().filter(|mapping| matches!((mapping.start_line,mapping.end_line),(Some(start),Some(end)) if line>=start && line<=end)).min_by_key(|mapping| mapping.end_line.unwrap() - mapping.start_line.unwrap());
-        Ok(selected
-            .or_else(|| {
-                active
-                    .into_iter()
-                    .find(|mapping| mapping.local_function.is_none())
-            })
-            .cloned())
+        Ok(source_for_breakpoint_in(&sources, &normalized, line))
     }
 
     /// Read the latest state without waiting for the engine's execution request.
@@ -433,12 +509,15 @@ impl Debugger {
             file.is_absolute(),
             "A breakpoint requires an absolute source path"
         );
-        let mapping = self.source_for_breakpoint(file, line)?;
         let mut installed = self
             .inner
             .breakpoints
             .lock()
             .map_err(|_| anyhow::anyhow!("Breakpoint lock is poisoned"))?;
+        // Hold the registry before choosing the source generation. Otherwise a
+        // concurrent registration could finish migration, then this command
+        // could install a new group using a mapping read before that migration.
+        let mapping = self.source_for_breakpoint(file, line)?;
         let value = self.breakpoint_request(file, line, false, mapping.as_ref())?;
         // Octave encodes a one-element numeric array as a scalar.
         let lines: Vec<usize> = decode_array_or_single(value)?;
@@ -475,12 +554,12 @@ impl Debugger {
             for actual_line in &lines {
                 let point = InstalledBreakpoint {
                     group_id,
+                    anchor_line: *actual_line,
                     actual_line: *actual_line,
                     mapping: mapping.clone(),
+                    confirmed: true,
                 };
-                if !installed.installed.contains(&point) {
-                    installed.installed.push(point);
-                }
+                installed.confirm_installation(point);
             }
         }
         Ok(lines)
@@ -502,7 +581,7 @@ impl Debugger {
             .breakpoints
             .lock()
             .map_err(|_| anyhow::anyhow!("Breakpoint lock is poisoned"))?;
-        let groups: Vec<_> = installed
+        let mut groups: Vec<_> = installed
             .groups
             .iter()
             .filter(|group| {
@@ -510,6 +589,22 @@ impl Debugger {
             })
             .map(|group| group.id)
             .collect();
+        // Prefer the editor's exact marker. An earlier generation's relocated
+        // actual line may coincide with another independently enabled marker.
+        if groups.is_empty() {
+            groups = installed
+                .groups
+                .iter()
+                .filter(|group| {
+                    group.original_path == original_path
+                        && installed
+                            .installed
+                            .iter()
+                            .any(|point| point.group_id == group.id && point.actual_line == line)
+                })
+                .map(|group| group.id)
+                .collect();
+        }
         let selected: Vec<_> = installed
             .installed
             .iter()
@@ -520,8 +615,32 @@ impl Debugger {
             let mapping = self.source_for_breakpoint(file, line)?;
             self.breakpoint_request(file, line, true, mapping.as_ref())?;
         } else {
+            // Any clear may have been accepted before a later request fails or
+            // its reply is lost. Keep logical ownership for an explicit retry,
+            // but do not let these records suppress a cached-generation rebind.
+            for point in &mut installed.installed {
+                if groups.contains(&point.group_id) {
+                    point.confirmed = false;
+                }
+            }
             let mut removed = Vec::new();
             for point in &selected {
+                let shared = installed.installed.iter().any(|other| {
+                    !groups.contains(&other.group_id)
+                        && other.mapping == point.mapping
+                        && other.actual_line == point.actual_line
+                        && (point.mapping.is_some()
+                            || installed.groups.iter().any(|group| {
+                                group.id == other.group_id && group.original_path == original_path
+                            }))
+                });
+                // A prepared body/line can serve multiple markers after edits.
+                // Remove its physical mark only after its final owner is cleared.
+                // Ordinary targets additionally require the same original file;
+                // mapping=None and equal lines alone do not identify one target.
+                if shared {
+                    continue;
+                }
                 let target = (point.mapping.clone(), point.actual_line);
                 if !removed.contains(&target) {
                     self.breakpoint_request(file, point.actual_line, true, point.mapping.as_ref())?;
@@ -691,6 +810,36 @@ impl Debugger {
     }
 }
 
+fn source_for_breakpoint_in(
+    sources: &[SourceMapping],
+    original: &Path,
+    line: usize,
+) -> Option<SourceMapping> {
+    let latest = sources
+        .iter()
+        .rev()
+        .find(|mapping| mapping.original_path == original)?;
+    if latest.generated_path == latest.original_path {
+        return None;
+    }
+    let active = sources.iter().filter(|mapping| {
+        mapping.original_path == original && mapping.scope_file == latest.scope_file
+    });
+    let selected = active
+        .clone()
+        .filter(|mapping| {
+            matches!((mapping.start_line, mapping.end_line), (Some(start), Some(end)) if line >= start && line <= end)
+        })
+        .min_by_key(|mapping| mapping.end_line.unwrap() - mapping.start_line.unwrap());
+    selected
+        .or_else(|| {
+            active
+                .into_iter()
+                .find(|mapping| mapping.local_function.is_none())
+        })
+        .cloned()
+}
+
 fn read_bounded(path: &Path) -> Result<Vec<u8>> {
     ensure!(
         fs::metadata(path)?.len() <= MAX_RESPONSE,
@@ -719,6 +868,466 @@ fn decode_array_or_single<T: DeserializeOwned>(value: Value) -> Result<Vec<T>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scripted_adapter(
+        debugger: &Debugger,
+        responses: Vec<Value>,
+    ) -> thread::JoinHandle<Vec<Value>> {
+        let directory = debugger.directory().to_owned();
+        thread::spawn(move || {
+            let mut commands = Vec::new();
+            for mut response in responses {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let command_path = directory.join("debug-command.json");
+                let command: Value = loop {
+                    match fs::read(&command_path) {
+                        Ok(raw) => break serde_json::from_slice(&raw).unwrap(),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            assert!(Instant::now() < deadline, "Missing debugger request");
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => panic!("Read debugger request: {error}"),
+                    }
+                };
+                let id = command["id"].as_u64().unwrap();
+                fs::remove_file(command_path).unwrap();
+                response["id"] = Value::from(id);
+                let temporary = directory.join("test-response.tmp");
+                fs::write(&temporary, serde_json::to_vec(&response).unwrap()).unwrap();
+                fs::rename(
+                    temporary,
+                    directory.join(format!("debug-response-{id}.json")),
+                )
+                .unwrap();
+                commands.push(command);
+            }
+            commands
+        })
+    }
+
+    #[test]
+    fn source_generations_migrate_existing_breakpoints_and_clear_every_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let original = root.join("saved.m");
+        let first = root.join("generation-one.m");
+        let second = root.join("generation-two.m");
+        for path in [&original, &first, &second] {
+            fs::write(path, "before=1;\nafter=before+1;\n").unwrap();
+        }
+        let mapping = |generated: &Path| SourceMapping {
+            generated_path: generated.to_owned(),
+            original_path: original.clone(),
+            scope_file: generated.to_owned(),
+            local_function: None,
+            start_line: None,
+            end_line: None,
+            snapshot_path: None,
+        };
+        let debugger = Debugger::new(&root);
+        let adapter = scripted_adapter(
+            &debugger,
+            vec![
+                serde_json::json!({"ok":true,"result":2}),
+                serde_json::json!({"ok":true,"result":2}),
+                // The new source moves the executable target past a blank line.
+                serde_json::json!({"ok":true,"result":3}),
+                serde_json::json!({"ok":true,"result":[]}),
+                serde_json::json!({"ok":true,"result":[]}),
+                serde_json::json!({"ok":true,"result":[]}),
+            ],
+        );
+        assert_eq!(debugger.set_breakpoint(&original, 2).unwrap(), vec![2]);
+        debugger.register_sources(vec![mapping(&first)]).unwrap();
+        debugger.register_sources(vec![mapping(&first)]).unwrap();
+        debugger.register_sources(vec![mapping(&second)]).unwrap();
+        debugger.register_sources(vec![mapping(&second)]).unwrap();
+        // Returning to an already installed immutable generation needs no bind.
+        debugger.register_sources(vec![mapping(&first)]).unwrap();
+        debugger.register_sources(vec![mapping(&second)]).unwrap();
+        let mut old_frame = first.clone();
+        let mut old_name = String::new();
+        debugger
+            .map_location(&mut old_frame, &mut old_name)
+            .unwrap();
+        assert_eq!(old_frame, original);
+        // A later direct registration must not create additional installations.
+        debugger.register_sources(vec![mapping(&original)]).unwrap();
+        debugger.clear_breakpoint(&original, 2).unwrap();
+        assert!(debugger.inner.breakpoints.lock().unwrap().groups.is_empty());
+        assert!(debugger
+            .inner
+            .breakpoints
+            .lock()
+            .unwrap()
+            .installed
+            .is_empty());
+        let commands = adapter.join().unwrap();
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command["command"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "breakpoint",
+                "prepared_breakpoint",
+                "prepared_breakpoint",
+                "clear_breakpoint",
+                "prepared_clear_breakpoint",
+                "prepared_clear_breakpoint",
+            ]
+        );
+        assert_eq!(commands[1]["file"], serde_json::json!(first));
+        assert_eq!(commands[2]["file"], serde_json::json!(second));
+        assert_eq!(commands[3]["line"], 2);
+        assert_eq!(commands[4]["line"], 2);
+        assert_eq!(commands[5]["line"], 3);
+    }
+
+    #[test]
+    fn failed_generation_rebind_preserves_successful_targets_and_retries_only_missing_ones() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let original = root.join("saved.m");
+        let generated = root.join("generation.m");
+        for path in [&original, &generated] {
+            fs::write(path, "a=1;\nb=2;\nc=3;\nd=4;\n").unwrap();
+        }
+        let mapping = SourceMapping {
+            generated_path: generated.clone(),
+            original_path: original.clone(),
+            scope_file: generated.clone(),
+            local_function: None,
+            start_line: None,
+            end_line: None,
+            snapshot_path: None,
+        };
+        let debugger = Debugger::new(&root);
+        let adapter = scripted_adapter(
+            &debugger,
+            vec![
+                serde_json::json!({"ok":true,"result":2}),
+                serde_json::json!({"ok":true,"result":4}),
+                serde_json::json!({"ok":true,"result":2}),
+                serde_json::json!({"ok":false,"error":"synthetic rebind failure"}),
+                serde_json::json!({"ok":true,"result":5}),
+                serde_json::json!({"ok":true,"result":[]}),
+                serde_json::json!({"ok":true,"result":[]}),
+                serde_json::json!({"ok":true,"result":[]}),
+                serde_json::json!({"ok":true,"result":[]}),
+            ],
+        );
+        debugger.set_breakpoint(&original, 2).unwrap();
+        debugger.set_breakpoint(&original, 4).unwrap();
+        let error = debugger
+            .register_sources(vec![mapping.clone()])
+            .unwrap_err();
+        assert!(error.to_string().contains("synthetic rebind failure"));
+        debugger.register_sources(vec![mapping.clone()]).unwrap();
+        debugger.register_sources(vec![mapping]).unwrap();
+        debugger.clear_breakpoint(&original, 2).unwrap();
+        // Clearing the runtime's shifted actual line also finds its old marker.
+        debugger.clear_breakpoint(&original, 5).unwrap();
+        let commands = adapter.join().unwrap();
+        assert_eq!(commands[2]["line"], 2);
+        assert_eq!(commands[3]["line"], 4);
+        assert_eq!(commands[4]["line"], 4);
+        assert_eq!(commands[5]["command"], "clear_breakpoint");
+        assert_eq!(commands[5]["line"], 2);
+        assert_eq!(commands[6]["command"], "prepared_clear_breakpoint");
+        assert_eq!(commands[6]["line"], 2);
+        assert_eq!(commands[7]["line"], 4);
+        assert_eq!(commands[8]["line"], 5);
+        assert!(debugger
+            .inner
+            .breakpoints
+            .lock()
+            .unwrap()
+            .installed
+            .is_empty());
+    }
+
+    #[test]
+    fn converging_breakpoint_groups_keep_shared_targets_until_the_final_owner_clears() {
+        for first_clear in [2, 3] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let original = root.join("saved.m");
+            let generated = root.join("generation.m");
+            for path in [&original, &generated] {
+                fs::write(path, "a=1;\nb=2;\nc=3;\n").unwrap();
+            }
+            let debugger = Debugger::new(&root);
+            let adapter = scripted_adapter(
+                &debugger,
+                vec![
+                    serde_json::json!({"ok":true,"result":2}),
+                    serde_json::json!({"ok":true,"result":3}),
+                    serde_json::json!({"ok":true,"result":3}),
+                    serde_json::json!({"ok":true,"result":[]}),
+                    serde_json::json!({"ok":true,"result":[]}),
+                ],
+            );
+            debugger.set_breakpoint(&original, 2).unwrap();
+            debugger
+                .register_sources(vec![SourceMapping {
+                    generated_path: generated.clone(),
+                    original_path: original.clone(),
+                    scope_file: generated.clone(),
+                    local_function: None,
+                    start_line: None,
+                    end_line: None,
+                    snapshot_path: None,
+                }])
+                .unwrap();
+            debugger.set_breakpoint(&original, 3).unwrap();
+            debugger.clear_breakpoint(&original, first_clear).unwrap();
+            let last_clear = if first_clear == 2 { 3 } else { 2 };
+            {
+                let registry = debugger.inner.breakpoints.lock().unwrap();
+                assert_eq!(registry.groups.len(), 1);
+                assert_eq!(registry.groups[0].active_lines, vec![last_clear]);
+                assert!(registry.installed.iter().any(|point| {
+                    point.mapping.as_ref().is_some_and(|mapping| {
+                        mapping.generated_path == generated && point.actual_line == 3
+                    })
+                }));
+            }
+            debugger.clear_breakpoint(&original, last_clear).unwrap();
+            let commands = adapter.join().unwrap();
+            assert_eq!(commands[3]["command"], "clear_breakpoint");
+            assert_eq!(commands[3]["file"], serde_json::json!(original));
+            assert_eq!(commands[3]["line"], 2);
+            assert_eq!(commands[4]["command"], "prepared_clear_breakpoint");
+            assert_eq!(commands[4]["file"], serde_json::json!(generated));
+            assert_eq!(commands[4]["line"], 3);
+            let registry = debugger.inner.breakpoints.lock().unwrap();
+            assert!(registry.groups.is_empty());
+            assert!(registry.installed.is_empty());
+        }
+    }
+
+    #[test]
+    fn ordinary_breakpoints_at_equal_lines_in_different_files_are_distinct_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let first = root.join("first.m");
+        let second = root.join("second.m");
+        for path in [&first, &second] {
+            fs::write(path, "a=1;\nb=2;\n").unwrap();
+        }
+        let debugger = Debugger::new(&root);
+        let adapter = scripted_adapter(
+            &debugger,
+            vec![
+                serde_json::json!({"ok":true,"result":2}),
+                serde_json::json!({"ok":true,"result":2}),
+                serde_json::json!({"ok":true,"result":[]}),
+                serde_json::json!({"ok":true,"result":[]}),
+            ],
+        );
+        debugger.set_breakpoint(&first, 2).unwrap();
+        debugger.set_breakpoint(&second, 2).unwrap();
+        debugger.clear_breakpoint(&first, 2).unwrap();
+        assert_eq!(debugger.inner.breakpoints.lock().unwrap().groups.len(), 1);
+        debugger.clear_breakpoint(&second, 2).unwrap();
+        let commands = adapter.join().unwrap();
+        assert_eq!(commands[2]["command"], "clear_breakpoint");
+        assert_eq!(commands[2]["file"], serde_json::json!(first));
+        assert_eq!(commands[3]["command"], "clear_breakpoint");
+        assert_eq!(commands[3]["file"], serde_json::json!(second));
+    }
+
+    #[test]
+    fn failed_clear_keeps_group_records_for_explicit_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let original = root.join("saved.m");
+        let generated = root.join("generation.m");
+        for path in [&original, &generated] {
+            fs::write(path, "a=1;\nb=2;\n").unwrap();
+        }
+        let debugger = Debugger::new(&root);
+        let adapter = scripted_adapter(
+            &debugger,
+            vec![
+                serde_json::json!({"ok":true,"result":2}),
+                serde_json::json!({"ok":true,"result":2}),
+                serde_json::json!({"ok":true,"result":[]}),
+                serde_json::json!({"ok":false,"error":"synthetic clear failure"}),
+                serde_json::json!({"ok":true,"result":[]}),
+                serde_json::json!({"ok":true,"result":[]}),
+            ],
+        );
+        debugger.set_breakpoint(&original, 2).unwrap();
+        debugger
+            .register_sources(vec![SourceMapping {
+                generated_path: generated.clone(),
+                original_path: original.clone(),
+                scope_file: generated.clone(),
+                local_function: None,
+                start_line: None,
+                end_line: None,
+                snapshot_path: None,
+            }])
+            .unwrap();
+        let error = debugger.clear_breakpoint(&original, 2).unwrap_err();
+        assert!(error.to_string().contains("synthetic clear failure"));
+        {
+            let registry = debugger.inner.breakpoints.lock().unwrap();
+            assert_eq!(registry.groups.len(), 1);
+            assert_eq!(registry.installed.len(), 2);
+        }
+        debugger.clear_breakpoint(&original, 2).unwrap();
+        let commands = adapter.join().unwrap();
+        assert_eq!(commands[2]["command"], "clear_breakpoint");
+        assert_eq!(commands[3]["command"], "prepared_clear_breakpoint");
+        assert_eq!(commands[4]["command"], "clear_breakpoint");
+        assert_eq!(commands[5]["command"], "prepared_clear_breakpoint");
+        assert!(debugger.inner.breakpoints.lock().unwrap().groups.is_empty());
+    }
+
+    #[test]
+    fn cached_generation_rebinds_after_partial_clear_failure_without_duplicate_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let original = root.join("saved.m");
+        let first = root.join("generation-one.m");
+        let second = root.join("generation-two.m");
+        for path in [&original, &first, &second] {
+            fs::write(path, "a=1;\nb=2;\n").unwrap();
+        }
+        let mapping = |generated: &Path| SourceMapping {
+            generated_path: generated.to_owned(),
+            original_path: original.clone(),
+            scope_file: generated.to_owned(),
+            local_function: None,
+            start_line: None,
+            end_line: None,
+            snapshot_path: None,
+        };
+        let debugger = Debugger::new(&root);
+        let adapter = scripted_adapter(
+            &debugger,
+            vec![
+                serde_json::json!({"ok":true,"result":2}),
+                serde_json::json!({"ok":true,"result":2}),
+                serde_json::json!({"ok":true,"result":2}),
+                serde_json::json!({"ok":true,"result":[]}),
+                serde_json::json!({"ok":true,"result":[]}),
+                serde_json::json!({"ok":false,"error":"synthetic late clear failure"}),
+                serde_json::json!({"ok":true,"result":2}),
+                serde_json::json!({"ok":true,"result":[]}),
+                serde_json::json!({"ok":true,"result":[]}),
+                serde_json::json!({"ok":true,"result":[]}),
+            ],
+        );
+        debugger.set_breakpoint(&original, 2).unwrap();
+        debugger.register_sources(vec![mapping(&first)]).unwrap();
+        debugger.register_sources(vec![mapping(&second)]).unwrap();
+        debugger.register_sources(vec![mapping(&first)]).unwrap();
+        let error = debugger.clear_breakpoint(&original, 2).unwrap_err();
+        assert!(error.to_string().contains("synthetic late clear failure"));
+        {
+            let registry = debugger.inner.breakpoints.lock().unwrap();
+            assert_eq!(registry.groups.len(), 1);
+            assert_eq!(registry.installed.len(), 3);
+            assert!(registry.installed.iter().all(|point| !point.confirmed));
+        }
+        // The current cached generation was physically cleared before the
+        // later failure. Its retained record must not suppress this rebind.
+        debugger.register_sources(vec![mapping(&first)]).unwrap();
+        debugger.register_sources(vec![mapping(&first)]).unwrap();
+        {
+            let registry = debugger.inner.breakpoints.lock().unwrap();
+            assert_eq!(registry.installed.len(), 3);
+            assert_eq!(
+                registry
+                    .installed
+                    .iter()
+                    .filter(|point| point.confirmed)
+                    .count(),
+                1
+            );
+            assert!(registry.installed.iter().any(|point| {
+                point.confirmed
+                    && point
+                        .mapping
+                        .as_ref()
+                        .is_some_and(|mapping| mapping.generated_path == first)
+            }));
+        }
+        debugger.clear_breakpoint(&original, 2).unwrap();
+        let commands = adapter.join().unwrap();
+        assert_eq!(commands[4]["command"], "prepared_clear_breakpoint");
+        assert_eq!(commands[4]["file"], serde_json::json!(first));
+        assert_eq!(commands[5]["file"], serde_json::json!(second));
+        assert_eq!(commands[6]["command"], "prepared_breakpoint");
+        assert_eq!(commands[6]["file"], serde_json::json!(first));
+        assert_eq!(commands[7]["command"], "clear_breakpoint");
+        assert_eq!(commands[8]["file"], serde_json::json!(first));
+        assert_eq!(commands[9]["file"], serde_json::json!(second));
+        assert!(debugger
+            .inner
+            .breakpoints
+            .lock()
+            .unwrap()
+            .installed
+            .is_empty());
+    }
+
+    #[test]
+    fn direct_registration_repairs_only_unconfirmed_ordinary_breakpoints() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let original = root.join("saved.m");
+        fs::write(&original, "a=1;\nb=2;\n").unwrap();
+        let mapping = SourceMapping {
+            generated_path: original.clone(),
+            original_path: original.clone(),
+            scope_file: original.clone(),
+            local_function: None,
+            start_line: None,
+            end_line: None,
+            snapshot_path: None,
+        };
+        let debugger = Debugger::new(&root);
+        let adapter = scripted_adapter(
+            &debugger,
+            vec![
+                serde_json::json!({"ok":true,"result":2}),
+                serde_json::json!({"ok":false,"error":"synthetic ordinary clear failure"}),
+                serde_json::json!({"ok":true,"result":2}),
+                serde_json::json!({"ok":true,"result":[]}),
+            ],
+        );
+        debugger.set_breakpoint(&original, 2).unwrap();
+        debugger.register_sources(vec![mapping.clone()]).unwrap();
+        let error = debugger.clear_breakpoint(&original, 2).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("synthetic ordinary clear failure"));
+        assert!(!debugger.inner.breakpoints.lock().unwrap().installed[0].confirmed);
+        debugger.register_sources(vec![mapping.clone()]).unwrap();
+        debugger.register_sources(vec![mapping]).unwrap();
+        {
+            let registry = debugger.inner.breakpoints.lock().unwrap();
+            assert_eq!(registry.installed.len(), 1);
+            assert!(registry.installed[0].confirmed);
+        }
+        debugger.clear_breakpoint(&original, 2).unwrap();
+        let commands = adapter.join().unwrap();
+        assert_eq!(commands[2]["command"], "breakpoint");
+        assert_eq!(commands[2]["file"], serde_json::json!(original));
+        assert_eq!(commands[3]["command"], "clear_breakpoint");
+        assert!(debugger
+            .inner
+            .breakpoints
+            .lock()
+            .unwrap()
+            .installed
+            .is_empty());
+    }
 
     #[test]
     fn prepared_generations_route_original_lines_and_keep_old_stack_locations() {

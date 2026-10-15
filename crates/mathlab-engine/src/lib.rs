@@ -697,7 +697,8 @@ impl Engine {
     }
 
     /// Stage saved source and register original-file debugger mappings. No user
-    /// statements run; ordinary function/class/script files remain direct paths.
+    /// statements run. Debugged scripts use immutable source generations;
+    /// ordinary function/class files retain their direct file identities.
     pub fn prepare_debug_file(&mut self, path: &Path) -> Result<PreparedDebugSource> {
         let original_path = self.resolve_session_path(path)?;
         let source = fs::read_to_string(&original_path)?;
@@ -756,9 +757,11 @@ impl Engine {
         if let Some(cached) = self.prepared_sources.iter().find(|cached| {
             cached.original_path == path
                 && cached.original_source == source
-                && (buffer || !cached.local_functions.is_empty())
+                && (buffer
+                    || !cached.local_functions.is_empty()
+                    || (self.debugger.is_some() && cached.source_kind == SourceKind::Script))
         }) {
-            let request = prepared_request(cached);
+            let request = prepared_request(cached, self.debugger.is_some());
             let current_scope = cached.materialized.script_path.clone();
             let index = self
                 .prepared_sources
@@ -786,7 +789,16 @@ impl Engine {
                 }],
             })
         })?;
-        if !buffer && !prepared.is_transformed() {
+        // Octave's persistent source() can retain a script AST loaded while
+        // setting an ordinary breakpoint, even after the saved bytes change.
+        // Bind debugged script execution to these exact bytes instead of the
+        // mutable filename. Functions/classes keep their normal file identity.
+        let debug_script = self.debugger.is_some()
+            && prepared
+                .source_kind()
+                .map_err(|error| Error::Protocol(error.to_string()))?
+                == SourceKind::Script;
+        if !buffer && !prepared.is_transformed() && !debug_script {
             self.active_sources.insert(path.to_owned(), path.to_owned());
             self.register_direct_debug_source(path)?;
             return Ok(json!({"command":"run_file","path":path}));
@@ -860,6 +872,7 @@ impl Engine {
         self.register_debug_source(self.prepared_sources.len() - 1)?;
         Ok(prepared_request(
             self.prepared_sources.last().expect("prepared source"),
+            self.debugger.is_some(),
         ))
     }
 
@@ -1867,8 +1880,8 @@ impl Drop for Engine {
     }
 }
 
-fn prepared_request(source: &PreparedSource) -> Value {
-    json!({"command":"run_file", "path":source.materialized.script_path,
+fn prepared_request(source: &PreparedSource, debugger_enabled: bool) -> Value {
+    let mut request = json!({"command":"run_file", "path":source.materialized.script_path,
     "source_directory":source.materialized.script_path.parent(),
     "keep_source_directory":!source.materialized.function_paths.is_empty(),
     "local_names":source.local_functions.iter().map(|function| &function.name).collect::<Vec<_>>(),
@@ -1877,7 +1890,20 @@ fn prepared_request(source: &PreparedSource) -> Value {
     "original_source":source.original_source,
     "source_kind":match source.source_kind {
         SourceKind::Script => "script", SourceKind::Function => "function", SourceKind::Class => "class"
-    }})
+    }});
+    if debugger_enabled
+        && source.source_kind == SourceKind::Script
+        && source.materialized.function_paths.is_empty()
+    {
+        // Native plain-script entry parses the absolute immutable filename and
+        // needs no load-path capsule. Even a temporary addpath/rmpath can rebind
+        // unrelated functions, losing their breakpoint or persistent state.
+        request
+            .as_object_mut()
+            .expect("prepared request object")
+            .remove("source_directory");
+    }
+    request
 }
 
 fn debug_source_descriptor(original_path: PathBuf, request: &Value) -> Result<PreparedDebugSource> {

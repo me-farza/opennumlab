@@ -70,7 +70,8 @@ if action == "doctor":
         print(json.dumps({"ready":True}))
         sys.exit(9)
     if mode == "doctor-output-flood":
-        print("x"*100000)
+        # Exercise pipe output bounds independently of the interpreter's buffer size.
+        print("x"*100000, flush=True)
         time.sleep(10)
     if mode == "doctor-timeout":
         child = "import pathlib,time; time.sleep(1); pathlib.Path("+repr(os.environ["QA_FAKE_CHILD_MARKER"])+").write_text('survived')"
@@ -316,8 +317,12 @@ class InstalledQATests(unittest.TestCase):
     def test_output_flood_is_bounded_and_cannot_qualify(self):
         report = self.run_qa("doctor-output-flood", output_limit=4096)
         command = next(item for item in report["commands"] if item["id"] == "doctor")
-        self.assertTrue(command["output_limit_exceeded"])
+        diagnostic = json.dumps(command, indent=2)
+        self.assertTrue(command["output_limit_exceeded"], diagnostic)
+        self.assertFalse(command["timed_out"], diagnostic)
+        self.assertEqual(command["cleanup_status"], "passed", diagnostic)
         self.assertLessEqual(command["stdout_bytes"] + command["stderr_bytes"], 4096)
+        self.assertEqual(report["checks"]["doctor"]["status"], "failed")
         self.assertEqual(report["status"], "failed")
 
     def test_cleanup_failure_retains_exit_and_log_evidence_and_fails_qualification(self):

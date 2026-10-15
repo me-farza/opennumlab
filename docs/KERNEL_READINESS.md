@@ -256,6 +256,11 @@ including handles whose functions had never been called before debugger setup.
 Reported pause filenames and stack names map to the original script and its local
 or nested function. An unsaved plain script executes its registered snapshot;
 preparing a snapshot does not execute its statements or overwrite the saved file.
+Saved plain scripts also use immutable generations when debugging is enabled.
+The generation cache compares exact source bytes, rather than file size or
+modification time. Focused actual regressions reproduce stale execution before
+this change and verify fresh saved execution, automatic frontend breakpoint
+migration and retained old/current snapshots afterward.
 
 The debugger caches script ASTs in `debug_events::prepared_sources`, while the
 ordinary inactive registry owns the numerical function objects. Public
@@ -280,7 +285,8 @@ assignments, skips subsequent statements, and permits the next request. Ordinary
 execution errors and interrupts retain their separate propagation paths.
 
 Native `dbclear all`, host-specific clear, and individual frontend removal are
-honored without silently recreating cleared points on the next script entry.
+honored without silently recreating cleared points on an unchanged cached script
+generation's next entry.
 `synchronize_prepared` also reconciles marks before each execution request, so a
 later direct old-handle call does not encounter a cleared mark even when an
 ordinary file breakpoint is active. After registry-clearing operations, configured
@@ -292,7 +298,10 @@ runtime relocation. Clearing a current frontend point removes the group's marks
 from all retained generations; a newly added point at an older historical line
 gets its own group. The checked relocation case moves one point twice and clears
 it while preserving that independent historical-line point. Failed clears retain
-tracking records for retry. This does not intercept arbitrary user breakpoint
+tracking records for retry and mark their physical installation unconfirmed.
+Selecting a cached generation repairs those uncertain marks; normal confirmed
+registrations do not reinstall them. Shared targets remain installed until their
+last logical owner clears. This does not intercept arbitrary user breakpoint
 commands outside the documented reconciliation boundaries.
 
 `DebugState.runtime_file` retains the actual scope identity before original-path
@@ -304,11 +313,20 @@ revision and shows a green paused-line arrow only when the snapshot belongs to
 the active original source and its text equals the editor buffer. Loading, missing
 or unreadable snapshots hide the arrow; errors stay visible. An edited buffer gets
 a warning and a bounded read-only executing-source context. Ordinary native
-saved files registered directly with the debugger, including scripts and
-function/class files, have no immutable snapshot through this API, so the desktop
-reports that limitation instead of using a clean/saved flag to infer identity.
+saved function/class files registered directly with the debugger have no
+immutable snapshot through this API, so the desktop reports that limitation
+instead of using a clean/saved flag to infer identity. Native plain scripts do
+not add/remove a generation folder on the load path: their absolute prepared
+path is sufficient, and path refresh can rebind unrelated external functions.
 
-The checked contract still has two debugger-specific boundaries:
+Automatic generation migration follows the Rust client's confirmed frontend
+breakpoint groups. Native `dbstop` marks installed outside that registry are not
+imported into a prepared script. Native clear commands followed by a newly
+prepared generation also need separate parity qualification; the retained
+frontend group can install its point in that new generation. These cases remain
+open rather than inheriting the checked unchanged-generation clear result.
+
+Additional debugger-specific boundaries remain:
 
 - Raw Octave `dbstatus` describes the registry host and its helper/subfunction
   metadata. The frontend's original-source mapping is authoritative; arbitrary
@@ -317,6 +335,9 @@ The checked contract still has two debugger-specific boundaries:
   evaluation that performs `dbclear all`, installs an ordinary breakpoint, and
   calls an old handle can run before another reconciliation. This combined case
   is not covered by the next-request clear guarantee.
+- An edit with no remaining executable statement beneath an enabled marker can
+  fail source preparation with an unavailable breakpoint. Automatic invalid-point
+  retirement and its editor feedback are not implemented.
 
 The evidence is in [`octave_session.rs`](../crates/mathlab-engine/tests/octave_session.rs):
 `optional_prepared_debugger_breaks_in_saved_and_unsaved_script_local_and_nested_sources`,
@@ -327,6 +348,11 @@ The evidence is in [`octave_session.rs`](../crates/mathlab-engine/tests/octave_s
 `optional_prepared_debugger_synchronizes_cleared_old_handles_before_new_requests`,
 `optional_prepared_handle_quit_preserves_process_workspace_and_next_command`, and
 `optional_prepared_debugger_parse_error_preserves_workspace_and_breakpoints`.
+Saved-source freshness additionally uses
+`optional_debugger_saved_plain_source_reloads_after_step_clear_and_same_identity_rewrite`
+and `optional_debugger_saved_plain_generations_rebind_breakpoints_and_keep_old_snapshots`.
+They retain file length and modification time while changing bytes; the first
+also verifies unrelated named and retained-handle persistent state.
 The current pre-entry/snapshot/clear extensions add
 `optional_prepared_debugger_handles_user_registry_name_and_base_variable_collisions`,
 `optional_prepared_debugger_single_original_clear_removes_all_retained_generation_marks`,

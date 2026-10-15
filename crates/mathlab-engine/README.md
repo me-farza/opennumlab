@@ -310,8 +310,18 @@ a point, so reflection cannot silently change a script point's bookkeeping ident
 The worker requires the `breakpoint_source_metadata` capability.
 `DebugState.runtime_file` preserves the immutable
 runtime identity, and `Debugger::source_snapshot` reads that generation's exact
-full original text without executing code. Saved ordinary files use their direct paths;
-unsaved function/class buffers must be saved before debugging.
+full original text without executing code. With debugging enabled, saved plain
+scripts also use immutable generations selected by their exact source bytes.
+Changing a saved file therefore changes the executed generation even when its
+length and modification time stay the same. Existing frontend breakpoints follow
+the new generation, and clearing one original-file point removes its retained
+generation targets. Saved function/class files keep their direct paths; unsaved
+function/class buffers must be saved before debugging.
+
+This migration tracks breakpoints installed through `Debugger`. Arbitrary native
+`dbstop` marks are not imported into prepared generations, and native clear
+commands combined with a newly prepared generation need separate qualification.
+These command-parity limits do not establish complete MATLAB debugger coverage.
 
 Prepared breakpoints use scoped aliases in the inactive runtime registry helper
 for Octave's normal breakpoint bookkeeping. Original local names stay private,

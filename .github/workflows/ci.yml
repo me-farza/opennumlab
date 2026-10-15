@@ -91,12 +91,21 @@ jobs:
         run: python3 scripts/release-native-gate-test.py
       - name: Build and execute required native and CLI contracts
         timeout-minutes: 27
-        run: bash scripts/release-native-gate.sh --report-dir target/release-native-gate
+        run: |
+          {
+            # The container runs as root over a runner-owned mount. Checkout's
+            # temporary HOME does not carry its safe-directory entry here.
+            git config --global --add safe.directory "$GITHUB_WORKSPACE"
+            git -C "$GITHUB_WORKSPACE" rev-parse --verify HEAD
+            bash scripts/release-native-gate.sh --report-dir target/release-native-gate
+          } 2>&1 | tee "$RUNNER_TEMP/native-gate-launch.log"
       - name: Retain enabled or failed native evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: native-linux-x86_64-octave-11.3.0
-          path: target/release-native-gate/
+          path: |
+            ${{ runner.temp }}/native-gate-launch.log
+            target/release-native-gate/
           if-no-files-found: error
           retention-days: 14
