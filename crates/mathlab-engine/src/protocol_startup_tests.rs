@@ -11,11 +11,18 @@ fn startup_rejects_wrong_protocol_capabilities_limits_and_context() {
     for (before, after) in [
         ("'name', 'mathlab-worker'", "'name', 'foreign-worker'"),
         (
-            "'name', 'mathlab-worker', 'version', 1",
-            "'name', 'mathlab-worker', 'version', 2",
+            "'name', 'mathlab-worker', 'version', builtin('uint32', 1)",
+            "'name', 'mathlab-worker', 'version', builtin('uint32', 2)",
         ),
         ("'checked_scalar_write.v1', ", ""),
-        ("'variable_cells', 2000", "'variable_cells', 1999"),
+        (
+            "'variable_cells', builtin('uint32', 2000)",
+            "'variable_cells', builtin('uint32', 1999)",
+        ),
+        (
+            "'response_bytes', builtin('uint32', 33554432)",
+            "'response_bytes', 33554432.5",
+        ),
         (
             "builtin('sprintf', '%.0f', generation)",
             "builtin('sprintf', '%.0f', generation + 1)",
@@ -32,7 +39,11 @@ fn startup_rejects_wrong_protocol_capabilities_limits_and_context() {
             &worker,
         );
         match result {
-            Err(Error::Protocol(_)) => {}
+            Err(Error::Protocol(_)) if after != "'response_bytes', 33554432.5" => {}
+            Err(Error::Json(error)) if after == "'response_bytes', 33554432.5" => {
+                assert!(error.is_data(), "Expected a wire type error: {error}");
+                assert!(error.to_string().contains("expected usize"), "{error}");
+            }
             Err(error) => panic!("Expected protocol rejection for {before}, received {error}"),
             Ok(_) => panic!("Invalid worker advertised {before} was accepted"),
         }

@@ -179,6 +179,84 @@ mod tests {
         }
     }
 
+    /// Keep numeric spellings intact: going through json! or a Value mutation
+    /// could hide the integer-versus-floating wire distinction being tested.
+    fn capabilities_wire(version: &str, cells: &str, bytes: &str) -> String {
+        format!(
+            r#"{{"name":"mathlab-worker","version":{version},"capabilities":["binding_snapshot.v1","checked_scalar_write.v1","display_page.v1"],"limits":{{"variable_cells":{cells},"response_bytes":{bytes}}}}}"#
+        )
+    }
+
+    #[test]
+    fn wire_integer_fields_reject_floating_and_noninteger_tokens_before_validation() {
+        for (index, field, valid, overflow) in [
+            (0, "version", "1", "4294967296".to_owned()),
+            (
+                1,
+                "variable_cells",
+                "2000",
+                (usize::MAX as u128 + 1).to_string(),
+            ),
+            (
+                2,
+                "response_bytes",
+                "33554432",
+                (usize::MAX as u128 + 1).to_string(),
+            ),
+        ] {
+            for invalid in [
+                format!("{valid}.0"),
+                format!("{valid}e0"),
+                format!("{valid}.5"),
+                "-1".to_owned(),
+                "-0".to_owned(),
+                format!(r#""{valid}""#),
+                "true".to_owned(),
+                "false".to_owned(),
+                "null".to_owned(),
+                "[]".to_owned(),
+                "{}".to_owned(),
+                overflow,
+                "18446744073709551616".to_owned(),
+            ] {
+                let mut tokens = ["1", "2000", "33554432"];
+                tokens[index] = &invalid;
+                let wire = capabilities_wire(tokens[0], tokens[1], tokens[2]);
+                assert!(
+                    serde_json::from_str::<WorkerCapabilities>(&wire).is_err(),
+                    "accepted noninteger or overflowing wire token {field}={invalid}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn raw_integer_wire_requires_the_exact_negotiated_version_and_limits() {
+        let exact = capabilities_wire("1", "2000", "33554432");
+        serde_json::from_str::<WorkerCapabilities>(&exact)
+            .unwrap()
+            .validate()
+            .unwrap();
+
+        // These remain valid integer tokens. Reject their values through the
+        // exact protocol contract, rather than broadening or clamping limits.
+        for version in [0, PROTOCOL_VERSION + 1, u32::MAX] {
+            let wire = capabilities_wire(&version.to_string(), "2000", "33554432");
+            let decoded = serde_json::from_str::<WorkerCapabilities>(&wire).unwrap();
+            assert!(matches!(decoded.validate(), Err(Error::Protocol(_))));
+        }
+        for cells in [0, VARIABLE_CELLS - 1, VARIABLE_CELLS + 1, usize::MAX] {
+            let wire = capabilities_wire("1", &cells.to_string(), "33554432");
+            let decoded = serde_json::from_str::<WorkerCapabilities>(&wire).unwrap();
+            assert!(matches!(decoded.validate(), Err(Error::Protocol(_))));
+        }
+        for bytes in [0, RESPONSE_BYTES - 1, RESPONSE_BYTES + 1, usize::MAX] {
+            let wire = capabilities_wire("1", "2000", &bytes.to_string());
+            let decoded = serde_json::from_str::<WorkerCapabilities>(&wire).unwrap();
+            assert!(matches!(decoded.validate(), Err(Error::Protocol(_))));
+        }
+    }
+
     #[test]
     fn context_round_trips_large_counters_as_exact_decimal_strings() {
         let context = SessionContext {
