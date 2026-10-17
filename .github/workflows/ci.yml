@@ -53,7 +53,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            octave liboctave-dev gnuplot-nox fonts-freefont-otf octave-control octave-signal \
+            octave octave-dev gnuplot-nox fonts-freefont-otf octave-control octave-signal \
             octave-image octave-statistics octave-optim octave-struct \
             build-essential pkg-config libx11-dev libxi-dev libxcursor-dev \
             libxrandr-dev libxinerama-dev libgl1-mesa-dev libwayland-dev libxkbcommon-dev

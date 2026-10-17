@@ -3,6 +3,9 @@
 // Uses public Octave APIs; numerical names stay local and no user variables are added.
 #include <octave/oct.h>
 #include <octave/defun-dld.h>
+#if defined(MATHLAB_QUALIFIED_CORE_V2) && MATHLAB_QUALIFIED_CORE_V2 == 1
+#include "mathlab_adapter_binding_v2.h"
+#endif
 #include <octave/interpreter.h>
 #include <octave/ov-fcn-handle.h>
 #include <octave/ov-fcn.h>
@@ -31,9 +34,28 @@ using mathlab_source_context::install_bindings;
 using mathlab_source_context::parse_script;
 using mathlab_source_context::bindings_from_handles;
 
+#if defined(MATHLAB_QUALIFIED_CORE_V2) && MATHLAB_QUALIFIED_CORE_V2 == 1
+namespace {
+mathlab_adapter_binding_v2::binding& intrinsic_binding() {
+  // Process-lifetime transport configuration only. Retention/teardown is unproved.
+  static auto *value = new mathlab_adapter_binding_v2::binding;
+  return *value;
+}
+} // namespace
+
+#endif
 DEFMETHOD_DLD (mathlab_scope_bridge, interp, args, nargout,
               "Prepare or bind local functions for an exact generated source file")
 {
+#if defined(MATHLAB_QUALIFIED_CORE_V2) && MATHLAB_QUALIFIED_CORE_V2 == 1
+  if (mathlab_adapter_binding_v2::is_bind_operation (args))
+    {
+      mathlab_adapter_binding_v2::bind (intrinsic_binding (), interp, args, nargout,
+                                      "scope", "mathlab_scope_bridge");
+      return octave_value_list ();
+    }
+  mathlab_adapter_binding_v2::active (intrinsic_binding (), interp);
+#endif
   if (args.length () == 2 && args(0).is_string ()
       && args(0).string_value () == "protocol" && args(1).isnumeric ()
       && args(1).is_scalar_type () && args(1).double_value () == 0)
@@ -51,7 +73,14 @@ DEFMETHOD_DLD (mathlab_scope_bridge, interp, args, nargout,
   if (args.length () == 2 && args(0).is_string ()
       && args(0).string_value () == "registry" && args(1).is_string () && nargout <= 1)
     {
+#if defined(MATHLAB_QUALIFIED_CORE_V2) && MATHLAB_QUALIFIED_CORE_V2 == 1
+      if (mathlab_adapter_binding_v2::active (intrinsic_binding (), interp))
+        mathlab_adapter_binding_v2::registry_function (intrinsic_binding (), interp, args(1));
+      else
+        mathlab_source_context::retain_registry (interp, args(1));
+#else
       mathlab_source_context::retain_registry (interp, args(1));
+#endif
       return ovl (true);
     }
 

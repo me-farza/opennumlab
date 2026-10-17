@@ -133,8 +133,8 @@ Stop after input consumption ends the enclosing execution with
 `MathLab:Interrupted`, releases the pending evaluation and preserves the base
 workspace. Explicit Quit uses `MathLab:DebugQuit`. Native probes cover waiting,
 entered-expression and nested-watch cancellation in quiet/live modes, including
-real cleanup and no continuation. The [desktop acceptance log](../artifacts/desktop-app-stop-test.log)
-and [native Stop report](../artifacts/debug-input-stop-report.json) record these
+real cleanup and no continuation. The desktop acceptance log (local evidence unavailable in source exports: `../artifacts/desktop-app-stop-test.log`)
+and native Stop report (local evidence unavailable in source exports: `../artifacts/debug-input-stop-report.json`) record these
 distinct checks. Exact pending reply files are removed when a read finishes or
 is revoked; stale replies cannot accumulate through normal restart/cancellation.
 
@@ -514,7 +514,7 @@ reflection, registry isolation, immutable snapshot and logical-clear changes.
 Recorded local command output is `artifacts/engine-registry-tests.log` and
 `artifacts/verification.log`; the repeated initial-breakpoint proof is
 `artifacts/ast-clear-registry-separation-tests.log`. Current input/debugger evidence
-uses scope 2, debugger 4 and input 1. The [validation record](../artifacts/VALIDATION.md)
+uses scope 2, debugger 4 and input 1. The validation record (local evidence unavailable in source exports: `../artifacts/VALIDATION.md`)
 separates targeted runs, full enabled/fallback verification and package checks.
 Local source packaging includes available generated records; a clean checkout
 does not require them to build.

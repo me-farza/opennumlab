@@ -16,6 +16,8 @@ clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 mathlab-engine.workspace = true
+mathlab-language.workspace = true
+mathlab-array.workspace = true
 tempfile.workspace = true
 sha2 = "0.10.9"
 

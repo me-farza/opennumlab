@@ -1,10 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Dense complex components for the owned worker; selected ABI support only.
 // Preserve dense complex component bits without Octave scalar/index narrowing.
+#if defined(MATHLAB_QUALIFIED_CORE_V2) && MATHLAB_QUALIFIED_CORE_V2 == 1
+// Numerical operations perform no interpreter evaluation, overloaded indexing,
+// callback, base assignment, registry mutation, graphics access or persistent
+// numeric ownership. The private bind retains transport code/configuration only.
+#else
 // No interpreter evaluation, overloaded indexing, callback, base assignment,
 // registry mutation, graphics access or persistent numeric ownership occurs.
+#endif
 #include <octave/oct.h>
 #include <octave/defun-dld.h>
+#if defined(MATHLAB_QUALIFIED_CORE_V2) && MATHLAB_QUALIFIED_CORE_V2 == 1
+#include "mathlab_adapter_binding_v2.h"
+#endif
 #include <octave/ov-cell.h>
 #include <octave/ov-complex.h>
 #include <octave/ov-cx-mat.h>
@@ -28,6 +37,14 @@
 #include <vector>
 
 namespace {
+#if defined(MATHLAB_QUALIFIED_CORE_V2) && MATHLAB_QUALIFIED_CORE_V2 == 1
+mathlab_adapter_binding_v2::binding& intrinsic_binding() {
+  // Process-lifetime transport configuration only. Retention/teardown is unproved.
+  static auto *value = new mathlab_adapter_binding_v2::binding;
+  return *value;
+}
+
+#endif
 constexpr octave_idx_type max_cells = 2000;
 constexpr int max_rank = 32;
 constexpr std::uint64_t first_unsupported_index = UINT64_C(9007199254740992);
@@ -297,8 +314,21 @@ std::string operation_name(const octave_value& value) {
 }
 } // namespace
 
+#if defined(MATHLAB_QUALIFIED_CORE_V2) && MATHLAB_QUALIFIED_CORE_V2 == 1
+DEFMETHOD_DLD(mathlab_value_bridge, interp, args, nargout,
+          "Narrow dense complex component access for a private MathLab worker.") {
+#else
 DEFUN_DLD(mathlab_value_bridge, args, nargout,
           "Narrow dense complex component access for a private MathLab worker.") {
+#endif
+#if defined(MATHLAB_QUALIFIED_CORE_V2) && MATHLAB_QUALIFIED_CORE_V2 == 1
+  if (mathlab_adapter_binding_v2::is_bind_operation(args)) {
+    mathlab_adapter_binding_v2::bind(intrinsic_binding(), interp, args, nargout,
+                                   "value", "mathlab_value_bridge");
+    return octave_value_list();
+  }
+  mathlab_adapter_binding_v2::active(intrinsic_binding(), interp);
+#endif
   if (args.length() < 1)
     error_with_id("MathLab:ValueBridgeArguments", "Expected an operation");
   const auto operation = operation_name(args(0));

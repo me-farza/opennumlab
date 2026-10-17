@@ -141,3 +141,12 @@ budgets, output/figure lifetimes, and current native-debugger boundaries.
 
 Reference behavior: [MATLAB script local functions](https://www.mathworks.com/help/matlab/matlab_prog/local-functions-in-scripts.html)
 and [Octave private functions](https://docs.octave.org/latest/Private-Functions.html).
+
+
+## Rust literal-expression component
+
+The explicit `literal-expression-v1` library component keeps the original UTF-8 source and byte spans while parsing signed integer spellings, parentheses, rectangular comma/semicolon matrix literals, `[]`, and binary `+`. `expression::lower_literal_expression_v1` produces admitted IR; `literal_evaluation::evaluate_literal_expression_v1` consumes that IR and returns an owned double array with its original AST/source. It composes the `mathlab-array` constructors and addition without invoking Octave.
+
+This first profile admits integer magnitudes through 2^53 with at most 16 digits, one physical code line with surrounding line comments, arrays up to 16 by 16 and 256 elements, and the other resource bounds in the N01 contract. Project syntax/resource diagnostics and host allocation failures are distinct; leaf errors preserve their original context and code. These are project rules for an incremental language component, not MATLAB's complete syntax or native error identifiers.
+
+The Engine, desktop and CLI still use their existing execution path. This library is not an application backend selection. Its original fixture predictions require affected Rust checks; fresh MATLAB source oracles and full N01/R03/K04/N03 acceptance remain separate. See `docs/research/matlab-r2026b/N01_LITERAL_EXPRESSION_HANDOFF_V1.md` at the repository root for the exact contract.

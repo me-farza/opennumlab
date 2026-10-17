@@ -1,0 +1,404 @@
+{
+  "schema_version": 1,
+  "capture_id": "N01-OPERATORS-ACTUAL-02-SHORT-RUNTIME-04",
+  "source_fixture_commit": "41ed297ad7453fe6bdd160f861a5331c4708c35c",
+  "source_fixture_sha256": "e00a3bd69d48461de9fefa461efebe29404dfd032bb4b15fe50277d48aeb2104",
+  "controls_source_commit": "b88878a0f1139be958b79e0ad3b8adbb82e7b8b8",
+  "prepared_sha256": "2972d9ba02c58ee5516f0813af67ee63fda48ddf1ee2e8000096a0a719184e98",
+  "terminal_receipt_sha256": "424ba525e36f8d43dc8a058305a0db6f2a75614a3aa0b415ad6f1a6d575985c5",
+  "accepted_capture_review_sha256": "aed0625193f1921ffc2666ce8a89da523bf9d8e8f1f1df81c13e10f766ee2430",
+  "runtime_profile": {
+    "architecture": "maca64",
+    "computer": "MACA64",
+    "mex_extension": "mexmaca64",
+    "path_mode": "restoredefaultpath_after_startup_plus_staged_observer",
+    "release": "R2026b",
+    "startup_hermeticity": "not_established",
+    "version": "26.2.0.3386108 (R2026b)"
+  },
+  "capture_counts": {
+    "prediction_matches": 6,
+    "harness_control_matches": 3,
+    "unasserted_native_observations": 6,
+    "record_count": 15
+  },
+  "policy": {
+    "original_capture": "Nine prediction/control matches and six accepted unasserted observations; Rust regression expectations do not change historical capture classifications.",
+    "nan": "O03 raw observed words are retained; comparison uses NaN category only, not a universal payload guarantee.",
+    "diagnostics": "O04 native identifier/frame line retained separately from project ArrayOperation/typed-shape error/byte spans. Native columns and AST not collected.",
+    "controls": "Three controls establish observer integrity; they are not admitted as additional Rust operator tests.",
+    "data_scope": "Original test sources and selected raw-record fields only; no environment, absolute host paths, vendor code or runtime file dependency."
+  },
+  "records": [
+    {
+      "id": "C01",
+      "role": "harness_control",
+      "source": "23",
+      "source_utf8_sha256": "535fa30d7e25dd8a49f1536779734ec8286108d115da5045d77f3b4185d8f790",
+      "record_sha256": "ce25f6b293c25d7dabb0517af2550f1b72db3d7f41f765b7df4870c7c44ad08d",
+      "outcome": "ok",
+      "ans_present": true,
+      "output": {
+        "class": "double",
+        "shape": [
+          "1",
+          "1"
+        ],
+        "numel": "1",
+        "is_real": true,
+        "is_sparse": false,
+        "order": "column_major",
+        "payload_status": "collected_real_dense_double",
+        "data_hex": [
+          "4037000000000000"
+        ]
+      },
+      "native_error_identifier": "",
+      "native_warning_identifier": ""
+    },
+    {
+      "id": "C02",
+      "role": "harness_control",
+      "source": "% original no-result control\n",
+      "source_utf8_sha256": "a1e91f735549fd3384d95246ff0b89446378e332e39e98289a13b7effa44da0d",
+      "record_sha256": "1f65149e161a9aa6064c4b420127d0ed26362836127ee33555659fb39c606bb7",
+      "outcome": "ok",
+      "ans_present": false,
+      "output": null,
+      "native_error_identifier": "",
+      "native_warning_identifier": ""
+    },
+    {
+      "id": "C03",
+      "role": "harness_control",
+      "source": "error('OpenNumLabReference:N01Control','original error control');",
+      "source_utf8_sha256": "1b1391275be194d6848ea7c8ef63eb23644a7cd62fd7c3ae9fef7ecf62c514d9",
+      "record_sha256": "cb51caf0bd436aca58cb67855507aafa372523ca6e76da55b9284ea4ebf03aa0",
+      "outcome": "error",
+      "ans_present": false,
+      "output": null,
+      "native_error_identifier": "OpenNumLabReference:N01Control",
+      "native_warning_identifier": ""
+    },
+    {
+      "id": "F01",
+      "role": "predicted_match",
+      "source": "-(5-2)",
+      "source_utf8_sha256": "57b69d163c3df286afa263b421ad9e20ac81d02425ae621506ae98610cd3c5aa",
+      "record_sha256": "30b9dc5bea59a516a1d2cb872a092e02186e8ea14762764c75c8eec5a44124e6",
+      "outcome": "ok",
+      "ans_present": true,
+      "output": {
+        "class": "double",
+        "shape": [
+          "1",
+          "1"
+        ],
+        "numel": "1",
+        "is_real": true,
+        "is_sparse": false,
+        "order": "column_major",
+        "payload_status": "collected_real_dense_double",
+        "data_hex": [
+          "c008000000000000"
+        ]
+      },
+      "native_error_identifier": "",
+      "native_warning_identifier": ""
+    },
+    {
+      "id": "F02",
+      "role": "predicted_match",
+      "source": "[10,20,30]-[1;2]",
+      "source_utf8_sha256": "294a77d648ba8ec3686fb6662ccef36e4cc5b3f9ee1b39803dae02087efc7c3a",
+      "record_sha256": "b0a3ae06ebf5cae0b0e2697cc94665f716af44c9ad1209dbfa835f6c5dd73e0c",
+      "outcome": "ok",
+      "ans_present": true,
+      "output": {
+        "class": "double",
+        "shape": [
+          "2",
+          "3"
+        ],
+        "numel": "6",
+        "is_real": true,
+        "is_sparse": false,
+        "order": "column_major",
+        "payload_status": "collected_real_dense_double",
+        "data_hex": [
+          "4022000000000000",
+          "4020000000000000",
+          "4033000000000000",
+          "4032000000000000",
+          "403d000000000000",
+          "403c000000000000"
+        ]
+      },
+      "native_error_identifier": "",
+      "native_warning_identifier": ""
+    },
+    {
+      "id": "F03",
+      "role": "predicted_match",
+      "source": "[1,2].*[3;4]",
+      "source_utf8_sha256": "59db2dcaff2ddbdff7e1d2961be3e678651d29a2b0f0cb353206e25f969ac09c",
+      "record_sha256": "3a70558c9bf08dca6549c23acc29556463b7e82c26bf57ecb78846fe83a2416f",
+      "outcome": "ok",
+      "ans_present": true,
+      "output": {
+        "class": "double",
+        "shape": [
+          "2",
+          "2"
+        ],
+        "numel": "4",
+        "is_real": true,
+        "is_sparse": false,
+        "order": "column_major",
+        "payload_status": "collected_real_dense_double",
+        "data_hex": [
+          "4008000000000000",
+          "4010000000000000",
+          "4018000000000000",
+          "4020000000000000"
+        ]
+      },
+      "native_error_identifier": "",
+      "native_warning_identifier": ""
+    },
+    {
+      "id": "F04",
+      "role": "predicted_match",
+      "source": "[2;4]./[2,4,8]",
+      "source_utf8_sha256": "522f125ff6854d8e4615f39ea9d1a12773461dc9d1802e34c261fafce19376f2",
+      "record_sha256": "4c7b3d1e4f4544345e7038928a92ddb6225e3bd1cf07455baa5c9daf6ca56a7c",
+      "outcome": "ok",
+      "ans_present": true,
+      "output": {
+        "class": "double",
+        "shape": [
+          "2",
+          "3"
+        ],
+        "numel": "6",
+        "is_real": true,
+        "is_sparse": false,
+        "order": "column_major",
+        "payload_status": "collected_real_dense_double",
+        "data_hex": [
+          "3ff0000000000000",
+          "4000000000000000",
+          "3fe0000000000000",
+          "3ff0000000000000",
+          "3fd0000000000000",
+          "3fe0000000000000"
+        ]
+      },
+      "native_error_identifier": "",
+      "native_warning_identifier": ""
+    },
+    {
+      "id": "F05",
+      "role": "predicted_match",
+      "source": "[1,2,3;4,5,6].'",
+      "source_utf8_sha256": "df4efd59d04c33d7c05127c1a1b8ae4b5b599322944dc2321130d08319ef60a5",
+      "record_sha256": "c012a8d0d0124436c03a8e6f62a13ac9306cb4b44da0506090525a30c060c549",
+      "outcome": "ok",
+      "ans_present": true,
+      "output": {
+        "class": "double",
+        "shape": [
+          "3",
+          "2"
+        ],
+        "numel": "6",
+        "is_real": true,
+        "is_sparse": false,
+        "order": "column_major",
+        "payload_status": "collected_real_dense_double",
+        "data_hex": [
+          "3ff0000000000000",
+          "4000000000000000",
+          "4008000000000000",
+          "4010000000000000",
+          "4014000000000000",
+          "4018000000000000"
+        ]
+      },
+      "native_error_identifier": "",
+      "native_warning_identifier": ""
+    },
+    {
+      "id": "F06",
+      "role": "predicted_match",
+      "source": "[]./1",
+      "source_utf8_sha256": "ecc85b8a01f1bb3795ec1cf2e1a9486eaabdcbdc0dda366529f8836bc2549b8a",
+      "record_sha256": "d8dbdff30cc2152d30b707e292009d0600fe5b13c4a0f2fbec46d75e99947f80",
+      "outcome": "ok",
+      "ans_present": true,
+      "output": {
+        "class": "double",
+        "shape": [
+          "0",
+          "0"
+        ],
+        "numel": "0",
+        "is_real": true,
+        "is_sparse": false,
+        "order": "column_major",
+        "payload_status": "collected_real_dense_double",
+        "data_hex": []
+      },
+      "native_error_identifier": "",
+      "native_warning_identifier": ""
+    },
+    {
+      "id": "O01",
+      "role": "unasserted_native_observation",
+      "source": "-[-0,0]",
+      "source_utf8_sha256": "d0920994233bc97e2ab0173a960c65d5521171b6138c0119488c9bc592b0dc34",
+      "record_sha256": "f9cbc000294a937e0c397808aa41554666218a2592c66a64dd88ff83c47958a5",
+      "outcome": "ok",
+      "ans_present": true,
+      "output": {
+        "class": "double",
+        "shape": [
+          "1",
+          "2"
+        ],
+        "numel": "2",
+        "is_real": true,
+        "is_sparse": false,
+        "order": "column_major",
+        "payload_status": "collected_real_dense_double",
+        "data_hex": [
+          "0000000000000000",
+          "8000000000000000"
+        ]
+      },
+      "native_error_identifier": "",
+      "native_warning_identifier": ""
+    },
+    {
+      "id": "O02",
+      "role": "unasserted_native_observation",
+      "source": "[1,-1,1,-1]./[0,0,-0,-0]",
+      "source_utf8_sha256": "9eed3f00d408d3a24be464f83c00bc263fd954868857a0fda9b90332d528b7e8",
+      "record_sha256": "79bfa9565bb3b1f4641af4b284d8bff5b098683c85441c3cea3947a153adf7bb",
+      "outcome": "ok",
+      "ans_present": true,
+      "output": {
+        "class": "double",
+        "shape": [
+          "1",
+          "4"
+        ],
+        "numel": "4",
+        "is_real": true,
+        "is_sparse": false,
+        "order": "column_major",
+        "payload_status": "collected_real_dense_double",
+        "data_hex": [
+          "7ff0000000000000",
+          "fff0000000000000",
+          "fff0000000000000",
+          "7ff0000000000000"
+        ]
+      },
+      "native_error_identifier": "",
+      "native_warning_identifier": ""
+    },
+    {
+      "id": "O03",
+      "role": "unasserted_native_observation",
+      "source": "[0,1e10000]./[0,1e10000]",
+      "source_utf8_sha256": "0507183d4111d2c4f8eef42e454cb29fd122020a71c1640c67ad890f3b7304ab",
+      "record_sha256": "324fcb2f16c2c91c1b84ce2e9e29cfed2ec754f35831f941550cf9292ac5b31d",
+      "outcome": "ok",
+      "ans_present": true,
+      "output": {
+        "class": "double",
+        "shape": [
+          "1",
+          "2"
+        ],
+        "numel": "2",
+        "is_real": true,
+        "is_sparse": false,
+        "order": "column_major",
+        "payload_status": "collected_real_dense_double",
+        "data_hex": [
+          "7ff8000000000000",
+          "7ff8000000000000"
+        ]
+      },
+      "native_error_identifier": "",
+      "native_warning_identifier": ""
+    },
+    {
+      "id": "O04",
+      "role": "unasserted_native_observation",
+      "source": "%λ\r\n[1;2]./[3;4;5]",
+      "source_utf8_sha256": "eb321234d6f2416742e10a92499a8bdcd1d9874053e4e792cb7afdec5812a26f",
+      "record_sha256": "8122d5de0c3ab69736337de624a4191c3d20b883feba98682b76d17c48f0691d",
+      "outcome": "error",
+      "ans_present": false,
+      "output": null,
+      "native_error_identifier": "MATLAB:sizeDimensionsMustMatch",
+      "native_warning_identifier": "",
+      "native_source_frame_line": 2
+    },
+    {
+      "id": "O05",
+      "role": "unasserted_native_observation",
+      "source": "1..*2",
+      "source_utf8_sha256": "18134249574821557bdf30e833a016ca57eb35ab27289c8557a3c76d90b97f07",
+      "record_sha256": "809a846167f8d1dab69b044f42bd92ff4881f66c464518467181fe7d6c6b9b6c",
+      "outcome": "ok",
+      "ans_present": true,
+      "output": {
+        "class": "double",
+        "shape": [
+          "1",
+          "1"
+        ],
+        "numel": "1",
+        "is_real": true,
+        "is_sparse": false,
+        "order": "column_major",
+        "payload_status": "collected_real_dense_double",
+        "data_hex": [
+          "4000000000000000"
+        ]
+      },
+      "native_error_identifier": "",
+      "native_warning_identifier": ""
+    },
+    {
+      "id": "O06",
+      "role": "unasserted_native_observation",
+      "source": "1..'",
+      "source_utf8_sha256": "8d7e12921ea9636474042a60f725536548ddd0d3667b07c9b178b0f1b2be45f9",
+      "record_sha256": "2d704d34d0ebce9ba9d119fa6868f18da8fedeb6ea53e4ced2b45e7a0a3723f4",
+      "outcome": "ok",
+      "ans_present": true,
+      "output": {
+        "class": "double",
+        "shape": [
+          "1",
+          "1"
+        ],
+        "numel": "1",
+        "is_real": true,
+        "is_sparse": false,
+        "order": "column_major",
+        "payload_status": "collected_real_dense_double",
+        "data_hex": [
+          "3ff0000000000000"
+        ]
+      },
+      "native_error_identifier": "",
+      "native_warning_identifier": ""
+    }
+  ]
+}

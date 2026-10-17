@@ -8,7 +8,13 @@
 //! Keeping all files unchanged preserves handles and local persistent state.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+pub mod arithmetic_expression;
+pub mod decimal_expression;
+pub mod expression;
+mod expression_core;
 mod lexer;
+pub mod literal_evaluation;
+pub mod session_expression;
 
 use lexer::{Statement, TokenKind, statements};
 use std::collections::HashSet;

@@ -9,6 +9,136 @@ parser or simulated interpreter.
 `MATHLAB_OCTAVE`, `OCTAVE_EXECUTABLE`, `PATH`, and common macOS/Linux install locations.
 GNU Octave 11.3.0 is tested locally; Octave must have built-in JSON support.
 
+## Explicit qualified startup
+
+`Engine::start_qualified(working_directory, TrustedStartupConfig)` selects the
+`qualified-core-v2` startup profile. Ordinary `Engine::start` retains its existing
+behavior; frontend opt-in is described below. The qualified profile currently selects
+GNU Octave **11.3.0 / api-v61**, the v2 intrinsic provider and an explicit subset of
+the input, scope, value and debugger adapters. Explicitly selecting an additional
+`AdapterRole::Graphics` chooses the experimental `qualified-graphics-v2` profile
+and its exact graphics worker/service closure. It admits 120 native primitives;
+the graphics-disabled core retains its original 115 and unchanged worker bytes.
+Call `enable_graphics_service` before user execution to activate the bounded
+object registry, line queries, mutations and programmatic callback service.
+The combined qualification fixture selects six native modules: the provider,
+four core adapters and the graphics bridge. Selection itself allows a declared
+subset of core adapters. It does not activate a frontend or establish full figure,
+native mouse or MATLAB graphics compatibility. Graphics recovery and native
+behavior require their own runtime evidence.
+
+The caller supplies canonical absolute paths and SHA-256 pins through
+`PinnedFile`, `AdapterConfig` and `AdapterRole`. `TrustedStartupConfig` includes
+the installation root, executable, provider, gnuplot and Ghostscript executables, explicit runtime
+function directories, adapter selections and runtime/API versions. Files and
+directory identities are checked again before startup; no project directory or
+native module directory is added to the admitted runtime function path. The
+private transport session is created with owner-only permissions. Inherited
+runtime and adapter environment settings do not select this profile.
+
+The qualified child starts with a cleared environment. On POSIX its utility
+`PATH` contains only the selected Octave executable's parent, `/usr/bin` and
+`/bin`, in that order. This lets user programs and Octave M files invoke system
+utilities such as the `mv` used by `movefile`, without inheriting ambient `PATH`
+entries or adding project, function or native-module directories. Runtime startup,
+the provider, adapters, gnuplot and Ghostscript still use their admitted absolute paths and
+pins; the utility path does not participate in selecting them. System utilities
+remain part of the host trust boundary, rather than individually pinned files.
+Qualified startup still requires Unix session semantics.
+
+Ordinary PNG export requires a selected Ghostscript pin even with the core
+profile. The child receives that absolute executable through Octave's `GSC`
+environment setting; its directory is not appended to `PATH`. Both export
+auxiliary paths must contain only ASCII letters, digits, `/`, `_`, `-`, `+` and
+`.` because the selected Octave print/gnuplot helpers can invoke a shell.
+After setting the selected `gnuplot_binary`, cold startup explicitly registers
+the runtime's gnuplot toolkit before the worker's existing invisible warmup.
+This avoids relying on Octave's earlier `PKG_ADD` executable probe under the
+constrained `PATH`. Recovery leaves the user's current toolkit choice intact.
+
+The session still follows the caller's temporary root, including roots with
+spaces. When its pathname is not a literal shell word, qualified startup gives
+the child a `TMPDIR` alias in a private owner-only directory under canonical
+`/tmp`. The alias points to the original session: temporary file contents stay
+on the caller-selected filesystem, and `HOME`, working directory, worker paths
+and admitted runtime paths do not move. Only the alias directory and one symlink
+use the system temporary filesystem. Startup checks its ownership, permissions
+and target before each spawn; the prepared startup owns its cleanup. An unusable
+system alias root fails startup explicitly. This is a Unix compatibility measure
+for Octave's unquoted temporary EPS paths, not a change to its installed helpers.
+
+After construction, enable each selected adapter through its ordinary public
+`enable_*` method before executing numerical user source. In particular, enable
+input before the first execution; previously captured input handles cannot be
+redirected safely. Selecting an adapter in configuration admits its identity but
+does not enable its user-facing functionality. The five-module release selection
+uses the intrinsic provider and all four adapters.
+
+`qualified_startup_status()` returns a serializable `QualifiedStartupStatus` only
+after a genuine Ready has matched the admitted identity and while that invocation
+still owns an open transport. It reports the selected core or graphics profile, accepted
+session context and intrinsic provider/adapter identities. Ordinary startup,
+unaccepted or retired Ready, stale contexts and closed transports return `None`.
+The intrinsic wire protocol remains `mathlab-intrinsics`, string version `"1"`;
+the profile name does not change the wire protocol version. The status proves
+startup admission, rather than numerical compatibility or full product readiness.
+
+Caller-supplied pins do not authenticate a vendor. Runtime directory contents,
+native dependencies and mutable filesystem state remain trust boundaries; the
+checks do not make executing user code a sandbox.
+
+### Explicit frontend configuration
+
+The source integration adds `--startup-config FILE.json` to the CLI and desktop.
+It conflicts with `--octave`; the desktop also rejects a debugger-path override.
+Without this option, frontend runtime selection keeps its legacy behavior. With
+it, the frontends use only the selected configuration and report failures without
+runtime discovery or fallback. Compiler, runtime and installed validation of this
+new frontend route remain pending.
+
+`startup_config::QualifiedStartupConfig::load` reads a regular UTF-8 JSON file of
+at most one MiB. Its envelope is `{ "schema_version": 2, "profile":
+"qualified-core-v2", "startup": { ... } }`. `startup` has the fields of
+`TrustedStartupConfig` above. File pins are `{ "path": "/absolute/path",
+"sha256": "64 lowercase hexadecimal digits" }`; adapter entries are
+`{ "role": "input", "file": { ... } }`. All paths must be absolute; existing
+startup admission checks canonical paths, file hashes, directories and SDK identity.
+Unknown and duplicate fields are rejected.
+
+`startup.ghostscript` is a required file pin. The private schema 1 predecessor is
+rejected; callers must explicitly supply schema 2 and the export executable.
+There is no automatic upgrade, inherited executable choice or discovery fallback.
+
+This serialized profile requires exactly input, scope, value and debug adapters,
+with their standard `mathlab_*_bridge.oct` basenames, plus
+`mathlab_intrinsic_bridge.oct`. The `qualified-graphics-v2` envelope instead
+requires those five modules plus `mathlab_graphics_bridge.oct` and activates the
+graphics registry. `start` admits the selection and enables all selected adapters
+before returning an Engine. Configuration-aware `restart` restores that selected
+activation, while raw `Engine::restart` continues to disable graphics. The fixed
+installed `qualified-core-v2.json` slot selects either profile through its envelope;
+only its native paths are rebound to the installed bundle. External runtime,
+gnuplot and Ghostscript pins remain literal. CLI doctor and value-probe reports
+bind actual accepted Ready status to the five or six native identities;
+Ghostscript is an external auxiliary, not an additional native module. The reported context belongs
+to that accepted Ready; it is not a later workspace revision.
+
+The private predecessor passed the selected startup, four-adapter, complex-edit,
+`clear functions`, Stop/recovery, cold restart, input and normal-exit workflow on
+local Octave 11.3. That evidence does not qualify a newly built shared or installed
+artifact. Native lifecycle tests are explicitly ignored by the default Rust
+test run because they need selected runtime and auxiliary pins plus five or six
+already-built modules;
+select `trusted_startup_runtime_tests` with `--include-ignored --test-threads=1`
+when those prerequisites and the workload lane are available. Missing selected
+prerequisites fail these tests; they do not return a successful skip. The registry
+lifecycle test additionally checks `clear all` and rejects a foreign command-line
+registry before any replacement or requested body executes.
+The new core and graphics ordinary-PNG fixtures also remain unrun. They require
+`MATHLAB_QUALIFIED_TEST_GHOSTSCRIPT` alongside the other explicit selections, and
+check export after finite-loop Stop, input Stop, `clear functions` and configured
+cold restart while retaining the user's explicit toolkit choice.
+
 ## Operations
 
 - `execute`: evaluate code in the persistent base workspace.
@@ -181,13 +311,13 @@ single native echo, prompt ordering, nested expressions, `builtin('input',...)`,
 EOF and subsequent requests, `clear all`, no-output calls, and same-process SIGINT
 recovery/restart with stale-key rejection. A caught malformed reply also finishes
 with `Error` before the next input in the same execution. Logs are in
-[`input-engine-tests.log`](../../artifacts/input-engine-tests.log). Separate real
+`input-engine-tests.log` (local evidence unavailable in source exports: `../../artifacts/input-engine-tests.log`). Separate real
 native proofs cover quiet and streamed paused evaluations while waiting, evaluating
 a submitted long expression, and nesting a watch inside an outer input wait. Both
 SIGINT and debugger Quit unwind the watch, run cleanup, finish the outer execution,
 retain the process/workspace and permit another input; see
-[`debug-input-stop-report.json`](../../artifacts/debug-input-stop-report.json) and
-[`debug-input-quit-report.json`](../../artifacts/debug-input-quit-report.json).
+`debug-input-stop-report.json` (local evidence unavailable in source exports: `../../artifacts/debug-input-stop-report.json`) and
+`debug-input-quit-report.json` (local evidence unavailable in source exports: `../../artifacts/debug-input-quit-report.json`).
 These are scoped runtime checks, not full MATLAB input conformance. Windows support
 is not established.
 

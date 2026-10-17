@@ -96,19 +96,19 @@ debugger response before unwinding, releasing its pending client instead of leav
 it to time out. User cleanup still needs to execute, and the original numerical
 workspace must remain usable afterward.
 
-Targeted [paused input reply evidence](../artifacts/desktop-paused-input-test.log)
+Targeted paused input reply evidence (local evidence unavailable in source exports: `../artifacts/desktop-paused-input-test.log`)
 checks caller-local expression input and live forwarding. Native quiet/live
 causal probes additionally check Busy rejection, requested Quit without later
-watch continuation, user cleanup and same-process reuse. The [actual desktop
-Stop regression](../artifacts/desktop-app-stop-test.log),
+watch continuation, user cleanup and same-process reuse. The actual desktop
+Stop regression (local evidence unavailable in source exports: `../artifacts/desktop-app-stop-test.log`),
 `app_stop_interrupts_a_paused_evaluation_after_input_has_already_been_consumed`,
 passes against the final module: Stop ends the outer request with
 `MathLab:Interrupted`, releases the pending Evaluate, clears busy state and
-preserves a base-workspace value for the next request. The [native causal Stop
-report](../artifacts/debug-input-stop-report.json) separately checks waiting,
+preserves a base-workspace value for the next request. The native causal Stop
+report (local evidence unavailable in source exports: `../artifacts/debug-input-stop-report.json`) separately checks waiting,
 entered-expression and nested-watch cancellation in both quiet and live modes,
 including cleanup and absence of later statements. Current full-suite and packaging
-records are maintained in [VALIDATION.md](../artifacts/VALIDATION.md); optional
+records are maintained in VALIDATION.md (local evidence unavailable in source exports: `../artifacts/VALIDATION.md`); optional
 native tests that take a skip branch do not validate their native path.
 
 Broader debugger, terminal and cross-platform behavior remains development work.

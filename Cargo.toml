@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/mathlab-engine", "crates/mathlab-cli", "crates/mathlab-desktop", "crates/mathlab-language", "crates/mathlab-debugger"]
+members = ["crates/mathlab-engine", "crates/mathlab-cli", "crates/mathlab-desktop", "crates/mathlab-language", "crates/mathlab-debugger", "crates/mathlab-array", "crates/mathlab-simulation"]
 resolver = "2"
 
 [workspace.package]
@@ -21,6 +21,7 @@ image = { version = "0.25.10", default-features = false, features = ["png"] }
 mathlab-engine = { path = "crates/mathlab-engine" }
 mathlab-language = { path = "crates/mathlab-language" }
 mathlab-debugger = { path = "crates/mathlab-debugger" }
+mathlab-array = { path = "crates/mathlab-array" }
 
 [profile.release]
 lto = "thin"

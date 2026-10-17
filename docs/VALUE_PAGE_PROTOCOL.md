@@ -14,7 +14,7 @@ The development checkpoint adds a native component route for dense
 complex values to avoid losing imaginary negative zero through native selection.
 It requires the optional `dense_complex_native_components.v1` capability for
 that route and rejects dense complex requests explicitly when the helper is
-unavailable. The [follow-up report](../artifacts/cp03-followup-validation/RESULTS.json)
+unavailable. The follow-up report (local evidence unavailable in source exports: `../artifacts/cp03-followup-validation/RESULTS.json`)
 records 404 passing entrypoints across all 19 compiled workspace test targets,
 with freshly built scope, debugger, input and value adapters on macOS arm64 /
 Octave 11.3. The original typed-page (12), binding (13) and session (56) targets

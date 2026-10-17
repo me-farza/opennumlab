@@ -1,6 +1,6 @@
 # Open source MATLAB compatible platform development plan
 
-Planning baseline: October 14, 2026. Implementation status: an integrated Rust desktop and CLI alpha now runs GNU Octave, with script execution, workspace previews, MAT files, figure previews and package loading. See [README](README.md) for the implemented scope and [validation evidence](artifacts/VALIDATION.md) for checked behavior. The remaining sections describe the full development target.
+Planning baseline: October 14, 2026. Implementation status: an integrated Rust desktop and CLI alpha now runs GNU Octave, with script execution, workspace previews, MAT files, figure previews and package loading. See [README](README.md) for the implemented scope and validation evidence (local evidence unavailable in source exports: `artifacts/VALIDATION.md`) for checked behavior. The remaining sections describe the full development target.
 
 Build an open-source scientific computing platform by integrating an existing MATLAB-compatible engine, tested scientific packages, and a familiar desktop written in Rust. Evaluate GNU Octave as the primary engine before investing in a new interpreter. A MATLAB user should be able to begin ordinary work without learning a different language or rearranging their workflow.
 

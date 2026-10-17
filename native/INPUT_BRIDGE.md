@@ -162,9 +162,9 @@ an entered expression running after F(line), and a nested watch inside the outer
 read. Each stops the enclosing execution, releases all pending watch responses,
 runs cleanup without continuation, retains base variables, and accepts fresh
 input in the same process. The checked native evidence is retained in
-[`debug-input-stop-report.json`](../artifacts/debug-input-stop-report.json) with
-its [probe](../artifacts/debug-input-stop-probe.py), plus the separate quiet/live
-Quit [report](../artifacts/debug-input-quit-report.json) and
-[probe](../artifacts/debug-input-quit-probe.py). These checks establish the tested
+`debug-input-stop-report.json` (local evidence unavailable in source exports: `../artifacts/debug-input-stop-report.json`) with
+its probe (local evidence unavailable in source exports: `../artifacts/debug-input-stop-probe.py`), plus the separate quiet/live
+Quit report (local evidence unavailable in source exports: `../artifacts/debug-input-quit-report.json`) and
+probe (local evidence unavailable in source exports: `../artifacts/debug-input-quit-probe.py`). These checks establish the tested
 adapter behavior on the runtime above; they do not establish complete MATLAB
 compatibility.

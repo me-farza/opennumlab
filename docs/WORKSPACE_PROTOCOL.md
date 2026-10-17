@@ -40,7 +40,7 @@ The recovery fault returns the producer-specific diagnostic, closes transport,
 does not repeat re-entry and cannot publish subsequent user execution. Exact
 uint64-max and 2^53+1 tokens, escaping/extensions, malformed values and ordinary
 payload passthrough passed on that runtime. See the retained
-[scoped validation](../artifacts/ready-history-validation/RESULTS.json).
+scoped validation (local evidence unavailable in source exports: `../artifacts/ready-history-validation/RESULTS.json`).
 `MATHLAB_REQUIRE_READY_JSON_TESTS=1` makes the direct producer probe and startup
 regressions mandatory when verifying a runtime profile. Exact uint64-max and
 2^53+1 output must be exercised on actual Octave 11.3 and hosted 8.4; source

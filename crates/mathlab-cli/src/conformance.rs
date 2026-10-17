@@ -3,7 +3,7 @@
 //! A missing reference is incomplete evidence, never a successful comparison.
 
 use anyhow::{bail, ensure, Context, Result};
-use mathlab_engine::{Engine, EngineConfig};
+use mathlab_engine::startup_config::QualifiedStartupConfig;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -25,6 +25,7 @@ const MAX_LOG: usize = 64 * 1024;
 pub(crate) struct Options<'a> {
     pub manifest: &'a Path,
     pub octave: Option<&'a Path>,
+    pub startup_config: Option<&'a QualifiedStartupConfig>,
     pub matlab: Option<&'a Path>,
     pub reference: Option<&'a Path>,
     pub output: Option<&'a Path>,
@@ -374,6 +375,63 @@ mod tests {
     }
 
     #[test]
+    fn missing_record_not_found_is_an_execution_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = read_bounded(&directory.path().join("record.json")).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let report = route_error(error);
+        assert_eq!(report["status"], "error");
+        assert!(report["detail"].as_str().unwrap().contains("record.json"));
+    }
+
+    #[test]
+    fn missing_runtime_spawn_is_unavailable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut command = Command::new(directory.path().join("missing-runtime"));
+        command.current_dir(directory.path());
+        let error = process(&mut command, Duration::from_secs(1)).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<RuntimeLaunchError>().unwrap().0.kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(route_error(error)["status"], "unavailable");
+    }
+
+    #[test]
+    fn engine_execution_diagnostics_are_bounded_and_utf8_safe() {
+        let output = format!("{}🌍tail", "a".repeat(MAX_LOG - 1));
+        let result: mathlab_engine::ExecutionResult = serde_json::from_value(json!({
+            "output":output,"output_truncated":false,
+            "error":{"identifier":"probe:failure","message":"é".repeat(MAX_LOG),"stack":[]},
+            "workspace":[],"figures":[],"working_directory":".","duration_ms":0,
+            "figure_warnings":[]
+        }))
+        .unwrap();
+        let diagnostic = execution_diagnostics(&result);
+        assert_eq!(diagnostic["output"], "a".repeat(MAX_LOG - 1));
+        assert_eq!(diagnostic["diagnostic_dropped_bytes"], "🌍tail".len());
+        assert_eq!(diagnostic["output_truncated"], true);
+        assert_eq!(diagnostic["error_diagnostic_truncated"], true);
+        assert_eq!(diagnostic["error"]["identifier"], "probe:failure");
+        assert!(diagnostic["error"]["message"].as_str().unwrap().len() <= MAX_LOG / 2);
+        assert_eq!(diagnostic["error"]["stack_frames_omitted"], 0);
+
+        let mut complete = result;
+        complete.output = "é".into();
+        complete.error.as_mut().unwrap().message = "short failure".into();
+        assert_eq!(
+            execution_diagnostics(&complete),
+            json!({"output":"é","diagnostic_dropped_bytes":0,"output_truncated":false,
+                "error":complete.error})
+        );
+        complete.output_truncated = true;
+        assert_eq!(execution_diagnostics(&complete)["output_truncated"], true);
+    }
+
+    #[test]
     fn exact_integer_low_bits_and_typed_variants_cannot_compare_as_equal() {
         let original = record();
         assert_eq!(
@@ -426,6 +484,102 @@ mod tests {
         assert_eq!(compare(&a, &b, &policy).unwrap()["status"], "match");
         b["values"][1]["real"][0] = json!("Inf");
         assert_eq!(compare(&a, &b, &policy).unwrap()["status"], "mismatch");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejected_qualified_runtime_pin_prevents_the_independent_raw_route() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let marker = root.join("raw-route-started");
+        let executable = root.join("octave-cli");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf raw > '{}'\nexit 1\n",
+                marker.to_str().unwrap().replace('\'', "'\\''")
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let gnuplot = root.join("gnuplot");
+        fs::write(&gnuplot, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&gnuplot, fs::Permissions::from_mode(0o755)).unwrap();
+        let ghostscript = root.join("gs");
+        fs::write(&ghostscript, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&ghostscript, fs::Permissions::from_mode(0o755)).unwrap();
+        let provider = root.join("mathlab_intrinsic_bridge.oct");
+        fs::write(&provider, b"test-only native pin").unwrap();
+        let adapters: Vec<Value> = ["input", "scope", "value", "debug"]
+            .into_iter()
+            .map(|role| {
+                let path = root.join(format!("mathlab_{role}_bridge.oct"));
+                fs::write(&path, b"test-only native pin").unwrap();
+                json!({"role":role,"file":{"path":path,"sha256":hash_file(&path).unwrap()}})
+            })
+            .collect();
+        let config_path = root.join("qualified.json");
+        fs::write(
+            &config_path,
+            serde_json::to_vec(&json!({
+                "schema_version":2,"profile":"qualified-core-v2","startup":{
+                    "installation_root":root,
+                    "executable":{"path":executable,"sha256":"0".repeat(64)},
+                    "provider":{"path":provider,"sha256":hash_file(&provider).unwrap()},
+                    "gnuplot":{"path":gnuplot,"sha256":hash_file(&gnuplot).unwrap()},
+                    "ghostscript":{"path":ghostscript,"sha256":hash_file(&ghostscript).unwrap()},
+                    "runtime_directories":[root],"adapters":adapters,
+                    "octave_version":"11.3.0","octave_api_version":"api-v61"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let config = QualifiedStartupConfig::load(&config_path).unwrap();
+        let support = root.join("support");
+        fs::create_dir(&support).unwrap();
+        fs::write(
+            support.join("mathlab_conformance_write.m"),
+            b"test-only support",
+        )
+        .unwrap();
+        fs::write(root.join("probe.m"), b"result=struct();").unwrap();
+        fs::write(
+            root.join("oracle.json"),
+            serde_json::to_vec(&record()).unwrap(),
+        )
+        .unwrap();
+        let manifest = root.join("manifest.json");
+        fs::write(
+            &manifest,
+            serde_json::to_vec(&json!({
+                "schema_version":1,"profile":{"octave_version":"11.3.0","matlab_release":"test-only"},
+                "support":"support","cases":[{"id":"probe","fixture":"probe.m","oracle":"oracle.json",
+                    "expected_outcome":"success","float_absolute_tolerance":0,"float_relative_tolerance":0}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let error = run(Options {
+            manifest: &manifest,
+            octave: Some(&executable),
+            startup_config: Some(&config),
+            matlab: None,
+            reference: None,
+            output: None,
+            directory: &root,
+            as_json: false,
+            strict: false,
+            timeout: Duration::from_secs(1),
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("caller-supplied SHA-256 pin"));
+        assert!(
+            !marker.exists(),
+            "raw Octave ran before qualified admission"
+        );
     }
 
     #[cfg(unix)]
@@ -696,6 +850,21 @@ impl Drop for OwnedProcess {
     }
 }
 
+#[derive(Debug)]
+struct RuntimeLaunchError(std::io::Error);
+
+impl std::fmt::Display for RuntimeLaunchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Runtime launch failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for RuntimeLaunchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
 fn process(command: &mut Command, timeout: Duration) -> Result<Value> {
     let deadline = Instant::now()
         .checked_add(timeout)
@@ -710,7 +879,8 @@ fn process(command: &mut Command, timeout: Duration) -> Result<Value> {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()?,
+            .spawn()
+            .map_err(RuntimeLaunchError)?,
         true,
     );
     let (out, ot) = drain(child.0.stdout.take().unwrap());
@@ -751,6 +921,38 @@ fn process(command: &mut Command, timeout: Duration) -> Result<Value> {
         "stdout_dropped_bytes":out.dropped,"stderr_dropped_bytes":err.dropped,"stdout_read_error":out.error,"stderr_read_error":err.error,"capture_incomplete":incomplete,
         "cleanup_policy":if cfg!(unix){"owned_process_group"}else{"immediate_child_only"}}),
     )
+}
+
+fn bounded_diagnostic(text: &str, limit: usize) -> (&str, usize) {
+    let end = (0..=text.len().min(limit))
+        .rev()
+        .find(|&end| text.is_char_boundary(end))
+        .unwrap();
+    (&text[..end], text.len() - end)
+}
+
+fn execution_diagnostics(result: &mathlab_engine::ExecutionResult) -> Value {
+    let (output, dropped) = bounded_diagnostic(&result.output, MAX_LOG);
+    let mut error = json!(result.error);
+    let error_truncated = error.to_string().len() > MAX_LOG;
+    if error_truncated {
+        if let Some(original) = &result.error {
+            // Preserve normal structured errors; oversized diagnostics retain
+            // their identifier/message with explicit stack omission and caps.
+            error = json!({
+                "identifier":bounded_diagnostic(&original.identifier, MAX_LOG / 2).0,
+                "message":bounded_diagnostic(&original.message, MAX_LOG / 2).0,
+                "stack":[],"stack_frames_omitted":original.stack.len()
+            });
+        }
+    }
+    let mut diagnostic = json!({"output":output,"diagnostic_dropped_bytes":dropped,
+        "output_truncated":result.output_truncated || dropped > 0,
+        "error":error});
+    if error_truncated {
+        diagnostic["error_diagnostic_truncated"] = json!(true);
+    }
+    diagnostic
 }
 
 struct Fixture<'a> {
@@ -844,16 +1046,16 @@ fn native_route(
 
 fn engine_route(
     executable: &Path,
+    startup_config: Option<&QualifiedStartupConfig>,
     fixture: &Fixture<'_>,
     directory: &Path,
     timeout: Duration,
     mat_input: Option<&Path>,
 ) -> Result<Value> {
-    let mut engine = match Engine::start(EngineConfig {
-        executable: executable.into(),
-        working_directory: directory.into(),
-    }) {
-        Err(mathlab_engine::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+    let mut engine = match super::start_engine(executable, directory.into(), startup_config) {
+        Err(mathlab_engine::Error::Io(e))
+            if startup_config.is_none() && e.kind() == std::io::ErrorKind::NotFound =>
+        {
             return Ok(unavailable("unavailable", e))
         }
         other => other?,
@@ -875,38 +1077,52 @@ fn engine_route(
         result.error
     );
     let result = engine.run_file_with_timeout(&fixture.path, timeout)?;
-    let payload = directory.join("export.json");
-    let output = directory.join("record.json");
-    fs::write(
-        &payload,
-        serde_json::to_vec(
-            &json!({"identifier":result.error.as_ref().map_or("",|e|&e.identifier),"message":result.error.as_ref().map_or("",|e|&e.message)}),
-        )?,
-    )?;
-    let code=format!("mlcf_export=jsondecode(fileread({}));mathlab_conformance_write({},{},result,mlcf_export.identifier,mlcf_export.message);",path_literal(&payload)?,path_literal(&output)?,literal(&fixture.case.id)?);
-    let export = engine.execute_with_timeout(&code, timeout)?;
-    ensure!(
-        export.error.is_none(),
-        "Engine record export failed: {:?}",
-        export.error
-    );
-    let record: Value = serde_json::from_slice(&read_bounded(&output)?)?;
     let pinned = engine.version() == fixture.profile.octave_version;
-    let status = if pinned {
-        record_status(&record, fixture.case, false)?
-    } else {
-        "unsupported".into()
-    };
-    let output_end = (0..=result.output.len().min(MAX_LOG))
-        .rev()
-        .find(|&end| result.output.is_char_boundary(end))
-        .unwrap();
-    let output_dropped = result.output.len() - output_end;
-    Ok(
-        json!({"status":status,"mode":"fresh","runtime":{"name":"MathLab/GNU Octave","version":engine.version(),"executable":executable,
-        "scope_adapter":engine.scope_bridge_path(),"input_adapter":engine.input_bridge_path(),"scope_adapter_file":scope_adapter_file,"input_adapter_file":input_adapter_file},"record":record,"fixture_sha256":fixture.sha,"profile_matches":pinned,
-        "execution":{"output":&result.output[..output_end],"diagnostic_dropped_bytes":output_dropped,"output_truncated":result.output_truncated || output_dropped > 0,"error":result.error}}),
-    )
+    let mut report = json!({"status":"error","mode":"fresh","runtime":{"name":"MathLab/GNU Octave","version":engine.version(),"executable":executable,
+        "scope_adapter":engine.scope_bridge_path(),"input_adapter":engine.input_bridge_path(),"scope_adapter_file":scope_adapter_file,"input_adapter_file":input_adapter_file},"record":null,"fixture_sha256":fixture.sha,"profile_matches":pinned,
+        "execution":execution_diagnostics(&result)});
+    let mut export_execution = None;
+    let completed = (|| -> Result<(Value, String)> {
+        let payload = directory.join("export.json");
+        let output = directory.join("record.json");
+        fs::write(
+            &payload,
+            serde_json::to_vec(
+                &json!({"identifier":result.error.as_ref().map_or("",|e|&e.identifier),"message":result.error.as_ref().map_or("",|e|&e.message)}),
+            )?,
+        )?;
+        let code=format!("mlcf_export=jsondecode(fileread({}));mathlab_conformance_write({},{},result,mlcf_export.identifier,mlcf_export.message);",path_literal(&payload)?,path_literal(&output)?,literal(&fixture.case.id)?);
+        let export = engine.execute_with_timeout(&code, timeout)?;
+        export_execution = Some(execution_diagnostics(&export));
+        ensure!(
+            export.error.is_none(),
+            "Engine record export failed: {:?}",
+            export.error
+        );
+        let record: Value = serde_json::from_slice(&read_bounded(&output)?)?;
+        let status = if pinned {
+            record_status(&record, fixture.case, false)?
+        } else {
+            "unsupported".into()
+        };
+        Ok((record, status))
+    })();
+    match completed {
+        Ok((record, status)) => {
+            report["record"] = record;
+            report["status"] = json!(status);
+        }
+        Err(error) => {
+            if let Some(export) = export_execution {
+                report["export_execution"] = export;
+            }
+            let detail = error.to_string();
+            let (detail, dropped) = bounded_diagnostic(&detail, MAX_LOG);
+            report["detail"] = json!(detail);
+            report["detail_dropped_bytes"] = json!(dropped);
+        }
+    }
+    Ok(report)
 }
 
 fn saved_reference(
@@ -1024,8 +1240,8 @@ fn validate_reference_cases(report: &Value, manifest: &Manifest) -> Result<()> {
 
 fn route_error(error: anyhow::Error) -> Value {
     let status = if error
-        .downcast_ref::<std::io::Error>()
-        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+        .downcast_ref::<RuntimeLaunchError>()
+        .is_some_and(|launch| launch.0.kind() == std::io::ErrorKind::NotFound)
     {
         "unavailable"
     } else {
@@ -1146,6 +1362,17 @@ pub(crate) fn run(options: Options<'_>) -> Result<()> {
         fs::write(&path, &bytes)?;
         staged.push((path, hash(&bytes), oracle, hash(&oracle_bytes)));
     }
+    if let Some(config) = options.startup_config {
+        // The raw Octave comparison intentionally bypasses Engine. Admit the
+        // explicit selection first so that route cannot execute rejected pins.
+        let admission = stage.path().join("qualified-admission");
+        fs::create_dir(&admission)?;
+        drop(
+            config
+                .start(admission)
+                .context("Qualified startup admission before conformance comparisons")?,
+        );
+    }
     for (case, (fixture_path, fixture_sha, oracle, oracle_sha)) in
         manifest.cases.iter().zip(&staged)
     {
@@ -1226,7 +1453,14 @@ pub(crate) fn run(options: Options<'_>) -> Result<()> {
                 || Ok(unavailable("unavailable", "GNU Octave was not found")),
                 |exe| {
                     if is_engine {
-                        engine_route(exe, &fixture, &directory, options.timeout, mat_input)
+                        engine_route(
+                            exe,
+                            options.startup_config,
+                            &fixture,
+                            &directory,
+                            options.timeout,
+                            mat_input,
+                        )
                     } else {
                         native_route(exe, false, &fixture, &directory, options.timeout, mat_input)
                     }

@@ -6,6 +6,7 @@ license = "GPL-3.0-or-later"
 description = "Persistent GNU Octave execution engine for Open MathLab"
 
 [dependencies]
+sha2 = "=0.10.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 tempfile = "3"

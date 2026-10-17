@@ -3,6 +3,9 @@
 // Numerical execution, scopes, breakpoints and stepping remain owned by Octave.
 #include <octave/oct.h>
 #include <octave/defun-dld.h>
+#if defined(MATHLAB_QUALIFIED_CORE_V2) && MATHLAB_QUALIFIED_CORE_V2 == 1
+#include "mathlab_adapter_binding_v2.h"
+#endif
 #include <octave/interpreter.h>
 #include <octave/event-manager.h>
 #include <octave/pt-eval.h>
@@ -38,6 +41,14 @@
 namespace fs = std::filesystem;
 
 namespace {
+#if defined(MATHLAB_QUALIFIED_CORE_V2) && MATHLAB_QUALIFIED_CORE_V2 == 1
+mathlab_adapter_binding_v2::binding& intrinsic_binding() {
+  // Process-lifetime transport configuration only. Retention/teardown is unproved.
+  static auto *value = new mathlab_adapter_binding_v2::binding;
+  return *value;
+}
+
+#endif
 struct evaluation_interrupt_context {
   octave::tree_evaluator& evaluator;
   bool& quit_requested;
@@ -210,12 +221,25 @@ public:
   }
 
   void configure_registry(const std::string& file) {
+#if defined(MATHLAB_QUALIFIED_CORE_V2) && MATHLAB_QUALIFIED_CORE_V2 == 1
+    const auto canonical = mathlab_adapter_binding_v2::active(intrinsic_binding(), interp)
+      ? mathlab_adapter_binding_v2::registry_path(octave_value(file)).string()
+      : canonical_file(file);
+#else
     const auto canonical = canonical_file(file);
+#endif
     if (fs::path(canonical).filename() != std::string(registry_name) + ".m")
       error_with_id("MathLab:DebuggerRegistry", "Expected the engine's script registry source file");
     if (!registry_file.empty() && registry_file != canonical)
       error_with_id("MathLab:DebuggerRegistry", "Restart MathLab to change the script debugger registry");
+#if defined(MATHLAB_QUALIFIED_CORE_V2) && MATHLAB_QUALIFIED_CORE_V2 == 1
+    if (mathlab_adapter_binding_v2::active(intrinsic_binding(), interp))
+      mathlab_adapter_binding_v2::registry_function(intrinsic_binding(), interp, octave_value(canonical));
+    else
+      mathlab_source_context::retain_registry(interp, octave_value(canonical));
+#else
     mathlab_source_context::retain_registry(interp, octave_value(canonical));
+#endif
     registry_file = canonical;
   }
 
@@ -303,6 +327,13 @@ private:
   }
 
   octave_value registry_host() {
+#if defined(MATHLAB_QUALIFIED_CORE_V2) && MATHLAB_QUALIFIED_CORE_V2 == 1
+    if (mathlab_adapter_binding_v2::active(intrinsic_binding(), interp)) {
+      if (registry_file.empty())
+        error_with_id("MathLab:DebuggerRegistry", "Qualified script debugger registry is not configured");
+      return mathlab_adapter_binding_v2::registry_function(intrinsic_binding(), interp, octave_value(registry_file));
+    }
+#endif
     auto host = interp.get_symbol_table().find_cmdline_function(registry_name);
     if (host.is_undefined() && !registry_file.empty()) {
       mathlab_source_context::retain_registry(interp, octave_value(registry_file));
@@ -406,7 +437,11 @@ private:
     // Appending preserves the user's existing global search precedence.
     const auto capsule = fs::path(target.scope_file).parent_path().string();
     if (!interp.get_load_path().contains_canonical(capsule))
+#if defined(MATHLAB_QUALIFIED_CORE_V2) && MATHLAB_QUALIFIED_CORE_V2 == 1
+      mathlab_adapter_binding_v2::call_primitive(intrinsic_binding(), interp, "addpath", ovl(capsule, "-end"), 0);
+#else
       interp.feval("addpath", ovl(capsule, "-end"), 0);
+#endif
     octave_value function;
     if (!registry_file.empty()) {
       const auto host = registry_host(); // Never resolve a paused user's local helper name.
@@ -444,7 +479,11 @@ private:
     return selected;
   }
   void write_json(const fs::path& destination, const octave_value& value) {
+#if defined(MATHLAB_QUALIFIED_CORE_V2) && MATHLAB_QUALIFIED_CORE_V2 == 1
+    auto encoded = mathlab_adapter_binding_v2::call_primitive(intrinsic_binding(), interp, "jsonencode", ovl(value), 1);
+#else
     auto encoded = interp.feval("jsonencode", ovl(value), 1);
+#endif
     const auto temporary = destination.string() + ".pending";
     {
       std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
@@ -470,7 +509,11 @@ private:
     double id = 0;
     octave_scalar_map response;
     try {
+#if defined(MATHLAB_QUALIFIED_CORE_V2) && MATHLAB_QUALIFIED_CORE_V2 == 1
+      auto decoded = mathlab_adapter_binding_v2::call_primitive(intrinsic_binding(), interp, "jsondecode", ovl(raw), 1);
+#else
       auto decoded = interp.feval("jsondecode", ovl(raw), 1);
+#endif
       auto request = decoded(0).scalar_map_value();
       id = request.getfield("id").double_value();
       const std::string action = request.getfield("command").string_value();
@@ -487,13 +530,25 @@ private:
         interp.get_evaluator().dbcont();
         publish(false, "", 0);
       } else if (action == "step") {
+#if defined(MATHLAB_QUALIFIED_CORE_V2) && MATHLAB_QUALIFIED_CORE_V2 == 1
+        mathlab_adapter_binding_v2::call_primitive(intrinsic_binding(), interp, "dbstep", octave_value_list(), 0);
+#else
         interp.feval("dbstep", octave_value_list(), 0);
+#endif
         publish(false, "", 0);
       } else if (action == "step_in") {
+#if defined(MATHLAB_QUALIFIED_CORE_V2) && MATHLAB_QUALIFIED_CORE_V2 == 1
+        mathlab_adapter_binding_v2::call_primitive(intrinsic_binding(), interp, "dbstep", ovl("in"), 0);
+#else
         interp.feval("dbstep", ovl("in"), 0);
+#endif
         publish(false, "", 0);
       } else if (action == "step_out") {
+#if defined(MATHLAB_QUALIFIED_CORE_V2) && MATHLAB_QUALIFIED_CORE_V2 == 1
+        mathlab_adapter_binding_v2::call_primitive(intrinsic_binding(), interp, "dbstep", ovl("out"), 0);
+#else
         interp.feval("dbstep", ovl("out"), 0);
+#endif
         publish(false, "", 0);
       } else if (action == "quit") {
         if (input_adapter.is_defined())
@@ -504,7 +559,11 @@ private:
         interp.get_evaluator().dbquit(true);
         publish(false, "", 0);
       } else if (action == "workspace") {
+#if defined(MATHLAB_QUALIFIED_CORE_V2) && MATHLAB_QUALIFIED_CORE_V2 == 1
+        auto values = mathlab_adapter_binding_v2::call_primitive(intrinsic_binding(), interp, "whos", octave_value_list(), 1);
+#else
         auto values = interp.feval("whos", octave_value_list(), 1);
+#endif
         result = values(0);
       } else if (action == "stack") {
         const auto frames = interp.get_evaluator().backtrace_frames();
@@ -640,7 +699,11 @@ private:
         if (!parent.filename().string().empty() && parent.filename().string()[0] == '@')
           parent = parent.parent_path();
         if (!interp.get_load_path().contains_canonical(parent.string()))
+#if defined(MATHLAB_QUALIFIED_CORE_V2) && MATHLAB_QUALIFIED_CORE_V2 == 1
+          mathlab_adapter_binding_v2::call_primitive(intrinsic_binding(), interp, "addpath", ovl(parent.string(), "-end"), 0);
+#else
           interp.feval("addpath", ovl(parent.string(), "-end"), 0);
+#endif
         const int actual = interp.get_evaluator().get_bp_table().add_breakpoint_in_file(file, line);
         if (actual <= 0)
           error_with_id("MathLab:BreakpointUnavailable", "No breakpoint was installed: the file is shadowed, unsupported, or has no executable line at this location");
@@ -699,8 +762,22 @@ private:
 std::shared_ptr<debug_events> current_events;
 }
 
+#if defined(MATHLAB_QUALIFIED_CORE_V2) && MATHLAB_QUALIFIED_CORE_V2 == 1
+DEFMETHOD_DLD(mathlab_debug_bridge, interp, args, nargout,
+             "Install the Open MathLab debugger event bridge in a private session directory.") {
+#else
 DEFMETHOD_DLD(mathlab_debug_bridge, interp, args, ,
              "Install the Open MathLab debugger event bridge in a private session directory.") {
+#endif
+#if defined(MATHLAB_QUALIFIED_CORE_V2) && MATHLAB_QUALIFIED_CORE_V2 == 1
+  if (mathlab_adapter_binding_v2::is_bind_operation(args)) {
+    mathlab_adapter_binding_v2::bind(intrinsic_binding(), interp, args, nargout,
+      "debug", "mathlab_debug_bridge",
+      {"addpath", "jsonencode", "jsondecode", "dbstep", "whos", "source", "evalin", "mlock"});
+    return octave_value_list();
+  }
+  mathlab_adapter_binding_v2::active(intrinsic_binding(), interp);
+#endif
   if (args.length() == 2 || args.length() == 4 || args.length() == 5) {
     const auto operation = args(0).string_value();
     if (operation != "source" && args.length() != 2) print_usage();
@@ -749,13 +826,21 @@ DEFMETHOD_DLD(mathlab_debug_bridge, interp, args, ,
         else if (current_events->has_prepared_source(file))
           current_events->source_prepared(file);
         else
+#if defined(MATHLAB_QUALIFIED_CORE_V2) && MATHLAB_QUALIFIED_CORE_V2 == 1
+          mathlab_adapter_binding_v2::call_primitive(intrinsic_binding(), interp, "source", ovl(args(1), "base"), 0);
+#else
           interp.feval("source", ovl(args(1), "base"), 0);
+#endif
       }
       else {
         if (current_events->has_prepared_breakpoints())
           current_events->evaluate_base(args(1).string_value());
         else
+#if defined(MATHLAB_QUALIFIED_CORE_V2) && MATHLAB_QUALIFIED_CORE_V2 == 1
+          mathlab_adapter_binding_v2::call_primitive(intrinsic_binding(), interp, "evalin", ovl("base", args(1)), 0);
+#else
           interp.feval("evalin", ovl("base", args(1)), 0);
+#endif
       }
       return ovl(true);
     } catch (const octave::execution_exception&) {
@@ -786,8 +871,18 @@ DEFMETHOD_DLD(mathlab_debug_bridge, interp, args, ,
   if (args.length() != 1) print_usage();
   const std::string directory = args(0).string_value();
   if (directory.empty()) error_with_id("MathLab:DebugDirectory", "A debugger session directory is required");
+#if defined(MATHLAB_QUALIFIED_CORE_V2) && MATHLAB_QUALIFIED_CORE_V2 == 1
+  mathlab_adapter_binding_v2::call_primitive(intrinsic_binding(), interp, "mlock", octave_value_list(), 0);
+  if (mathlab_adapter_binding_v2::active(intrinsic_binding(), interp)) {
+    if (!intrinsic_binding().shutdown_proxy_registered)
+      error_with_id("MathLab:AdapterBindingUnavailable", "Qualified debugger requires its verified provider shutdown proxy");
+  } else {
+    interp.add_atexit_fcn("mathlab_debug_bridge");
+  }
+#else
   interp.feval("mlock", octave_value_list(), 0);
   interp.add_atexit_fcn("mathlab_debug_bridge");
+#endif
   interp.get_evaluator().server_mode(true);
   current_events = std::make_shared<debug_events>(interp, directory);
   interp.get_event_manager().connect_link(current_events);

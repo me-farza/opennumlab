@@ -3,17 +3,20 @@ use crate::range_transactions::{
     TransactionRefresh,
 };
 use crate::variable_editor::VariablePage;
+use mathlab_engine::startup_config::QualifiedStartupConfig;
 use mathlab_engine::{
-    discover_octave, BindingToken, CancellationHandle, DecimalU64, Engine, EngineConfig,
-    ExecutionResult, MutationReceipt, Package, PageWindow, ValuePageRequest, ValuePath,
+    BindingToken, CancellationHandle, DecimalU64, Engine, EngineConfig, ExecutionResult,
+    MutationReceipt, Package, PageWindow, ValuePageRequest, ValuePath, discover_octave,
 };
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, channel};
 
 pub enum Request {
     RangeTransaction(Box<TransactionEnvelope>),
     Start {
         executable: Option<PathBuf>,
+        startup_config: Option<PathBuf>,
+        packaged_startup: bool,
         directory: PathBuf,
     },
     Execute(String),
@@ -61,6 +64,8 @@ pub enum Event {
     },
     Ready {
         executable: PathBuf,
+        qualified_profile: Option<String>,
+        debugger: Option<mathlab_debugger::Debugger>,
         cancel: CancellationHandle,
         internal_worker: PathBuf,
         input: Option<mathlab_engine::InputHandle>,
@@ -68,6 +73,7 @@ pub enum Event {
     Executed(ExecutionResult),
     Directory(PathBuf),
     Restarted {
+        qualified_profile: Option<String>,
         debugger: Option<mathlab_debugger::Debugger>,
         internal_worker: PathBuf,
         input: Option<mathlab_engine::InputHandle>,
@@ -101,12 +107,28 @@ pub enum Event {
 }
 
 pub fn spawn(ctx: eframe::egui::Context) -> (Sender<Request>, Receiver<Event>) {
+    spawn_with_executable(
+        ctx,
+        std::env::current_exe().map_err(|error| error.to_string()),
+    )
+}
+
+fn spawn_with_executable(
+    ctx: eframe::egui::Context,
+    running_executable: Result<PathBuf, String>,
+) -> (Sender<Request>, Receiver<Event>) {
+    // Freeze the physical process anchor once; retries must not retarget an
+    // executable alias that has changed after this worker was created.
+    let running_executable =
+        running_executable.and_then(|path| path.canonicalize().map_err(|error| error.to_string()));
     let (requests_tx, requests_rx) = channel();
     let (events_tx, events_rx) = channel();
     std::thread::Builder::new()
         .name("mathlab-engine".into())
         .spawn(move || {
             let mut engine: Option<Engine> = None;
+            let mut qualified_selection = false;
+            let mut selected_config: Option<QualifiedStartupConfig> = None;
             while let Ok(request) = requests_rx.recv() {
                 let event = match request {
                     Request::RangeTransaction(envelope) => {
@@ -120,29 +142,28 @@ pub fn spawn(ctx: eframe::egui::Context) -> (Sender<Request>, Receiver<Event>) {
                         };
                         Event::RangeTransactionFinished { envelope, outcome: Box::new(outcome) }
                     }
-                    Request::Start { executable, directory } => {
+                    Request::Start { executable, startup_config, packaged_startup, directory } => {
                         engine = None;
-                        match executable.or_else(discover_octave) {
-                            Some(executable) => {
-                                match Engine::start(EngineConfig {
-                                    executable: executable.clone(),
-                                    working_directory: directory,
-                                }) {
-                                    Ok(started) => {
-                                        let cancel = started.cancellation_handle();
-                                        let internal_worker = started.worker_source_path();
-                                        let _ = events_tx.send(Event::ConsoleConnected {
-                                            subscription: started.subscribe_console(),
-                                            generation: started.console_generation(),
-                                        });
-                                        let input = started.input_handle();
-                                        engine = Some(started);
-                                        Event::Ready { executable, cancel, internal_worker, input }
-                                    }
-                                    Err(error) => Event::Unavailable(error.to_string()),
-                                }
+                        selected_config = None;
+                        qualified_selection = startup_config.is_some() || packaged_startup;
+                        match select_startup(executable, startup_config, packaged_startup, &running_executable, discover_octave)
+                            .and_then(|selection| start_engine(selection, directory))
+                        {
+                            Ok((started, executable, config)) => {
+                                let qualified_profile = accepted_profile(&started);
+                                let debugger = started.debugger_handle();
+                                let cancel = started.cancellation_handle();
+                                let internal_worker = started.worker_source_path();
+                                let _ = events_tx.send(Event::ConsoleConnected {
+                                    subscription: started.subscribe_console(),
+                                    generation: started.console_generation(),
+                                });
+                                let input = started.input_handle();
+                                selected_config = config;
+                                engine = Some(started);
+                                Event::Ready { executable, qualified_profile, debugger, cancel, internal_worker, input }
                             }
-                            None => Event::Unavailable("GNU Octave was not found. Install Octave, then choose its executable in Engine Settings.".into()),
+                            Err(error) => Event::Unavailable(error),
                         }
                     }
                     Request::Execute(code) => match engine.as_mut() {
@@ -191,11 +212,24 @@ pub fn spawn(ctx: eframe::egui::Context) -> (Sender<Request>, Receiver<Event>) {
                         None => Event::Directory(directory),
                     },
                     Request::Restart => match engine.as_mut() {
-                        Some(engine) => match engine.restart() {
-                            Ok(()) => Event::Restarted { debugger: engine.debugger_handle(), internal_worker: engine.worker_source_path(), input: engine.input_handle() },
+                        Some(engine) => match restart_engine(engine, selected_config.as_ref()) {
+                            Ok(()) => {
+                                let qualified_profile = accepted_profile(engine);
+                                if qualified_selection && qualified_profile.is_none() {
+                                    let _ = engine.cancellation_handle().terminate();
+                                    Event::Unavailable("Qualified restart did not retain accepted startup status.".into())
+                                } else {
+                                    Event::Restarted { qualified_profile, debugger: engine.debugger_handle(), internal_worker: engine.worker_source_path(), input: engine.input_handle() }
+                                }
+                            }
                             Err(error) => Event::Unavailable(error.to_string()),
                         },
+                        None if qualified_selection => Event::Unavailable("The qualified engine is unavailable. Retry the startup configuration in Engine Settings.".into()),
                         None => Event::Unavailable("Choose an Octave executable to start the engine.".into()),
+                    },
+                    Request::EnableDebugger(_) if qualified_selection => Event::DebuggerUnavailable {
+                        error: "The startup configuration owns the debugger adapter; runtime overrides are disabled.".into(),
+                        debugger: engine.as_ref().and_then(Engine::debugger_handle),
                     },
                     Request::EnableDebugger(path) => match engine.as_mut() {
                         Some(engine) => match engine.enable_debugger(&path) {
@@ -245,6 +279,117 @@ pub fn spawn(ctx: eframe::egui::Context) -> (Sender<Request>, Receiver<Event>) {
         })
         .expect("could not create engine worker thread");
     (requests_tx, events_rx)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StartupSelection {
+    Qualified(PathBuf),
+    Packaged(PathBuf),
+    Legacy(PathBuf),
+}
+
+fn select_startup(
+    executable: Option<PathBuf>,
+    startup_config: Option<PathBuf>,
+    packaged_startup: bool,
+    running_executable: &Result<PathBuf, String>,
+    discover: impl FnOnce() -> Option<PathBuf>,
+) -> Result<StartupSelection, String> {
+    if packaged_startup {
+        if startup_config.is_some() || executable.is_some() {
+            return Err(
+                "Packaged startup cannot be combined with a startup configuration or Octave executable override."
+                    .into(),
+            );
+        }
+        return installed_contents(running_executable).map(StartupSelection::Packaged);
+    }
+    if let Some(path) = startup_config {
+        if executable.is_some() {
+            return Err(
+                "A startup configuration cannot be combined with an Octave executable override."
+                    .into(),
+            );
+        }
+        return Ok(StartupSelection::Qualified(path));
+    }
+    executable.or_else(discover).map(StartupSelection::Legacy).ok_or_else(|| {
+        "GNU Octave was not found. Install Octave, then choose its executable in Engine Settings.".into()
+    })
+}
+
+// The captured physical executable is the sole bundle anchor. Revalidate its
+// spelling without retargeting it; cwd, environment and recovery cannot select it.
+fn installed_contents(running_executable: &Result<PathBuf, String>) -> Result<PathBuf, String> {
+    let executable = running_executable.as_ref().map_err(Clone::clone)?;
+    let resolved = executable
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    if resolved.as_os_str() != executable.as_os_str() {
+        return Err("The running executable's physical installed context changed.".into());
+    }
+    let macos = executable
+        .parent()
+        .ok_or("Installed executable has no MacOS directory")?;
+    let contents = macos
+        .parent()
+        .ok_or("Installed executable has no Contents directory")?;
+    if !executable.is_file()
+        || executable.file_name() != Some(std::ffi::OsStr::new("mathlab-desktop"))
+        || macos.file_name() != Some(std::ffi::OsStr::new("MacOS"))
+        || contents.file_name() != Some(std::ffi::OsStr::new("Contents"))
+    {
+        return Err(
+            "Packaged startup requires the running Contents/MacOS/mathlab-desktop executable."
+                .into(),
+        );
+    }
+    Ok(contents.to_owned())
+}
+
+fn start_engine(
+    selection: StartupSelection,
+    directory: PathBuf,
+) -> Result<(Engine, PathBuf, Option<QualifiedStartupConfig>), String> {
+    match selection {
+        selection @ (StartupSelection::Qualified(_) | StartupSelection::Packaged(_)) => {
+            let config = match selection {
+                StartupSelection::Qualified(path) => QualifiedStartupConfig::load(&path),
+                StartupSelection::Packaged(contents) => {
+                    QualifiedStartupConfig::load_installed(&contents)
+                }
+                StartupSelection::Legacy(_) => unreachable!(),
+            }
+            .map_err(|error| error.to_string())?;
+            let executable = config.executable().to_owned();
+            let engine = config.start(directory).map_err(|error| error.to_string())?;
+            Ok((engine, executable, Some(config)))
+        }
+        StartupSelection::Legacy(executable) => {
+            let engine = Engine::start(EngineConfig {
+                executable: executable.clone(),
+                working_directory: directory,
+            })
+            .map_err(|error| error.to_string())?;
+            Ok((engine, executable, None))
+        }
+    }
+}
+
+fn restart_engine(
+    engine: &mut Engine,
+    config: Option<&QualifiedStartupConfig>,
+) -> mathlab_engine::Result<()> {
+    match config {
+        Some(config) => config.restart(engine),
+        None => engine.restart(),
+    }
+}
+
+fn accepted_profile(engine: &Engine) -> Option<String> {
+    engine
+        .qualified_startup_status()
+        .map(|status| status.profile.to_owned())
 }
 
 /// Commit and refresh are separate outcomes: a successful receipt is never
@@ -459,6 +604,661 @@ mod tests {
     use super::*;
 
     #[test]
+    fn explicit_startup_selection_bypasses_discovery_and_rejects_overrides() {
+        let path = PathBuf::from("qualified.json");
+        assert_eq!(
+            select_startup(
+                None,
+                Some(path.clone()),
+                false,
+                &Err("unused".into()),
+                || panic!("qualified selection must not discover")
+            ),
+            Ok(StartupSelection::Qualified(path.clone())),
+        );
+        assert!(
+            select_startup(
+                Some("octave".into()),
+                Some(path),
+                false,
+                &Err("unused".into()),
+                || panic!("conflicting selection must not discover")
+            )
+            .is_err()
+        );
+        assert_eq!(
+            select_startup(
+                Some("selected-octave".into()),
+                None,
+                false,
+                &Err("unused".into()),
+                || panic!("explicit runtime must not discover")
+            ),
+            Ok(StartupSelection::Legacy("selected-octave".into())),
+        );
+        assert_eq!(
+            select_startup(None, None, false, &Err("unused".into()), || Some(
+                "discovered-octave".into()
+            )),
+            Ok(StartupSelection::Legacy("discovered-octave".into())),
+        );
+    }
+
+    #[test]
+    fn unavailable_explicit_config_fails_before_any_legacy_start() {
+        let directory = tempfile::tempdir().unwrap();
+        let selection = select_startup(
+            None,
+            Some(directory.path().join("missing.json")),
+            false,
+            &Err("unused".into()),
+            || panic!("invalid qualified configuration must not discover a fallback"),
+        )
+        .unwrap();
+        assert!(start_engine(selection, directory.path().to_owned()).is_err());
+    }
+
+    fn installed_test_executable(base: &std::path::Path) -> PathBuf {
+        let executable = base.join("Moved λ space.app/Contents/MacOS/mathlab-desktop");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::write(&executable, b"test context anchor; never executed").unwrap();
+        executable.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn packaged_selection_uses_only_physical_executable_context_and_rejects_conflicts() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = installed_test_executable(directory.path());
+        let running = Ok(executable.clone());
+        let selected = select_startup(None, None, true, &running, || {
+            panic!("no packaged discovery")
+        })
+        .unwrap();
+        assert_eq!(
+            selected,
+            StartupSelection::Packaged(executable.parent().unwrap().parent().unwrap().to_owned())
+        );
+        for (runtime, config) in [
+            (Some("override".into()), None),
+            (None, Some("seed.json".into())),
+        ] {
+            assert!(
+                select_startup(runtime, config, true, &running, || panic!(
+                    "no conflict discovery"
+                ))
+                .is_err()
+            );
+        }
+        let wrong_layout = directory.path().join("mathlab-desktop");
+        std::fs::write(&wrong_layout, b"wrong installed layout").unwrap();
+        for context in [
+            Err("unavailable current executable".into()),
+            Ok(directory.path().join("missing")),
+            Ok(wrong_layout.canonicalize().unwrap()),
+        ] {
+            assert!(
+                select_startup(None, None, true, &context, || panic!("no context fallback"))
+                    .is_err()
+            );
+        }
+        #[cfg(unix)]
+        {
+            let alias = directory.path().join("desktop-alias");
+            std::os::unix::fs::symlink(&executable, &alias).unwrap();
+            assert_eq!(
+                installed_contents(&Ok(alias.canonicalize().unwrap())).unwrap(),
+                executable.parent().unwrap().parent().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn missing_packaged_configuration_keeps_worker_qualified_on_retry_and_restart() {
+        use std::time::Duration;
+        let directory = tempfile::tempdir().unwrap();
+        let executable = installed_test_executable(directory.path());
+        let (requests, events) =
+            spawn_with_executable(eframe::egui::Context::default(), Ok(executable));
+        for _ in 0..2 {
+            requests
+                .send(Request::Start {
+                    executable: None,
+                    startup_config: None,
+                    packaged_startup: true,
+                    directory: directory.path().into(),
+                })
+                .unwrap();
+            assert!(matches!(
+                events.recv_timeout(Duration::from_secs(3)).unwrap(),
+                Event::Unavailable(_)
+            ));
+            requests.send(Request::Restart).unwrap();
+            match events.recv_timeout(Duration::from_secs(3)).unwrap() {
+                Event::Unavailable(error) => assert!(error.contains("qualified engine")),
+                _ => panic!("missing packaged startup must remain qualified"),
+            }
+            requests
+                .send(Request::EnableDebugger("override.oct".into()))
+                .unwrap();
+            assert!(matches!(
+                events.recv_timeout(Duration::from_secs(3)).unwrap(),
+                Event::DebuggerUnavailable { debugger: None, .. }
+            ));
+        }
+    }
+
+    // These ignored tests exercise the actual worker and admitted external
+    // runtime, with a deliberately injected test executable context. They do
+    // not prove the production current_exe route or a normal/relocated UI launch.
+    struct PackagedRuntimeFixture {
+        _directory: tempfile::TempDir,
+        executable: PathBuf,
+        contents: PathBuf,
+        old_native: PathBuf,
+    }
+
+    impl PackagedRuntimeFixture {
+        fn new() -> Self {
+            Self::from_seed("MATHLAB_QUALIFIED_STARTUP_CONFIG")
+        }
+
+        fn from_seed(variable: &str) -> Self {
+            let seed = std::env::var_os(variable)
+                .unwrap_or_else(|| panic!("required packaged worker test needs {variable}"));
+            let config = QualifiedStartupConfig::load(std::path::Path::new(&seed)).unwrap();
+            let mut document: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(seed).unwrap()).unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let executable = installed_test_executable(directory.path());
+            let contents = executable.parent().unwrap().parent().unwrap().to_owned();
+            let native = contents.join("Resources/native");
+            let old_native = directory
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join("Original.app/Contents/Resources/native");
+            std::fs::create_dir_all(&native).unwrap();
+            std::fs::create_dir_all(&old_native).unwrap();
+            for (basename, module) in config.native_modules() {
+                std::fs::copy(&module.path, native.join(&basename)).unwrap();
+                std::fs::copy(&module.path, old_native.join(basename)).unwrap();
+            }
+            document["startup"]["provider"]["path"] =
+                serde_json::json!(old_native.join("mathlab_intrinsic_bridge.oct"));
+            for adapter in document["startup"]["adapters"].as_array_mut().unwrap() {
+                let basename = std::path::Path::new(adapter["file"]["path"].as_str().unwrap())
+                    .file_name()
+                    .unwrap()
+                    .to_owned();
+                adapter["file"]["path"] = serde_json::json!(old_native.join(basename));
+            }
+            std::fs::write(
+                contents.join("Resources/qualified-core-v2.json"),
+                serde_json::to_vec(&document).unwrap(),
+            )
+            .unwrap();
+            Self {
+                _directory: directory,
+                executable,
+                contents,
+                old_native,
+            }
+        }
+
+        fn start(&self, requests: &Sender<Request>) {
+            requests
+                .send(Request::Start {
+                    executable: None,
+                    startup_config: None,
+                    packaged_startup: true,
+                    directory: self._directory.path().into(),
+                })
+                .unwrap();
+        }
+    }
+
+    fn next_startup_event(events: &Receiver<Event>) -> Event {
+        loop {
+            match events
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap()
+            {
+                Event::ConsoleConnected { .. } => {}
+                event => return event,
+            }
+        }
+    }
+
+    struct PackagedChildGuard(CancellationHandle);
+
+    impl Drop for PackagedChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.terminate();
+        }
+    }
+
+    fn require_packaged_ready(events: &Receiver<Event>) -> PackagedChildGuard {
+        match next_startup_event(events) {
+            Event::Ready {
+                qualified_profile,
+                debugger,
+                input,
+                cancel,
+                ..
+            } => {
+                let guard = PackagedChildGuard(cancel);
+                assert_eq!(qualified_profile.as_deref(), Some("qualified-core-v2"));
+                assert!(debugger.is_some());
+                assert!(input.is_some());
+                guard
+            }
+            Event::Unavailable(error) => panic!("packaged startup failed: {error}"),
+            _ => panic!("expected accepted packaged Ready"),
+        }
+    }
+
+    #[test]
+    #[ignore = "UNRUN: requires admitted native runtime; injected executable context is not UI proof"]
+    fn packaged_worker_accepts_current_modules_with_original_present_then_absent_and_restarts() {
+        let fixture = PackagedRuntimeFixture::new();
+        let (requests, events) = spawn_with_executable(
+            eframe::egui::Context::default(),
+            Ok(fixture.executable.clone()),
+        );
+        fixture.start(&requests);
+        let first = require_packaged_ready(&events);
+        std::fs::remove_dir_all(&fixture.old_native).unwrap();
+        requests.send(Request::Restart).unwrap();
+        match next_startup_event(&events) {
+            Event::Restarted {
+                qualified_profile,
+                debugger,
+                input,
+                ..
+            } => {
+                assert_eq!(qualified_profile.as_deref(), Some("qualified-core-v2"));
+                assert!(debugger.is_some());
+                assert!(input.is_some());
+            }
+            _ => panic!("packaged restart must retain current native modules"),
+        }
+        first.0.terminate().unwrap();
+        fixture.start(&requests);
+        let current = require_packaged_ready(&events);
+        current.0.terminate().unwrap();
+    }
+
+    #[test]
+    #[ignore = "UNRUN: requires admitted native runtime; injected executable context is not UI proof"]
+    fn packaged_worker_current_tamper_fails_with_valid_original_and_retry_recovers_in_place() {
+        let fixture = PackagedRuntimeFixture::new();
+        let selected = fixture
+            .contents
+            .join("Resources/native/mathlab_intrinsic_bridge.oct");
+        let good = std::fs::read(&selected).unwrap();
+        std::fs::write(&selected, b"tampered installed provider").unwrap();
+        let (requests, events) = spawn_with_executable(
+            eframe::egui::Context::default(),
+            Ok(fixture.executable.clone()),
+        );
+        fixture.start(&requests);
+        match next_startup_event(&events) {
+            Event::Unavailable(error) => assert!(error.contains("SHA-256"), "{error}"),
+            Event::Ready { cancel, .. } => {
+                let _ = cancel.terminate();
+                panic!("valid old bundle must not hide current tamper");
+            }
+            _ => panic!("expected packaged admission failure"),
+        }
+        requests.send(Request::Restart).unwrap();
+        assert!(matches!(next_startup_event(&events), Event::Unavailable(_)));
+        requests
+            .send(Request::EnableDebugger("override.oct".into()))
+            .unwrap();
+        assert!(matches!(
+            next_startup_event(&events),
+            Event::DebuggerUnavailable { .. }
+        ));
+        std::fs::write(selected, good).unwrap();
+        fixture.start(&requests);
+        let current = require_packaged_ready(&events);
+        current.0.terminate().unwrap();
+    }
+
+    #[test]
+    #[ignore = "UNRUN: requires MATHLAB_QUALIFIED_GRAPHICS_STARTUP_CONFIG; injected context is not UI proof"]
+    fn packaged_graphics_selection_activates_registry_and_restores_it_on_frontend_restart() {
+        let fixture =
+            PackagedRuntimeFixture::from_seed("MATHLAB_QUALIFIED_GRAPHICS_STARTUP_CONFIG");
+        let (mut engine, _, selected) = start_engine(
+            StartupSelection::Packaged(fixture.contents.clone()),
+            fixture._directory.path().canonicalize().unwrap(),
+        )
+        .unwrap();
+        let config = selected.expect("packaged selection must retain its configuration");
+        assert_eq!(
+            config.profile(),
+            mathlab_engine::QUALIFIED_GRAPHICS_STARTUP_PROFILE
+        );
+        assert_eq!(
+            accepted_profile(&engine).as_deref(),
+            Some(mathlab_engine::QUALIFIED_GRAPHICS_STARTUP_PROFILE)
+        );
+        config.require_active(&engine).unwrap();
+        assert!(engine.graphics_snapshot().unwrap().nodes.is_empty());
+        let result = engine.execute("desktop_gf=figure('visible','off'); desktop_ga=axes('parent',desktop_gf); desktop_gl=line('parent',desktop_ga,'xdata',[1,2,3],'ydata',[10,20,30]);").unwrap();
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let old_scene = engine.graphics_snapshot().unwrap();
+        assert_eq!(old_scene.nodes.len(), 3);
+        let old = old_scene
+            .nodes
+            .iter()
+            .find(|node| {
+                matches!(
+                    node.properties,
+                    mathlab_engine::graphics::GraphicsProperties::Line { .. }
+                )
+            })
+            .unwrap()
+            .token
+            .clone();
+        let pid = engine.process_id();
+        std::fs::remove_dir_all(&fixture.old_native).unwrap();
+        restart_engine(&mut engine, Some(&config)).unwrap();
+        assert_ne!(engine.process_id(), pid);
+        config.require_active(&engine).unwrap();
+        assert!(engine.graphics_snapshot().unwrap().nodes.is_empty());
+        assert!(engine.graphics_query(&old, 1, 2).is_err());
+        // Replace the current file's inode, preserving any loaded native image.
+        // A configured restart must fail closed rather than lose graphics and
+        // announce the selected profile as an active frontend session.
+        let replacement = fixture.contents.join("Resources/native/replacement.oct");
+        std::fs::write(&replacement, b"tampered current graphics adapter").unwrap();
+        std::fs::rename(
+            replacement,
+            fixture
+                .contents
+                .join("Resources/native/mathlab_graphics_bridge.oct"),
+        )
+        .unwrap();
+        assert!(restart_engine(&mut engine, Some(&config)).is_err());
+        assert!(accepted_profile(&engine).is_none());
+        assert!(engine.graphics_snapshot().is_err());
+    }
+
+    #[test]
+    #[ignore = "requires MATHLAB_QUALIFIED_STARTUP_CONFIG with the admitted native runtime"]
+    fn qualified_worker_start_and_restart_retain_profile_and_native_adapters() {
+        use std::time::Duration;
+
+        let path = std::env::var_os("MATHLAB_QUALIFIED_STARTUP_CONFIG").expect(
+            "required qualified desktop integration needs MATHLAB_QUALIFIED_STARTUP_CONFIG",
+        );
+        let config = QualifiedStartupConfig::load(std::path::Path::new(&path)).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let (requests, events) = spawn(eframe::egui::Context::default());
+        requests
+            .send(Request::Start {
+                executable: None,
+                startup_config: Some(path.into()),
+                packaged_startup: false,
+                directory: directory.path().to_owned(),
+            })
+            .unwrap();
+        let next = || loop {
+            match events.recv_timeout(Duration::from_secs(30)).unwrap() {
+                Event::ConsoleConnected { .. } => {}
+                event => break event,
+            }
+        };
+        let cancel = match next() {
+            Event::Ready {
+                executable,
+                qualified_profile,
+                debugger,
+                input,
+                cancel,
+                ..
+            } => {
+                assert_eq!(executable.as_path(), config.executable());
+                assert_eq!(qualified_profile.as_deref(), Some("qualified-core-v2"));
+                assert!(
+                    debugger.is_some(),
+                    "the configured debugger must be enabled before Ready"
+                );
+                assert!(
+                    input.is_some(),
+                    "the configured input adapter must be enabled before Ready"
+                );
+                cancel
+            }
+            _ => panic!("expected qualified Ready after adapter activation"),
+        };
+        struct TerminateOnDrop(CancellationHandle);
+        impl Drop for TerminateOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.terminate();
+            }
+        }
+        let _terminate = TerminateOnDrop(cancel);
+        requests
+            .send(Request::EnableDebugger(
+                directory.path().join("override.oct"),
+            ))
+            .unwrap();
+        assert!(matches!(
+            next(),
+            Event::DebuggerUnavailable {
+                debugger: Some(_),
+                ..
+            }
+        ));
+        requests
+            .send(Request::Execute("qualified_before_restart=42;".into()))
+            .unwrap();
+        match next() {
+            Event::Executed(result) => assert!(result.error.is_none(), "{:?}", result.error),
+            _ => panic!("expected qualified execution"),
+        }
+        requests
+            .send(Request::ReadVariable {
+                request_id: 1,
+                name: "qualified_before_restart".into(),
+                token: None,
+                row_start: 1,
+                column_start: 1,
+                higher_indices: Vec::new(),
+            })
+            .unwrap();
+        assert!(matches!(
+            next(),
+            Event::VariableRead {
+                result: Ok(VariablePage::Typed { .. }),
+                ..
+            }
+        ));
+        requests.send(Request::Restart).unwrap();
+        match next() {
+            Event::Restarted {
+                qualified_profile,
+                debugger,
+                input,
+                ..
+            } => {
+                assert_eq!(qualified_profile.as_deref(), Some("qualified-core-v2"));
+                assert!(debugger.is_some());
+                assert!(input.is_some());
+            }
+            _ => panic!("expected qualified restart with restored native adapters"),
+        }
+        requests
+            .send(Request::Execute(
+                "assert(exist('qualified_before_restart', 'var') == 0); qualified_after_restart=7;"
+                    .into(),
+            ))
+            .unwrap();
+        match next() {
+            Event::Executed(result) => assert!(result.error.is_none(), "{:?}", result.error),
+            _ => panic!("expected cleared workspace after qualified restart"),
+        }
+        requests
+            .send(Request::ReadVariable {
+                request_id: 2,
+                name: "qualified_after_restart".into(),
+                token: None,
+                row_start: 1,
+                column_start: 1,
+                higher_indices: Vec::new(),
+            })
+            .unwrap();
+        assert!(matches!(
+            next(),
+            Event::VariableRead {
+                result: Ok(VariablePage::Typed { .. }),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires MATHLAB_QUALIFIED_STARTUP_CONFIG with the admitted native runtime"]
+    fn qualified_worker_retry_after_unavailable_config_preserves_selection() {
+        use std::time::Duration;
+
+        let admitted = std::env::var_os("MATHLAB_QUALIFIED_STARTUP_CONFIG").expect(
+            "required qualified desktop integration needs MATHLAB_QUALIFIED_STARTUP_CONFIG",
+        );
+        let admitted = std::path::Path::new(&admitted);
+        let config = QualifiedStartupConfig::load(admitted).unwrap();
+        let config_bytes = std::fs::read(admitted).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let selected = directory.path().join("retry-qualified.json");
+        let (requests, events) = spawn(eframe::egui::Context::default());
+        let next = || loop {
+            match events.recv_timeout(Duration::from_secs(30)).unwrap() {
+                Event::ConsoleConnected { .. } => {}
+                event => break event,
+            }
+        };
+        requests
+            .send(Request::Start {
+                executable: None,
+                startup_config: Some(selected.clone()),
+                packaged_startup: false,
+                directory: directory.path().to_owned(),
+            })
+            .unwrap();
+        match next() {
+            Event::Unavailable(error) => assert!(!error.is_empty()),
+            Event::Ready { cancel, .. } => {
+                let _ = cancel.terminate();
+                panic!("missing qualified configuration must not start a legacy fallback");
+            }
+            _ => panic!("expected unavailable selected configuration"),
+        }
+        requests.send(Request::Restart).unwrap();
+        match next() {
+            Event::Unavailable(error) => assert!(error.contains("qualified engine")),
+            _ => panic!("unavailable qualified selection must remain selected on restart"),
+        }
+
+        std::fs::write(&selected, &config_bytes).unwrap();
+        requests
+            .send(Request::Start {
+                executable: None,
+                startup_config: Some(selected),
+                packaged_startup: false,
+                directory: directory.path().to_owned(),
+            })
+            .unwrap();
+        let (executable, profile, debugger, input, cancel) = match next() {
+            Event::Ready {
+                executable,
+                qualified_profile,
+                debugger,
+                input,
+                cancel,
+                ..
+            } => (executable, qualified_profile, debugger, input, cancel),
+            _ => panic!("expected qualified Ready after restoring the selected configuration"),
+        };
+        struct TerminateOnDrop(CancellationHandle);
+        impl Drop for TerminateOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.terminate();
+            }
+        }
+        let _terminate = TerminateOnDrop(cancel);
+        assert_eq!(executable.as_path(), config.executable());
+        assert_eq!(profile.as_deref(), Some("qualified-core-v2"));
+        assert!(debugger.is_some());
+        assert!(input.is_some());
+        requests
+            .send(Request::EnableDebugger(
+                directory.path().join("override.oct"),
+            ))
+            .unwrap();
+        assert!(matches!(
+            next(),
+            Event::DebuggerUnavailable {
+                debugger: Some(_),
+                ..
+            }
+        ));
+        requests
+            .send(Request::Execute("qualified_after_retry=uint64(42);".into()))
+            .unwrap();
+        match next() {
+            Event::Executed(result) => assert!(result.error.is_none(), "{:?}", result.error),
+            _ => panic!("expected execution in the retried qualified session"),
+        }
+        requests
+            .send(Request::ReadVariable {
+                request_id: 1,
+                name: "qualified_after_retry".into(),
+                token: None,
+                row_start: 1,
+                column_start: 1,
+                higher_indices: Vec::new(),
+            })
+            .unwrap();
+        let token = match next() {
+            Event::VariableRead {
+                request_id: 1,
+                result: Ok(VariablePage::Typed { page, .. }),
+            } => page.token,
+            _ => panic!("expected a typed binding after qualified retry"),
+        };
+        requests
+            .send(Request::ReadVariable {
+                request_id: 2,
+                name: "qualified_after_retry".into(),
+                token: Some(token.clone()),
+                row_start: 1,
+                column_start: 1,
+                higher_indices: Vec::new(),
+            })
+            .unwrap();
+        match next() {
+            Event::VariableRead {
+                request_id: 2,
+                result: Ok(VariablePage::Typed { page, .. }),
+            } => {
+                assert_eq!(page.token, token);
+                assert_eq!(page.class, mathlab_engine::NumericClass::Uint64);
+                match page.data {
+                    mathlab_engine::PageData::Dense {
+                        real: mathlab_engine::NumericComponents::Uint64(values),
+                        imag: None,
+                    } => assert_eq!(values, vec![42]),
+                    _ => panic!("expected the exact uint64 value in a checked typed page"),
+                }
+            }
+            _ => panic!("expected a checked typed read in the retried qualified session"),
+        }
+    }
+
+    #[test]
     fn lost_engine_transport_disconnects_instead_of_leaving_the_editor_enabled() {
         assert!(disconnected(&mathlab_engine::Error::Timeout));
         assert!(disconnected(&mathlab_engine::Error::Io(
@@ -486,6 +1286,8 @@ mod tests {
         requests
             .send(Request::Start {
                 executable: Some(executable),
+                startup_config: None,
+                packaged_startup: false,
                 directory: directory.path().into(),
             })
             .unwrap();
@@ -659,6 +1461,8 @@ mod tests {
         requests
             .send(Request::Start {
                 executable: Some(executable),
+                startup_config: None,
+                packaged_startup: false,
                 directory: directory.path().into(),
             })
             .unwrap();
@@ -840,6 +1644,8 @@ mod tests {
         requests
             .send(Request::Start {
                 executable: Some(executable),
+                startup_config: None,
+                packaged_startup: false,
                 directory: directory.path().into(),
             })
             .unwrap();
@@ -891,9 +1697,11 @@ mod tests {
         match events.recv_timeout(Duration::from_secs(10)).unwrap() {
             Event::Executed(result) => {
                 assert!(result.error.is_none());
-                assert!(result
-                    .output
-                    .contains("STREAM_BEFORE_WAITSTREAM_AFTER_WAIT"));
+                assert!(
+                    result
+                        .output
+                        .contains("STREAM_BEFORE_WAITSTREAM_AFTER_WAIT")
+                );
                 assert!(result.console_end_sequence > 0);
             }
             _ => panic!("expected completed execution after releasing the test gate"),
@@ -931,6 +1739,8 @@ mod tests {
         requests
             .send(Request::Start {
                 executable: Some(executable),
+                startup_config: None,
+                packaged_startup: false,
                 directory: directory.path().into(),
             })
             .unwrap();
@@ -1191,13 +2001,14 @@ mod tests {
             assert!(Instant::now() < deadline, "source did not pause");
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(test
-            .app
-            .debugger
-            .as_mut()
-            .unwrap()
-            .evaluate_source("reply_value=input('PAUSED_LONG_INPUT> ');".into())
-            .is_some());
+        assert!(
+            test.app
+                .debugger
+                .as_mut()
+                .unwrap()
+                .evaluate_source("reply_value=input('PAUSED_LONG_INPUT> ');".into())
+                .is_some()
+        );
         let request = wait_input(&runtime, "PAUSED_LONG_INPUT>");
         runtime
             .input
@@ -1255,7 +2066,7 @@ mod tests {
     /// portable coverage when the optional native complex adapter is absent.
     #[test]
     fn desktop_range_actor_routes_exact_nd_paste_history_and_stale_reset_without_retry() {
-        use crate::range_paste::{parse_range_paste, PasteLimits, PasteTarget};
+        use crate::range_paste::{PasteLimits, PasteTarget, parse_range_paste};
         use crate::range_transactions::RangeTransactions;
         use mathlab_engine::value_edit::EditOperation;
         use mathlab_engine::{NumericComponents, PageData, ValuePage};
@@ -1275,6 +2086,8 @@ mod tests {
         requests
             .send(Request::Start {
                 executable: Some(executable),
+                startup_config: None,
+                packaged_startup: false,
                 directory: directory.path().into(),
             })
             .unwrap();

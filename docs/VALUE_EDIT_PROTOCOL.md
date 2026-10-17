@@ -11,7 +11,7 @@ The newest working source routes dense complex pages, edit construction and
 history through separate real/imaginary buffers from an optional native helper.
 It rejects those operations explicitly when the helper is unavailable. This
 integration passed the headless native profile in the
-[follow-up report](../artifacts/cp03-followup-validation/RESULTS.json): 404 passing
+follow-up report (local evidence unavailable in source exports: `../artifacts/cp03-followup-validation/RESULTS.json`): 404 passing
 entrypoints across all 19 compiled workspace test targets, with no ignored or
 filtered tests. This includes 98 Engine unit, 119 desktop unit, 13 edit-session,
 three adapter lifecycle and four precision entrypoints, plus the original
@@ -27,11 +27,11 @@ workspace, installed application, native visual workflow, or complete CP03 miles
 
 | Retained run | Passed | Scope |
 | --- | ---: | --- |
-| [Edit codec](../artifacts/cp03-edit-codec-rerun.log) | 11 | Pure codec, exact typed components, bounds, strict JSON and receipt identity checks |
-| [Clipboard parser](../artifacts/cp03-paste-first.log) | 16 | Literal TSV, rectangularity/budgets, exact integers, direct binary32 midpoint rounding and shared request conversion |
-| [Engine edit sessions](../artifacts/cp03-edit-session-rerun.log) | 13 | Actual-worker selected write/undo/redo, N-D/nested/sparse/type, invalidation, reset and Stop journeys |
-| [Private worker/fault checks](../artifacts/cp03-edit-worker-first.log) | 10 | Actual-worker raw validation, construction admission and project-shadow checks, plus six SIGINT cases using private worker-copy gates before revision or after assignment |
-| [Temporary lifetime checks](../artifacts/cp03-edit-lifetime-all-first.log) | 9 | Actual-worker last-owner deletion, alias ownership, undo/redo, rejection, uncertainty, SIGINT boundaries and protection of user variables/functions; exact inputs in the [cleanup checkpoint](../artifacts/cp03-edit-lifetime-checkpoint.json) |
+| Edit codec (local evidence unavailable in source exports: `../artifacts/cp03-edit-codec-rerun.log`) | 11 | Pure codec, exact typed components, bounds, strict JSON and receipt identity checks |
+| Clipboard parser (local evidence unavailable in source exports: `../artifacts/cp03-paste-first.log`) | 16 | Literal TSV, rectangularity/budgets, exact integers, direct binary32 midpoint rounding and shared request conversion |
+| Engine edit sessions (local evidence unavailable in source exports: `../artifacts/cp03-edit-session-rerun.log`) | 13 | Actual-worker selected write/undo/redo, N-D/nested/sparse/type, invalidation, reset and Stop journeys |
+| Private worker/fault checks (local evidence unavailable in source exports: `../artifacts/cp03-edit-worker-first.log`) | 10 | Actual-worker raw validation, construction admission and project-shadow checks, plus six SIGINT cases using private worker-copy gates before revision or after assignment |
+| Temporary lifetime checks (local evidence unavailable in source exports: `../artifacts/cp03-edit-lifetime-all-first.log`) | 9 | Actual-worker last-owner deletion, alias ownership, undo/redo, rejection, uncertainty, SIGINT boundaries and protection of user variables/functions; exact inputs in the cleanup checkpoint (local evidence unavailable in source exports: `../artifacts/cp03-edit-lifetime-checkpoint.json`) |
 
 These test counts do not establish all complex signed-zero variants or general
 resource accounting; see the known limitations below. Desktop writes
@@ -128,8 +128,8 @@ failed by incorrectly reporting possible commits; all four now pass.
 
 ## Complex signed-zero repair and remaining work
 
-The raw probes [complex zero](../artifacts/cp03-complex-zero-probe.log) and
-[complex singleton](../artifacts/cp03-complex-singleton-probe.log) expose native
+The raw probes complex zero (local evidence unavailable in source exports: `../artifacts/cp03-complex-zero-probe.log`) and
+complex singleton (local evidence unavailable in source exports: `../artifacts/cp03-complex-singleton-probe.log`) expose native
 narrowing that the 13 Engine edit-session tests do not exhaust. One probe reports
 single imaginary scalar bits `00000000` while the array component retains
 `80000000`; another reports a duplicated selection as real with imaginary bits
@@ -158,16 +158,16 @@ through a struct/cell/struct leaf, with independent full-leaf IEEE-word oracles
 and root/container/leaf alias checks. The five-entrypoint native precision target
 passed on local Octave 11.3 with the explicitly selected matching value adapter,
 including these eight nested journeys and the earlier root `Z` journeys. The
-[scoped replay](../artifacts/ready-history-validation/RESULTS.json) retains its
+scoped replay (local evidence unavailable in source exports: `../artifacts/ready-history-validation/RESULTS.json`) retains its
 source/executable/module identities; other runtime/storage variants stay open.
 
 A private native component helper passed focused single/double probes for exact
 signed-zero and quiet-NaN payload copying, alias preservation, component-pair
 restoration, storage in genuine containers and rejection before object conversion.
-The [private probe report](../artifacts/cp03-value-bridge-extensions/report.json)
+The private probe report (local evidence unavailable in source exports: `../artifacts/cp03-value-bridge-extensions/report.json`)
 records executable/module identities and actual commands. The same native body
 now has an owned source copy and the newest working page/edit/history routes call
-its component API. The [earlier 232-entrypoint report](../artifacts/cp03-current-validation/RESULTS.json)
+its component API. The earlier 232-entrypoint report (local evidence unavailable in source exports: `../artifacts/cp03-current-validation/RESULTS.json`)
 records the first combined checks and standalone build; the follow-up records
 the fresh four-module build and broader workspace run. The initial loader run failed all three
 lifecycle cases because its metadata type label was wrong; a genuine runtime
@@ -222,11 +222,69 @@ exercise actual non-UTF-8 path arguments without creating impossible filenames.
 Existing non-UTF-8 files and UTF-8 aliases to those targets remain authored for
 other Unix filesystems and have not been executed on Linux in this checkpoint.
 
-A separate shipped checked-API diagnostic is
-being designed privately; it is not activated as a CLI command, installed test
-or graphical workflow by these prerequisites. Actual installed read/write/history
-acceptance, runtime/module fingerprints and complete desktop journeys remain
-separate gates.
+The separate checked-API command below is now implemented and locally validated.
+Actual installed read/write/history acceptance and complete desktop journeys
+remain separate gates.
+
+## CLI checked-value diagnostic
+
+`probe-value-api` runs public Engine reads, range edits and history operations in
+a new owned temporary workspace. It does not attach to an existing session or
+use the global `--directory`. Its help and JSON report identify fixed request and
+Stop-wait budgets; global `--timeout` does not replace those budgets.
+
+The default `native-required` profile needs an explicitly configured matching
+value adapter:
+
+```sh
+MATHLAB_VALUE_BRIDGE=/absolute/path/mathlab_value_bridge.oct \
+  mathlab --json --octave /absolute/path/octave-cli probe-value-api
+```
+
+The deliberate `native-unavailable` profile tests useful real-value operations
+and precise complex-value rejections without native adapters:
+
+```sh
+env -u MATHLAB_VALUE_BRIDGE -u MATHLAB_SCOPE_BRIDGE \
+  -u MATHLAB_INPUT_BRIDGE -u MATHLAB_DEBUG_BRIDGE \
+  mathlab --json --octave /absolute/path/octave-cli \
+  probe-value-api --expect-unavailable
+```
+
+Both profiles check exact uint64 read/Write/Undo/Redo beyond 2^53, including
+uint64 max, aliases and untouched scalar peers. Native-required adds twelve
+independent double/single complex prefix journeys through a struct/cell leaf,
+with exact terminal NaN and negative-zero bit oracles, stale authority and
+history reset, a wholly empty restarted workspace, and Unix same-process Stop
+recovery. Terminal peer checks require uint64 class, exact scalar shape and
+value; numeric equality alone is insufficient. Native-unavailable has four
+cases, including `MathLab:ValuePagePrecisionUnavailable` and
+`MathLab:ValueEditPrecisionUnavailable`; it does not claim native complex or
+lifecycle success. Native-required has seven cases.
+
+JSON has schema version 1 and kind `mathlab.value-api-probe`. A successful report
+requires actual worker observations and matching before/after canonical paths
+and SHA-256 for the running CLI, selected Octave and each configured native
+module, with at most six artifact records. Their kinds include `cli_executable`,
+`octave_runtime` and the configured adapter names. Hashes establish endpoint
+byte identity; the worker capability and executed cases establish selected
+behavior. A configured debugger path is admitted and hashed without claiming
+that the debugger loaded. An independent installed consumer must still bind its
+expected package/runtime/module identities to the report.
+
+Explicit `--octave`, then the first present runtime environment selection, takes
+priority over discovery for this command. Invalid explicit selections cannot
+fall back to another runtime. Missing modules, profile conflicts, invalid path
+identities, changed bytes or failed cases produce failed JSON and a nonzero
+exit. Earlier completed cases remain distinguishable from failed or unrun work.
+
+The final local macOS arm64/Octave 11.3 checkpoint passed 26 unit entrypoints,
+four CLI integration groups and two separately retained actual profiles, with
+strict CLI all-target Clippy and package formatting. Earlier failed compilation
+and the weaker peer-oracle replay remain preserved as separate attempts.
+Non-macOS invalid-byte filesystem branches, hosted Octave 8.4, installed final
+packages, GUI actions, general trusted-dispatch hardening and full CP03 remain
+unqualified by this diagnostic.
 
 ## Desktop transaction preparation
 

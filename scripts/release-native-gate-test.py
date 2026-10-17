@@ -595,5 +595,132 @@ class NativeGateTest(unittest.TestCase):
         self.assertFalse((self.root / "not-ignored-output").exists())
 
 
+class NativeBuilderSelectionTest(unittest.TestCase):
+    """Exercise the real builder with fake tools; no native compiler or Octave."""
+
+    MODULES = ("debug", "scope", "input", "value", "intrinsic")
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="native-builder-selection-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name) / "builder Ω"
+        (self.root / "scripts").mkdir(parents=True)
+        self.native = self.root / "native"
+        self.native.mkdir()
+        self.builder = self.root / "scripts/build-debugger.sh"
+        self.builder.write_bytes((Path(__file__).parent / "build-debugger.sh").read_bytes())
+        for name in self.MODULES:
+            source = "mathlab_intrinsic_bridge_v2.cc" if name == "intrinsic" else f"mathlab_{name}_bridge.cc"
+            (self.native / source).write_text("// synthetic source\n")
+            (self.native / f"mathlab_{name}_bridge.oct").write_text(f"old {name}\n")
+        (self.native / "runtime-version.txt").write_text("old runtime\n")
+        self.trace = self.root / "calls.jsonl"
+        tools = self.root / "tools"
+        tools.mkdir()
+        fake = '''#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+name = Path(sys.argv[0]).name
+with Path(os.environ["NATIVE_BUILDER_TEST_TRACE"]).open("a") as output:
+    output.write(json.dumps({"tool": name, "args": args}) + "\\n")
+if name == "octave-cli":
+    assert args == ["--version"]
+    print("GNU Octave, version " + os.environ["NATIVE_BUILDER_TEST_VERSION"])
+elif args == ["-p", "OCTAVE_VERSION"]:
+    print(os.environ["NATIVE_BUILDER_TEST_SDK"])
+else:
+    source = next(Path(arg).name for arg in args if arg.endswith(".cc"))
+    if source == os.environ.get("NATIVE_BUILDER_TEST_FAIL_SOURCE"):
+        sys.exit(23)
+    Path(args[args.index("-o") + 1]).write_text("synthetic compiled " + source + "\\n")
+'''
+        for name in ("octave-cli", "mkoctfile"):
+            tool = tools / name
+            tool.write_text(fake)
+            tool.chmod(0o755)
+        self.environment = dict(os.environ, MATHLAB_OCTAVE=str(tools / "octave-cli"),
+                                MATHLAB_MKOCTFILE=str(tools / "mkoctfile"),
+                                NATIVE_BUILDER_TEST_TRACE=str(self.trace),
+                                NATIVE_BUILDER_TEST_VERSION="11.3.0", NATIVE_BUILDER_TEST_SDK="11.3.0")
+        self.environment.pop("MATHLAB_EXPECT_OCTAVE_VERSION", None)
+        self.environment.pop("NATIVE_BUILDER_TEST_FAIL_SOURCE", None)
+
+    def published(self):
+        return {p.name: (p.read_bytes(), p.stat().st_ino) for p in self.native.iterdir()
+                if p.suffix == ".oct" or p.name == "runtime-version.txt"}
+
+    def build(self, *arguments):
+        return subprocess.run(["bash", str(self.builder), *arguments], env=self.environment,
+                              capture_output=True, text=True, timeout=5)
+
+    def compiles(self):
+        return [json.loads(line)["args"] for line in self.trace.read_text().splitlines()
+                if "-o" in json.loads(line)["args"]]
+
+    def test_default_four_mode_preserves_provider_and_legacy_compiler_arguments(self):
+        self.environment.update(NATIVE_BUILDER_TEST_VERSION="8.4.0", NATIVE_BUILDER_TEST_SDK="8.4.0")
+        previous = self.published()
+        result = self.build()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = self.compiles()
+        self.assertEqual([Path(call[0]).name for call in calls],
+                         [f"mathlab_{name}_bridge.cc" for name in self.MODULES[:-1]])
+        for call in calls:
+            self.assertEqual(len(call), 3)
+            self.assertEqual(call[1], "-o")
+        self.assertEqual(self.published()["mathlab_intrinsic_bridge.oct"],
+                         previous["mathlab_intrinsic_bridge.oct"])
+        self.assertEqual((self.native / "runtime-version.txt").read_text(), "8.4.0\n")
+
+    def test_qualified_mode_builds_five_and_replaces_all_module_inodes(self):
+        previous = self.published()
+        result = self.build("--profile", "qualified-core-v2")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = self.compiles()
+        self.assertEqual([Path(call[-3]).name for call in calls],
+                         [f"mathlab_{name}_bridge.cc" for name in self.MODULES[:-1]]
+                         + ["mathlab_intrinsic_bridge_v2.cc"])
+        for call in calls:
+            self.assertEqual(call[:-3], ["-DMATHLAB_QUALIFIED_CORE_V2=1", "-Wall", "-Wextra",
+                                        "-Werror", "-std=c++17", f"-I{self.native}"])
+        for name in self.MODULES:
+            filename = f"mathlab_{name}_bridge.oct"
+            self.assertNotEqual(self.published()[filename][1], previous[filename][1])
+            self.assertTrue(self.published()[filename][0].startswith(b"synthetic compiled "))
+        self.assertEqual((self.native / "runtime-version.txt").read_text(), "11.3.0\n")
+        self.assertEqual(list(self.native.glob(".build-*")), [])
+
+    def test_bad_arguments_fail_before_any_tool_or_output_change(self):
+        previous = self.published()
+        for arguments in (("--profile",), ("--profile", "unknown"),
+                          ("--profile", "qualified-core-v2", "extra")):
+            with self.subTest(arguments=arguments):
+                result = self.build(*arguments)
+                self.assertEqual(result.returncode, 2)
+                self.assertFalse(self.trace.exists())
+                self.assertEqual(self.published(), previous)
+                self.assertEqual(list(self.native.glob(".build-*")), [])
+
+    def test_fifth_compile_failure_preserves_every_published_output(self):
+        previous = self.published()
+        self.environment["NATIVE_BUILDER_TEST_FAIL_SOURCE"] = "mathlab_intrinsic_bridge_v2.cc"
+        result = self.build("--profile", "qualified-core-v2")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(self.compiles()), 5)
+        self.assertEqual(self.published(), previous)
+        self.assertEqual(list(self.native.glob(".build-*")), [])
+
+    def test_qualified_wrong_runtime_fails_before_staging_or_compilation(self):
+        previous = self.published()
+        self.environment.update(NATIVE_BUILDER_TEST_VERSION="8.4.0", NATIVE_BUILDER_TEST_SDK="8.4.0")
+        result = self.build("--profile", "qualified-core-v2")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires Octave 11.3.0", result.stderr)
+        self.assertEqual(self.compiles(), [])
+        self.assertEqual(self.published(), previous)
+        self.assertEqual(list(self.native.glob(".build-*")), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

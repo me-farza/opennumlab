@@ -6,6 +6,9 @@
 #endif
 #include <octave/oct.h>
 #include <octave/defun-dld.h>
+#if defined(MATHLAB_QUALIFIED_CORE_V2) && MATHLAB_QUALIFIED_CORE_V2 == 1
+#include "mathlab_adapter_binding_v2.h"
+#endif
 #include <octave/interpreter.h>
 #include <octave/symtab.h>
 #include <octave/ov-builtin.h>
@@ -36,6 +39,14 @@
 
 namespace fs = std::filesystem;
 namespace {
+#if defined(MATHLAB_QUALIFIED_CORE_V2) && MATHLAB_QUALIFIED_CORE_V2 == 1
+mathlab_adapter_binding_v2::binding& intrinsic_binding() {
+  // Process-lifetime transport configuration only. Retention/teardown is unproved.
+  static auto *value = new mathlab_adapter_binding_v2::binding;
+  return *value;
+}
+
+#endif
 constexpr std::size_t max_text = 1024 * 1024;
 constexpr std::size_t max_prompt = 64 * 1024;
 constexpr std::size_t max_metadata = 128 * 1024;
@@ -393,9 +404,22 @@ void context(const octave_value_list& args, int first) {
 }
 } // namespace
 
+#if defined(MATHLAB_QUALIFIED_CORE_V2) && MATHLAB_QUALIFIED_CORE_V2 == 1
+DEFMETHOD_DLD(mathlab_input_bridge, interp, args, nargout,
+             "Install authentic file-backed input reads while retaining GNU Octave builtin semantics.") {
+#else
 DEFMETHOD_DLD(mathlab_input_bridge, interp, args, ,
              "Install authentic file-backed input reads while retaining GNU Octave builtin semantics.") {
+#endif
   try {
+#if defined(MATHLAB_QUALIFIED_CORE_V2) && MATHLAB_QUALIFIED_CORE_V2 == 1
+    if (mathlab_adapter_binding_v2::is_bind_operation(args)) {
+      mathlab_adapter_binding_v2::bind(intrinsic_binding(), interp, args, nargout,
+                                     "input", "mathlab_input_bridge");
+      return octave_value_list();
+    }
+    mathlab_adapter_binding_v2::active(intrinsic_binding(), interp);
+#endif
     if (args.length() < 1) print_usage();
     const auto operation = args(0).string_value();
     if (operation == "protocol" && (args.length() == 1 || args.length() == 2)) {

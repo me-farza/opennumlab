@@ -6,3 +6,4 @@ license = "GPL-3.0-or-later"
 description = "Lexical MATLAB script preparation for Open MathLab"
 
 [dependencies]
+mathlab-array = { path = "../mathlab-array" }

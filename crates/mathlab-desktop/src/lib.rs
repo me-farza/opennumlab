@@ -3,6 +3,8 @@
 mod console;
 mod debugging;
 mod editor_gutter;
+/// Documented file-action descriptors; desktop routing remains separately qualified.
+pub mod file_actions;
 mod input;
 mod prepared_debug;
 pub mod range_paste;
@@ -33,10 +35,21 @@ const GREEN: Color32 = Color32::from_rgb(42, 143, 82);
 const RED: Color32 = Color32::from_rgb(181, 58, 54);
 const DEMO: &str = include_str!("../assets/getting_started.m");
 
+/// Platform binding displayed by the desktop and its command-line help.
+pub const RUN_SECTION_SHORTCUT: &str = if cfg!(target_os = "macos") {
+    "Command+Enter"
+} else {
+    "Ctrl+Enter"
+};
+
 #[derive(Clone, Debug)]
 pub struct DesktopOptions {
     pub directory: PathBuf,
     pub executable: Option<PathBuf>,
+    /// Explicit pinned qualified startup configuration; never selected by recovery or environment.
+    pub startup_config: Option<PathBuf>,
+    /// Qualified installed-bundle selection; remains selected after startup errors.
+    pub packaged_startup: bool,
     pub initial_file: Option<PathBuf>,
     pub run_on_start: bool,
     /// Capture the rendered desktop after startup, execution or an interactive pause, then exit.
@@ -58,6 +71,8 @@ impl Default for DesktopOptions {
         Self {
             directory: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             executable: None,
+            startup_config: None,
+            packaged_startup: false,
             initial_file: None,
             run_on_start: false,
             screenshot: None,
@@ -138,6 +153,9 @@ pub struct MathLabApp {
     events: Receiver<Event>,
     cancellation: Option<CancellationHandle>,
     executable: Option<PathBuf>,
+    startup_config: Option<PathBuf>,
+    packaged_startup: bool,
+    qualified_profile: Option<String>,
     configured_executable: String,
     directory: PathBuf,
     directory_input: String,
@@ -215,7 +233,10 @@ pub struct MathLabApp {
 
 impl MathLabApp {
     pub fn new(cc: &eframe::CreationContext<'_>, mut options: DesktopOptions) -> Self {
-        if options.debugger_bridge.is_none() {
+        if options.startup_config.is_none()
+            && !options.packaged_startup
+            && options.debugger_bridge.is_none()
+        {
             options.debugger_bridge = std::env::var_os("MATHLAB_DEBUG_BRIDGE").map(PathBuf::from);
         }
         style(&cc.egui_ctx);
@@ -248,12 +269,15 @@ impl MathLabApp {
                     directory = saved_directory;
                 }
             }
-            if executable.is_none() {
+            if options.startup_config.is_none() && !options.packaged_startup && executable.is_none()
+            {
                 executable = session.executable.clone();
             }
         }
         let _ = requests.send(Request::Start {
             executable: executable.clone(),
+            startup_config: options.startup_config.clone(),
+            packaged_startup: options.packaged_startup,
             directory: directory.clone(),
         });
         let mut app = Self {
@@ -265,6 +289,9 @@ impl MathLabApp {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             executable,
+            startup_config: options.startup_config.clone(),
+            packaged_startup: options.packaged_startup,
+            qualified_profile: None,
             directory_input: directory.display().to_string(),
             directory,
             documents: vec![Document {
@@ -341,8 +368,7 @@ impl MathLabApp {
             go_to_line: 1,
             pending_editor_selection: None,
             configured_debugger_bridge: options
-                .debugger_bridge
-                .as_ref()
+                .debugger_bridge.as_ref().filter(|_| options.startup_config.is_none() && !options.packaged_startup)
                 .map(|path| path.display().to_string())
                 .unwrap_or_default(),
             debugger: None,
@@ -368,7 +394,10 @@ impl MathLabApp {
                 app.show_history = session.show_history;
                 app.ribbon_tab = session.ribbon_tab;
                 app.figure_zoom = session.figure_zoom.clamp(0.25, 3.0);
-                if options.debugger_bridge.is_none() {
+                if options.startup_config.is_none()
+                    && !options.packaged_startup
+                    && options.debugger_bridge.is_none()
+                {
                     app.configured_debugger_bridge = session
                         .debugger_bridge
                         .as_ref()
@@ -674,6 +703,8 @@ impl MathLabApp {
                 }
                 Event::Ready {
                     executable,
+                    qualified_profile,
+                    debugger,
                     cancel,
                     internal_worker,
                     input,
@@ -687,7 +718,9 @@ impl MathLabApp {
                     self.inspected = None;
                     self.range_transactions.restarted();
                     self.selected_variable = None;
-                    self.debugger = None;
+                    self.debugger =
+                        debugger.map(|handle| debugging::DebuggerPanel::new(handle, ctx.clone()));
+                    self.qualified_profile = qualified_profile;
                     self.pending_prepared_breakpoint = None;
                     self.pending_breakpoint_id = None;
                     self.configured_executable = executable.display().to_string();
@@ -697,8 +730,19 @@ impl MathLabApp {
                     self.busy = false;
                     self.restarting = false;
                     self.status = "Ready".into();
-                    self.notice("GNU Octave connected. Commands and scripts share one workspace.");
-                    if !self.configured_debugger_bridge.trim().is_empty() {
+                    if let Some(profile) = &self.qualified_profile {
+                        self.notice(format!("GNU Octave connected with accepted profile {profile}. Commands and scripts share one workspace."));
+                    } else {
+                        self.notice(
+                            "GNU Octave connected. Commands and scripts share one workspace.",
+                        );
+                    }
+                    if self.debugger.is_some() {
+                        self.continue_startup();
+                    } else if self.startup_config.is_none()
+                        && !self.packaged_startup
+                        && !self.configured_debugger_bridge.trim().is_empty()
+                    {
                         self.enable_debugger();
                     } else if self.initial_breakpoint.is_some() {
                         self.error("A startup breakpoint requires --debugger BRIDGE.oct or MATHLAB_DEBUG_BRIDGE. Select the adapter in Engine Settings.");
@@ -803,6 +847,7 @@ impl MathLabApp {
                     self.status = "Ready".into();
                 }
                 Event::Restarted {
+                    qualified_profile,
                     debugger,
                     internal_worker,
                     input,
@@ -820,6 +865,7 @@ impl MathLabApp {
                     self.inspected = None;
                     self.selected_variable = None;
                     self.range_transactions.restarted();
+                    self.qualified_profile = qualified_profile;
                     self.status = "Ready".into();
                     self.notice("Engine restarted. Workspace variables and figures were cleared.");
                     self.debugger =
@@ -834,19 +880,7 @@ impl MathLabApp {
                     self.debugger = Some(debugging::DebuggerPanel::new(handle, ctx.clone()));
                     self.status = "Debugger enabled".into();
                     self.notice("Native debugger enabled. Set a breakpoint in a source file or script buffer before running.");
-                    if let Some(line) = self.initial_breakpoint.take() {
-                        let path = prepared_debug::original_path(
-                            &self.documents[self.active_document],
-                            &self.directory,
-                        );
-                        self.prepare_breakpoint(path, line, self.pending_auto_run);
-                    } else if self.pending_auto_run {
-                        self.pending_auto_run = false;
-                        self.run_document();
-                    } else {
-                        self.screenshot_ready = true;
-                        self.screenshot_ready_at = Some(std::time::Instant::now());
-                    }
+                    self.continue_startup();
                 }
                 Event::DebuggerUnavailable { error, debugger } => {
                     if self.restarting {
@@ -969,6 +1003,7 @@ impl MathLabApp {
                     self.restarting = false;
                     self.connected = false;
                     self.cancellation = None;
+                    self.qualified_profile = None;
                     self.debugger = None;
                     self.pending_breakpoint_id = None;
                     self.pending_prepared_breakpoint = None;
@@ -1069,6 +1104,7 @@ impl MathLabApp {
         self.connected = false;
         self.debugger = None;
         self.cancellation = None;
+        self.qualified_profile = None;
         self.pending_breakpoint_id = None;
         self.pending_prepared_breakpoint = None;
         self.pending_auto_run = false;
@@ -1116,6 +1152,7 @@ impl MathLabApp {
         if self.requests.send(request).is_err() {
             self.busy = false;
             self.connected = false;
+            self.qualified_profile = None;
             self.error("The engine worker stopped unexpectedly.");
         }
     }
@@ -1674,8 +1711,30 @@ impl MathLabApp {
         let _ = self.requests.send(Request::Restart);
     }
 
+    fn connect_engine(&mut self) {
+        self.debugger = None;
+        self.qualified_profile = None;
+        self.pending_breakpoint_id = None;
+        self.pending_prepared_breakpoint = None;
+        self.input.disconnect();
+        self.connected = false;
+        self.busy = true;
+        self.status = "Starting GNU Octave…".into();
+        let executable = (self.startup_config.is_none()
+            && !self.packaged_startup
+            && !self.configured_executable.trim().is_empty())
+        .then(|| PathBuf::from(self.configured_executable.trim()));
+        let _ = self.requests.send(Request::Start {
+            executable,
+            startup_config: self.startup_config.clone(),
+            packaged_startup: self.packaged_startup,
+            directory: self.directory.clone(),
+        });
+    }
+
     fn enable_debugger(&mut self) {
-        if !self.connected || self.busy {
+        if (self.startup_config.is_some() || self.packaged_startup) || !self.connected || self.busy
+        {
             return;
         }
         let path = PathBuf::from(self.configured_debugger_bridge.trim());
@@ -1684,6 +1743,22 @@ impl MathLabApp {
             "enable native debugger".into(),
         );
         self.status = "Enabling debugger…".into();
+    }
+
+    fn continue_startup(&mut self) {
+        if let Some(line) = self.initial_breakpoint.take() {
+            let path = prepared_debug::original_path(
+                &self.documents[self.active_document],
+                &self.directory,
+            );
+            self.prepare_breakpoint(path, line, self.pending_auto_run);
+        } else if self.pending_auto_run {
+            self.pending_auto_run = false;
+            self.run_document();
+        } else {
+            self.screenshot_ready = true;
+            self.screenshot_ready_at = Some(std::time::Instant::now());
+        }
     }
 
     fn prepare_breakpoint(&mut self, file: PathBuf, line: usize, run_after: bool) {
@@ -2012,6 +2087,78 @@ impl MathLabApp {
         }
     }
 
+    fn consume_file_shortcut(
+        input: &mut egui::InputState,
+        action: file_actions::FileAction,
+    ) -> bool {
+        let platform = if cfg!(target_os = "macos") {
+            file_actions::Platform::MacOs
+        } else if cfg!(target_os = "windows") {
+            file_actions::Platform::Windows
+        } else {
+            file_actions::Platform::Linux
+        };
+        let Some(binding) = action.documented_binding(platform) else {
+            return false;
+        };
+        let mut consumed = false;
+        // egui's consume_key ignores extra Shift/Alt; file actions require the
+        // descriptor's exact physical chord, including distinct Control/Command.
+        input.events.retain(|event| {
+            let egui::Event::Key {
+                key,
+                modifiers,
+                pressed: true,
+                ..
+            } = event
+            else {
+                return true;
+            };
+            let key = match key {
+                Key::O => file_actions::FileKey::O,
+                Key::S => file_actions::FileKey::S,
+                _ => file_actions::FileKey::Other,
+            };
+            let matches = binding.matches(
+                key,
+                file_actions::PhysicalModifiers {
+                    control: modifiers.ctrl,
+                    command: modifiers.mac_cmd,
+                    shift: modifiers.shift,
+                    alt: modifiers.alt,
+                },
+            );
+            consumed |= matches;
+            !matches
+        });
+        consumed
+    }
+
+    fn consume_run_section_shortcut(input: &mut egui::InputState, macos: bool) -> bool {
+        let mut consumed = false;
+        // Match the event's physical chord exactly, as file shortcuts do.
+        // Shift/Alt variants belong to different section actions in MATLAB.
+        input.events.retain(|event| {
+            let egui::Event::Key {
+                key,
+                modifiers,
+                pressed: true,
+                ..
+            } = event
+            else {
+                return true;
+            };
+            let matches = *key == Key::Enter
+                && modifiers.mac_cmd == macos
+                && modifiers.ctrl != macos
+                && !modifiers.shift
+                && !modifiers.alt;
+            consumed |= matches;
+            !matches
+        });
+        consumed
+    }
+
     fn shortcuts(&mut self, ctx: &egui::Context) {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::F))
             || ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::H))
@@ -2038,10 +2185,10 @@ impl MathLabApp {
                 .count()
                 + 1;
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::O)) {
+        if ctx.input_mut(|i| Self::consume_file_shortcut(i, file_actions::FileAction::Open)) {
             self.choose_file();
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::S)) {
+        if ctx.input_mut(|i| Self::consume_file_shortcut(i, file_actions::FileAction::Save)) {
             self.save_document(false);
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::N)) {
@@ -2082,7 +2229,7 @@ impl MathLabApp {
                 + 1;
             self.toggle_editor_breakpoint(line);
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::Enter)) {
+        if ctx.input_mut(|i| Self::consume_run_section_shortcut(i, cfg!(target_os = "macos"))) {
             self.run_section();
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::F9)) {
@@ -2294,6 +2441,19 @@ impl MathLabApp {
     }
 
     fn top(&mut self, ctx: &egui::Context) {
+        let platform = if cfg!(target_os = "macos") {
+            file_actions::Platform::MacOs
+        } else if cfg!(target_os = "windows") {
+            file_actions::Platform::Windows
+        } else {
+            file_actions::Platform::Linux
+        };
+        let open_hint = file_actions::FileAction::Open
+            .menu_hint(platform)
+            .expect("Open has a documented platform binding");
+        let save_hint = file_actions::FileAction::Save
+            .menu_hint(platform)
+            .expect("Save has a documented platform binding");
         egui::TopBottomPanel::top("ribbon")
             .frame(egui::Frame::NONE.fill(PALE))
             .show(ctx, |ui| {
@@ -2329,12 +2489,15 @@ impl MathLabApp {
                             self.new_document();
                             ui.close();
                         }
-                        if ui.button("Open…                        Ctrl+O").clicked() {
+                        if ui
+                            .add(egui::Button::new("Open…").shortcut_text(open_hint.as_str()))
+                            .clicked()
+                        {
                             self.choose_file();
                             ui.close();
                         }
                         if ui
-                            .button("Save                            Ctrl+S")
+                            .add(egui::Button::new("Save").shortcut_text(save_hint.as_str()))
                             .clicked()
                         {
                             self.save_document(false);
@@ -2395,7 +2558,8 @@ impl MathLabApp {
                         if ui
                             .add_enabled(
                                 enabled,
-                                egui::Button::new("Run Section              Ctrl+Enter"),
+                                egui::Button::new("Run Section")
+                                    .shortcut_text(RUN_SECTION_SHORTCUT),
                             )
                             .clicked()
                         {
@@ -2574,13 +2738,19 @@ impl MathLabApp {
                             if ribbon_button(
                                 ui,
                                 "Open",
-                                "Open .m script (Ctrl+O)",
+                                &format!("Open .m script ({open_hint})"),
                                 Icon::Open,
                                 true,
                             ) {
                                 self.choose_file();
                             }
-                            if ribbon_button(ui, "Save", "Save script (Ctrl+S)", Icon::Save, true) {
+                            if ribbon_button(
+                                ui,
+                                "Save",
+                                &format!("Save script ({save_hint})"),
+                                Icon::Save,
+                                true,
+                            ) {
                                 self.save_document(false);
                             }
                             ui.separator();
@@ -2597,7 +2767,7 @@ impl MathLabApp {
                             if ribbon_button(
                                 ui,
                                 "Run Section",
-                                "Run current %% section (Ctrl+Enter)",
+                                &format!("Run current %% section ({RUN_SECTION_SHORTCUT})"),
                                 Icon::Section,
                                 ready,
                             ) {
@@ -3393,26 +3563,27 @@ impl MathLabApp {
             egui::Window::new("Engine Settings").open(&mut open).resizable(false).default_width(550.0).show(ctx, |ui| {
                 ui.heading("GNU Octave runtime");
                 ui.label("OpenNumLab uses an installed GNU Octave executable to run your MATLAB-style code.");
+                if self.packaged_startup {
+                    ui.label("Startup configuration: current installed app bundle");
+                } else if let Some(path) = &self.startup_config {
+                    ui.label(format!("Startup configuration: {}", path.display()));
+                }
+                if self.startup_config.is_some() || self.packaged_startup {
+                    ui.label(format!("Accepted profile: {}", self.qualified_profile.as_deref().unwrap_or("not connected")));
+                    ui.label("Executable and native adapters are pinned by this configuration.");
+                }
                 ui.add_space(8.0);
                 ui.label(RichText::new("Executable path").strong());
-                ui.horizontal(|ui| {
+                ui.add_enabled_ui(self.startup_config.is_none() && !self.packaged_startup, |ui| { ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut self.configured_executable).desired_width(410.0).hint_text("Auto-detect from PATH"));
                     if ui.button("Choose…").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_file() { self.configured_executable = path.display().to_string(); }
                     }
-                });
+                }); });
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.add_enabled(!self.busy, egui::Button::new("Connect / Retry")).clicked() {
-                        self.debugger = None;
-                        self.pending_breakpoint_id = None;
-                        self.pending_prepared_breakpoint = None;
-                        self.input.disconnect();
-                        self.connected = false;
-                        self.busy = true;
-                        self.status = "Starting GNU Octave…".into();
-                        let executable = if self.configured_executable.trim().is_empty() { None } else { Some(PathBuf::from(self.configured_executable.trim())) };
-                        let _ = self.requests.send(Request::Start { executable, directory: self.directory.clone() });
+                        self.connect_engine();
                     }
                     if ui.add_enabled(self.connected && !self.busy, egui::Button::new("Restart Engine")).clicked() { self.restart(); }
                     ui.label(if self.connected { "Connected" } else if self.busy { "Connecting…" } else { "Not connected" });
@@ -3423,15 +3594,15 @@ impl MathLabApp {
                 ui.hyperlink_to("Windows installers and other platforms", "https://octave.org/download");
                 ui.separator();
                 ui.label(RichText::new("Optional native debugger adapter").strong());
-                ui.horizontal(|ui| {
+                ui.add_enabled_ui(self.startup_config.is_none() && !self.packaged_startup, |ui| { ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut self.configured_debugger_bridge).desired_width(400.0).hint_text("Path to mathlab_debug_bridge.oct"));
                     if ui.button("Choose Adapter…").clicked() {
                         if let Some(path) = rfd::FileDialog::new().add_filter("Octave native adapter", &["oct"]).pick_file() { self.configured_debugger_bridge = path.display().to_string(); }
                     }
-                });
-                if ui.add_enabled(self.connected && !self.busy && !self.configured_debugger_bridge.trim().is_empty(), egui::Button::new("Enable Debugger")).clicked() { self.enable_debugger(); }
+                }); });
+                if ui.add_enabled(self.startup_config.is_none() && !self.packaged_startup && self.connected && !self.busy && !self.configured_debugger_bridge.trim().is_empty(), egui::Button::new("Enable Debugger")).clicked() { self.enable_debugger(); }
                 ui.label(if self.debugger.is_some() { "Debugger enabled" } else { "Debugger disabled" });
-                ui.label(RichText::new("Build with scripts/build-debugger.sh using the development headers for this Octave runtime. The debugger is optional and defaults to disabled.").small().color(MUTED));
+                if self.startup_config.is_none() && !self.packaged_startup { ui.label(RichText::new("Build with scripts/build-debugger.sh using the development headers for this Octave runtime. The debugger is optional and defaults to disabled.").small().color(MUTED)); }
                 ui.add_space(8.0);
                 ui.label(RichText::new(if cfg!(unix) { "Stop / Ctrl+C requests an interrupt and preserves the workspace. Use Run → Force Terminate and Restart if a computation cannot be interrupted; that clears this session's variables." } else { "This platform currently stops execution by restarting the engine, with confirmation. This clears the session's variables." }).size(12.0).color(MUTED));
             });
@@ -3444,7 +3615,7 @@ impl MathLabApp {
                 ui.label("The familiar scientific workflow: open a script, run it, inspect variables, and view figures.");
                 ui.add_space(10.0);
                 egui::Grid::new("help_shortcuts").spacing([20.0, 10.0]).show(ui, |ui| {
-                    for (key, action) in [("F5", "Run the active script or continue debugging"), ("F12 / gutter", "Toggle a breakpoint while idle"), ("F10 / F11", "Step / step in"), ("Shift+F11", "Step out"), ("Shift+F5", "Quit debugging"), ("Ctrl+Enter", "Run the %% section containing the cursor"), ("F9", "Evaluate selected code"), ("Ctrl/Cmd+O", "Open a .m script"), ("Ctrl/Cmd+S", "Save the active script"), ("Ctrl/Cmd+F", "Find and replace in the active script"), ("Ctrl/Cmd+G", "Go to a line"), ("Ctrl+C", "Stop execution"), ("Ctrl+D", "Send EOF when replying to input"), ("Up / Down", "Recall commands in the Command Window")] {
+                    for (key, action) in [("F5", "Run the active script or continue debugging"), ("F12 / gutter", "Toggle a breakpoint while idle"), ("F10 / F11", "Step / step in"), ("Shift+F11", "Step out"), ("Shift+F5", "Quit debugging"), (RUN_SECTION_SHORTCUT, "Run the %% section containing the cursor"), ("F9", "Evaluate selected code"), ("Ctrl/Cmd+O", "Open a .m script"), ("Ctrl/Cmd+S", "Save the active script"), ("Ctrl/Cmd+F", "Find and replace in the active script"), ("Ctrl/Cmd+G", "Go to a line"), ("Ctrl+C", "Stop execution"), ("Ctrl+D", "Send EOF when replying to input"), ("Up / Down", "Recall commands in the Command Window")] {
                         ui.monospace(key); ui.label(action); ui.end_row();
                     }
                 });
@@ -3960,6 +4131,142 @@ fn ribbon_note(ui: &mut egui::Ui, heading: &str, text: &str) {
 }
 
 #[cfg(test)]
+mod file_shortcut_tests {
+    use super::*;
+    use file_actions::FileAction;
+
+    fn command_modifiers() -> egui::Modifiers {
+        let physical = if cfg!(target_os = "macos") {
+            egui::Modifiers::MAC_CMD
+        } else {
+            egui::Modifiers::CTRL
+        };
+        physical | egui::Modifiers::COMMAND
+    }
+
+    fn key_event(key: Key, modifiers: egui::Modifiers, pressed: bool) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn file_shortcuts_consume_each_exact_press_without_eating_other_events() {
+        let command = command_modifiers();
+        let retained = vec![
+            key_event(Key::O, command | egui::Modifiers::SHIFT, true),
+            key_event(Key::S, command | egui::Modifiers::ALT, true),
+            key_event(Key::O, command, false),
+            egui::Event::Text("oS".into()),
+        ];
+        let mut input = egui::InputState::default();
+        input.events = retained.clone();
+        input.events.push(key_event(Key::O, command, true));
+        input.events.push(key_event(Key::S, command, true));
+
+        // The frame's final modifiers are empty; route using each event's flags.
+        for action in [FileAction::Open, FileAction::Save] {
+            assert!(MathLabApp::consume_file_shortcut(&mut input, action));
+            assert!(!MathLabApp::consume_file_shortcut(&mut input, action));
+        }
+        assert_eq!(input.events, retained);
+    }
+
+    #[test]
+    fn ordinary_and_modified_file_keys_do_not_dispatch_or_get_consumed() {
+        let command = command_modifiers();
+        for modifiers in [
+            egui::Modifiers::NONE,
+            egui::Modifiers::SHIFT,
+            egui::Modifiers::ALT,
+            command | egui::Modifiers::SHIFT,
+            command | egui::Modifiers::ALT,
+            command | egui::Modifiers::SHIFT | egui::Modifiers::ALT,
+            egui::Modifiers::CTRL | egui::Modifiers::MAC_CMD | egui::Modifiers::COMMAND,
+            egui::Modifiers::COMMAND,
+        ] {
+            let events = vec![
+                key_event(Key::O, modifiers, true),
+                key_event(Key::S, modifiers, true),
+                egui::Event::Text("oS".into()),
+            ];
+            let mut input = egui::InputState::default();
+            input.events = events.clone();
+            for action in FileAction::ALL {
+                assert!(
+                    !MathLabApp::consume_file_shortcut(&mut input, action),
+                    "{action:?} must ignore {modifiers:?}"
+                );
+            }
+            assert_eq!(input.events, events);
+        }
+    }
+
+    #[test]
+    fn run_section_shortcut_consumes_exact_presses_without_eating_other_events() {
+        for macos in [false, true] {
+            let command = if macos {
+                egui::Modifiers::MAC_CMD
+            } else {
+                egui::Modifiers::CTRL
+            } | egui::Modifiers::COMMAND;
+            let retained = vec![
+                key_event(Key::Enter, command | egui::Modifiers::SHIFT, true),
+                key_event(Key::Enter, command | egui::Modifiers::ALT, true),
+                key_event(Key::Enter, command, false),
+                key_event(Key::O, command, true),
+                egui::Event::Text("\n".into()),
+            ];
+            let mut input = egui::InputState::default();
+            input.events = retained.clone();
+            input.events.push(key_event(Key::Enter, command, true));
+            input.events.push(key_event(Key::Enter, command, true));
+
+            // Route from each event, not the frame's final empty modifiers.
+            assert!(MathLabApp::consume_run_section_shortcut(&mut input, macos));
+            assert!(!MathLabApp::consume_run_section_shortcut(&mut input, macos));
+            assert_eq!(input.events, retained);
+        }
+    }
+
+    #[test]
+    fn run_section_shortcut_requires_exact_platform_physical_modifiers() {
+        for macos in [false, true] {
+            for mask in 0..16 {
+                for command in [false, true] {
+                    let modifiers = egui::Modifiers {
+                        ctrl: mask & 1 != 0,
+                        mac_cmd: mask & 2 != 0,
+                        shift: mask & 4 != 0,
+                        alt: mask & 8 != 0,
+                        command,
+                    };
+                    let events = vec![key_event(Key::Enter, modifiers, true)];
+                    let mut input = egui::InputState::default();
+                    input.events = events.clone();
+                    // Independent physical masks: Mac Command, otherwise Control.
+                    let expected = mask == if macos { 2 } else { 1 };
+                    assert_eq!(
+                        MathLabApp::consume_run_section_shortcut(&mut input, macos),
+                        expected,
+                        "macos={macos} physical_mask={mask} command_alias={command}"
+                    );
+                    if expected {
+                        assert!(input.events.is_empty());
+                    } else {
+                        assert_eq!(input.events, events);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod lifecycle_tests {
     use super::*;
     use std::sync::mpsc::channel;
@@ -3998,6 +4305,70 @@ mod lifecycle_tests {
             ctx,
             _directory: directory,
         }
+    }
+
+    #[test]
+    fn qualified_retry_preserves_config_and_suppresses_legacy_debugger_activation() {
+        let mut test = harness();
+        let selected = test.app.directory.join("qualified.json");
+        test.app.startup_config = Some(selected.clone());
+        test.app.configured_executable = "ignored-runtime-override".into();
+        test.app.configured_debugger_bridge = "ignored-debugger-override.oct".into();
+        test.app.enable_debugger();
+        assert!(test.requests.try_recv().is_err());
+        test.app.connect_engine();
+        match test.requests.recv().unwrap() {
+            Request::Start {
+                executable,
+                startup_config,
+                packaged_startup,
+                directory,
+            } => {
+                assert!(executable.is_none());
+                assert!(!packaged_startup);
+                assert_eq!(startup_config, Some(selected.clone()));
+                assert_eq!(directory, test.app.directory);
+            }
+            _ => panic!("expected selected qualified configuration on retry"),
+        }
+        test.app.busy = false;
+        test.app.restart();
+        assert!(matches!(test.requests.recv().unwrap(), Request::Restart));
+        assert_eq!(test.app.startup_config, Some(selected));
+    }
+
+    #[test]
+    fn packaged_retry_and_restart_preserve_selection_after_unavailable() {
+        let mut test = harness();
+        test.app.packaged_startup = true;
+        test.app.configured_executable = "ignored-runtime-override".into();
+        test.app.configured_debugger_bridge = "ignored-debugger-override.oct".into();
+        test.events
+            .send(Event::Unavailable("missing installed config".into()))
+            .unwrap();
+        test.app.poll_events(&test.ctx);
+        assert!(test.app.packaged_startup);
+        test.app.enable_debugger();
+        assert!(test.requests.try_recv().is_err());
+        test.app.connect_engine();
+        match test.requests.recv().unwrap() {
+            Request::Start {
+                executable,
+                startup_config,
+                packaged_startup,
+                ..
+            } => {
+                assert!(executable.is_none());
+                assert!(startup_config.is_none());
+                assert!(packaged_startup);
+            }
+            _ => panic!("expected retained packaged selection on retry"),
+        }
+        test.app.connected = true;
+        test.app.busy = false;
+        test.app.restart();
+        assert!(matches!(test.requests.recv().unwrap(), Request::Restart));
+        assert!(test.app.packaged_startup);
     }
 
     fn inspected_token(revision: u64) -> mathlab_engine::BindingToken {
@@ -4246,6 +4617,7 @@ mod lifecycle_tests {
         assert!(!test.app.show_settings);
         test.events
             .send(Event::Restarted {
+                qualified_profile: None,
                 debugger: None,
                 internal_worker: test.app.directory.join("new-worker.m"),
                 input: None,

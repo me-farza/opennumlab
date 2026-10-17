@@ -71,7 +71,7 @@ function mathlab_conformance_write(output_path, case_id, result, error_identifie
         end
         [ok, message] = movefile(temporary, output_path, 'f');
         if ~ok
-            error('MathLab:ConformanceWrite', '%s', message);
+            error('MathLab:ConformanceWrite', 'Cannot publish the typed record: %s', message);
         end
     catch caught
         if stream >= 0

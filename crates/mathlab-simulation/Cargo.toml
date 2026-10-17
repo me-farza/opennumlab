@@ -1,0 +1,9 @@
+[package]
+name = "mathlab-simulation"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "GPL-3.0-or-later"
+description = "Opt-in bounded independent discrete scalar accumulator preparation"
+
+[dependencies]

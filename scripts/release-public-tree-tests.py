@@ -257,6 +257,61 @@ class PublicTreeTests(unittest.TestCase):
         self.assertFalse(any(b"VALUE_PROVISIONING_PRIVATE_SENTINEL" in data for data in self.output_bytes().values()))
         self.assertEqual(public.verify(self.output), manifest)
 
+    def test_exact_optional_contributor_and_operator_provenance_roundtrip(self):
+        selected = {
+            "CONTRIBUTING.md": "# Original contributor fixture\n",
+            "crates/mathlab-language/tests/fixtures/operator_native_reference_v1.provenance.json":
+                '{"schema_version":1,"fixture":"PUB01 original provenance"}\n',
+        }
+        minimal_output = self.root / "minimal-public"
+        minimal = self.create(output=minimal_output)
+        self.assertTrue(source.policy.ROOT_FILES.issubset({r["path"] for r in minimal["files"]}))
+        self.assertFalse(set(selected).intersection(r["path"] for r in minimal["files"]))
+        self.assertEqual(public.verify(minimal_output), minimal)
+        denied = (
+            "docs/CONTRIBUTING.md",
+            "crates/mathlab-language/tests/fixtures/unrelated.json",
+            "crates/mathlab-language/tests/fixtures/operator_native_reference_v2.provenance.json",
+            "crates/mathlab-language/tests/fixtures/nested/operator_native_reference_v1.provenance.json",
+            "crates/research/fixture.rs", "crates/evidence/fixture.rs", "crates/local/fixture.rs",
+        )
+        for name, text in selected.items():
+            self.write(name, text).chmod(0o644)
+        for name in denied:
+            self.write(name, "PUB01_DENIED_SENTINEL\n")
+        self.git("add", ".")
+        # Stage a case-distinct name without a colliding macOS worktree file.
+        blob = self.git("hash-object", "-w", "--", "docs/CONTRIBUTING.md")
+        self.git("-c", "core.ignorecase=false", "update-index", "--add", "--cacheinfo",
+                 "100644," + blob + ",contributing.md")
+        self.git("commit", "-qm", "Exact optional public fixtures")
+        reference = self.git("rev-parse", "HEAD")
+        for name in selected:
+            self.write(name, "PUB01_DIRTY_WORKTREE\n").chmod(0o755)
+        selected_source = self.root / "optional-source"
+        source_manifest = source.create(self.repo, reference, selected_source)
+        manifest = self.create(source_set=selected_source)
+        self.assertEqual(manifest["source"]["commit"], reference)
+        source_records = {record["path"]: record for record in source_manifest["files"]}
+        records = {record["path"]: record for record in manifest["files"]}
+        for name, text in selected.items():
+            with self.subTest(path=name):
+                data = text.encode()
+                path = self.output / public.TREE / name
+                self.assertEqual(path.read_bytes(), data)
+                self.assertEqual(path.stat().st_mode & 0o777, 0o644)
+                self.assertEqual(records[name]["mode"], "0644")
+                self.assertFalse(records[name]["executable"])
+                self.assertEqual(records[name]["origin"], "source_archive")
+                self.assertEqual(records[name]["sha256"], source.digest(data))
+                self.assertEqual(records[name]["git_blob"], public.blob_id(data, reference))
+                self.assertEqual({key: records[name][key] for key in public.SOURCE_FIELDS}, source_records[name])
+        self.assertEqual(set(records), set(source_records) | set(public.CONFIGS))
+        self.assertFalse(set(records).intersection((*denied, "contributing.md")))
+        self.assertFalse(any(b"PUB01_DENIED_SENTINEL" in data or b"PUB01_DIRTY_WORKTREE" in data
+                             for data in self.output_bytes().values()))
+        self.assertEqual(public.verify(self.output), manifest)
+
     def test_fixed_configs_despite_dirty_extra_replacement_and_moving_head(self):
         self.write(".gitignore", "later committed ignore\n")
         self.write(".github/workflows/ci.yml", "name: Later committed CI\n")

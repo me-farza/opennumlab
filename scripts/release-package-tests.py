@@ -10,6 +10,7 @@ from pathlib import Path
 import plistlib
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -72,13 +73,13 @@ class PackageTests(unittest.TestCase):
         p.write_text(data)
         return p
 
-    def builder(self, repo, native):
+    def builder(self, repo, native, startup=None):
         result = {"executables": {"mathlab": self.executable, "mathlab-desktop": self.executable},
                   "version": "2.7.3-alpha.4", "native": {
                       "status": "not_included", "adapter_profile": dict(release.NATIVE_OMITTED_PROFILE),
                       "value_component": dict(release.VALUE_OMITTED_COMPONENT), "reason": "Native profile not requested"},
                   "executable_sha256": {name: release.sha(self.executable) for name in ("mathlab", "mathlab-desktop")}}
-        if native:
+        if native or startup is not None:
             result["native"] = {"status": "enabled_protocol_load_passed", "artifact_sha256": {},
                                 "adapter_profile": dict(release.NATIVE_REQUIRED_PROFILE),
                                 "runtime_version": "11.3.0", "sdk": {"OCTAVE_VERSION": "11.3.0"},
@@ -100,6 +101,12 @@ class PackageTests(unittest.TestCase):
                 "runtime": "/synthetic/external/octave-cli", "worker_capabilities": sorted(release.VALUE_REQUIRED_CAPABILITIES),
                 "module_sha256": module_hash, "runtime_executable_sha256": "a" * 64}
             result["linked_libraries"] = {name: "synthetic linked dependencies for " + name for name in release.NATIVE_MODULES}
+            if startup is not None:
+                runtime = startup["startup"]["executable"]
+                result["native"]["ghostscript"] = copy.deepcopy(startup["startup"]["ghostscript"])
+                result["native"]["runtime_executable_sha256"] = runtime["sha256"]
+                result["native"]["worker_observation"].update(runtime=runtime["path"], runtime_executable_sha256=runtime["sha256"])
+                self.qualify_native(result, repo / "native", graphics=startup["profile"] == "qualified-graphics-v2")
         return result
 
     def notices(self, repo, destination):
@@ -510,6 +517,510 @@ class PackageTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "exactly the canonical"):
             release.validate(self.destination)
 
+    def qualify_native(self, identity, native_root, graphics=False):
+        """Add synthetic accepted core evidence to the existing native fixture."""
+        native = identity["native"]
+        provider = native_root / "mathlab_intrinsic_bridge.oct"
+        provider.write_text("synthetic qualified provider")
+        native["artifact_sha256"][provider.name] = release.sha(provider)
+        native["adapter_profile"] = {"schema_version": 1, "name": "qualified-core-v2"}
+        native["sdk"]["OCTAVE_API_VERSION"] = "api-v61"
+        native["protocols"]["intrinsic"] = {
+            "protocol": "mathlab-intrinsics", "version": 1, "octave_version": "11.3.0", "octave_api_version": "api-v61",
+            "actual_function_object": True, "native_base_queries": True, "unlocked_registry": True,
+            "callback_binding_v2": True, "adapter_carrier_v2": True, "provider_shutdown_proxy": True}
+        identity["linked_libraries"][provider.name] = "synthetic provider dependencies"
+        if graphics:
+            module = native_root / release.GRAPHICS_NAME
+            module.write_text("synthetic qualified graphics")
+            native["artifact_sha256"][module.name] = release.sha(module)
+            native["adapter_profile"] = dict(release.NATIVE_GRAPHICS_PROFILE)
+            native["protocols"]["graphics"] = dict(release.GRAPHICS_PROTOCOL)
+            native["worker_observation"]["worker_capabilities"].append(release.GRAPHICS_CAPABILITY)
+            identity["linked_libraries"][module.name] = "synthetic graphics dependencies"
+        observation = native["worker_observation"]
+        observation["native_modules"] = {
+            name: {"path": str((native_root / name).resolve()), "sha256": native["artifact_sha256"][name]}
+            for name in release.qualified_native_modules(native["adapter_profile"])}
+        observation["value_adapter"] = observation["native_modules"]["mathlab_value_bridge.oct"]["path"]
+        context = {"worker_id": "synthetic-worker", "generation": "1", "invocation": "1", "revision": "0"}
+        observation["session_context"] = dict(context)
+        observation["qualified_startup_status"] = {"profile": native["adapter_profile"]["name"], "context": context, "intrinsics": {
+            "protocol": "mathlab-intrinsics", "version": "1", "phase": "ready",
+            "provider_file": observation["native_modules"][provider.name]["path"],
+            "worker_file": "/synthetic/session/worker.m", "registry_file": "/synthetic/session/registry.m",
+            "entry_alias": "__mlentry_fixture", "shutdown_alias": "__mlshutdown_fixture",
+            "octave_version": "11.3.0", "octave_api_version": "api-v61",
+            "initial_path_admitted": True, "shutdown_registered": True,
+            "adapters": {role: {"path": observation["native_modules"]["mathlab_" + role + "_bridge.oct"]["path"],
+                                "protocol": protocol, "version": version}
+                         for role, protocol, version in (("debug", "mathlab-debugger", "4"), ("scope", "mathlab-scope", "2"),
+                                                         ("input", "mathlab-input", "1"), ("value", "mathlab-value", "1"))}}}
+
+        if graphics:
+            observation["qualified_startup_status"]["intrinsics"]["adapters"]["graphics"] = {
+                "path": observation["native_modules"][release.GRAPHICS_NAME]["path"],
+                "protocol": "mathlab-graphics", "version": "1"}
+
+    def qualified_manifest(self, graphics=False):
+        """Use a coherent qualified assembly before independent validator mutations."""
+        seed, _ = self.startup_seed(graphics=graphics)
+        self.assemble(startup_config=seed)
+        return self.manifest()
+
+    def startup_seed(self, graphics=False):
+        installation = self.root / "selected-installation"
+        runtime = installation / "bin/octave-cli"
+        runtime.parent.mkdir(parents=True, exist_ok=True)
+        runtime.write_text("#!/bin/sh\n# synthetic runtime; never execute\nexit 0\n")
+        runtime.chmod(0o755)
+        directory = installation / "share/octave/11.3.0/m"
+        directory.mkdir(parents=True, exist_ok=True)
+        gnuplot = self.root / "selected-gnuplot"
+        gnuplot.write_text("#!/bin/sh\n# synthetic plotting tool; never execute\nexit 0\n")
+        gnuplot.chmod(0o755)
+        ghostscript = self.root / "selected-ghostscript"
+        ghostscript.write_text("#!/bin/sh\n# synthetic export auxiliary; never execute\nexit 0\n")
+        ghostscript.chmod(0o755)
+        def pin(name):
+            return {"path":"/stale-original-build/native/" + name, "sha256":"e" * 64}
+        document = {"schema_version":2, "profile":"qualified-core-v2", "startup":{
+            "installation_root":str(installation.resolve()), "executable":{"path":str(runtime.resolve()), "sha256":release.sha(runtime)},
+            "provider":pin("mathlab_intrinsic_bridge.oct"), "gnuplot":{"path":str(gnuplot.resolve()), "sha256":release.sha(gnuplot)},
+            "ghostscript":{"path":str(ghostscript.resolve()), "sha256":release.sha(ghostscript)},
+            "runtime_directories":[str(directory.resolve())], "octave_version":"11.3.0", "octave_api_version":"api-v61",
+            "adapters":[{"role":role,"file":pin("mathlab_" + role + "_bridge.oct")} for role in ("input","scope","value","debug")]}}
+        if graphics:
+            document["profile"] = "qualified-graphics-v2"
+            document["startup"]["adapters"].append({"role": "graphics", "file": pin(release.GRAPHICS_NAME)})
+        path = self.root / "explicit startup Ω.json"
+        path.write_text(json.dumps(document))
+        return path, document
+
+    def test_graphics6_schema2_selection_and_rebased_package_are_exact(self):
+        seed_path, seed = self.startup_seed(graphics=True)
+        self.assertEqual(release.read_qualified_startup(seed_path), seed)
+        for change in ("core-with-graphics", "missing", "duplicate", "foreign-role", "basename", "schema1", "missing-gs"):
+            with self.subTest(change=change):
+                altered = copy.deepcopy(seed)
+                if change == "core-with-graphics": altered["profile"] = "qualified-core-v2"
+                elif change == "missing": altered["startup"]["adapters"].pop()
+                elif change == "duplicate": altered["startup"]["adapters"][-1] = copy.deepcopy(altered["startup"]["adapters"][0])
+                elif change == "foreign-role": altered["startup"]["adapters"][-1]["role"] = "unknown"
+                elif change == "basename": altered["startup"]["adapters"][-1]["file"]["path"] = "/foreign/wrong.oct"
+                elif change == "schema1": altered["schema_version"] = 1
+                else: del altered["startup"]["ghostscript"]
+                seed_path.write_text(json.dumps(altered))
+                with patch.object(self, "builder") as builder, self.assertRaises(RuntimeError):
+                    self.assemble(startup_config=seed_path)
+                builder.assert_not_called()
+        seed_path.write_text(json.dumps(seed))
+        self.assemble(startup_config=seed_path)
+        manifest = self.manifest()
+        native = manifest["build"]["native"]
+        self.assertEqual(native["adapter_profile"], release.NATIVE_GRAPHICS_PROFILE)
+        self.assertEqual(set(native["artifact_sha256"]), set(release.qualified_native_files(release.NATIVE_GRAPHICS_PROFILE)))
+        document = json.loads((self.destination / release.STARTUP_CONFIG_PATH).read_text())
+        self.assertEqual(document["profile"], "qualified-graphics-v2")
+        self.assertEqual(document["startup"]["ghostscript"], seed["startup"]["ghostscript"])
+        pins = [document["startup"]["provider"]] + [a["file"] for a in document["startup"]["adapters"]]
+        self.assertEqual(len(pins), 6)
+        for pin in pins:
+            path = self.destination / "Contents/Resources/native" / Path(pin["path"]).name
+            self.assertEqual(pin, {"path": str(path.resolve()), "sha256": release.sha(path)})
+        release.validate(self.destination)
+        def downgrade(repo, native, startup=None):
+            identity = self.builder(repo, native, startup)
+            identity["native"]["adapter_profile"] = dict(release.NATIVE_QUALIFIED_PROFILE)
+            return identity
+        with self.assertRaisesRegex(RuntimeError, "requested adapter_profile"):
+            self.assemble(startup_config=seed_path, builder=downgrade)
+        release.validate(self.destination)
+
+    def test_graphics6_manifest_rejects_resealed_identity_protocol_and_capability_drift(self):
+        original = self.qualified_manifest(graphics=True)
+        changes = (
+            (("protocols", "graphics", "version"), "1"),
+            (("protocols", "graphics", "version"), 1.0),
+            (("protocols", "graphics", "native_object_lifetime"), 1),
+            (("protocols", "graphics", "max_entries"), 4095),
+            (("protocols", "graphics", "extra"), True),
+            (("worker_observation", "worker_capabilities"), sorted(release.VALUE_REQUIRED_CAPABILITIES)),
+            (("worker_observation", "qualified_startup_status", "profile"), "qualified-core-v2"),
+            (("worker_observation", "qualified_startup_status", "intrinsics", "adapters", "graphics", "version"), 1),
+            (("worker_observation", "qualified_startup_status", "intrinsics", "adapters", "graphics", "path"), "/foreign/mathlab_graphics_bridge.oct"),
+            (("worker_observation", "native_modules", release.GRAPHICS_NAME, "sha256"), "b" * 64),
+            (("worker_observation", "native_modules", "unexpected.oct"), {"path":"/foreign/unexpected.oct", "sha256":"b"*64}),
+            (("artifact_sha256", "ghostscript"), "a" * 64),
+            (("adapter_profile", "name"), "qualified-core-v2"),
+        )
+        for path, value in changes:
+            with self.subTest(path=path, value=value):
+                changed = copy.deepcopy(original)
+                node = changed["build"]["native"]
+                for key in path[:-1]: node = node[key]
+                node[path[-1]] = value
+                self.refresh_metadata(changed)
+                with self.assertRaises(RuntimeError): release.validate(self.destination)
+        self.refresh_metadata(original)
+        module = self.destination / "Contents/Resources/native" / release.GRAPHICS_NAME
+        module.unlink()
+        self.refresh_metadata(original)
+        with self.assertRaises(RuntimeError): release.validate(self.destination)
+
+    def test_schema2_ghostscript_selection_is_strict_and_external(self):
+        path, seed = self.startup_seed()
+        self.assertEqual(release.read_qualified_startup(path), seed)
+        for mutation in ("schema1", "schema1-missing", "missing", "extra", "bad-hash", "relative", "duplicate", "unsafe-path", "unsafe-gnuplot"):
+            with self.subTest(mutation=mutation):
+                changed = copy.deepcopy(seed)
+                if mutation.startswith("schema1"):
+                    changed["schema_version"] = 1
+                if mutation in ("missing", "schema1-missing"):
+                    del changed["startup"]["ghostscript"]
+                elif mutation == "extra":
+                    changed["startup"]["ghostscript"]["extra"] = True
+                elif mutation == "bad-hash":
+                    changed["startup"]["ghostscript"]["sha256"] = "A" * 64
+                elif mutation == "relative":
+                    changed["startup"]["ghostscript"]["path"] = "gs"
+                elif mutation == "duplicate":
+                    changed["startup"]["ghostscript"] = copy.deepcopy(changed["startup"]["gnuplot"])
+                elif mutation.startswith("unsafe-"):
+                    key = "gnuplot" if mutation == "unsafe-gnuplot" else "ghostscript"
+                    unsafe = self.root / (key + " quoted ' Ω")
+                    shutil.copy2(changed["startup"][key]["path"], unsafe)
+                    changed["startup"][key]["path"] = str(unsafe)
+                path.write_text(json.dumps(changed))
+                with self.assertRaises(RuntimeError):
+                    release.read_qualified_startup(path)
+        path.write_text(json.dumps(seed).replace('"ghostscript":', '"ghostscript": {}, "ghostscript":', 1))
+        with self.assertRaises(RuntimeError):
+            release.read_qualified_startup(path)
+        selected = Path(seed["startup"]["ghostscript"]["path"])
+        for mutation in ("missing-file", "nonexecutable", "symlink", "tampered"):
+            with self.subTest(mutation=mutation):
+                path.write_text(json.dumps(seed))
+                original = selected.read_bytes()
+                if mutation == "missing-file":
+                    selected.unlink()
+                elif mutation == "nonexecutable":
+                    selected.chmod(0o644)
+                elif mutation == "symlink":
+                    selected.unlink()
+                    selected.symlink_to(seed["startup"]["gnuplot"]["path"])
+                else:
+                    selected.write_bytes(original + b"# changed\n")
+                with self.assertRaises(RuntimeError):
+                    release.read_qualified_startup(path)
+                if selected.is_symlink():
+                    selected.unlink()
+                selected.write_bytes(original)
+                selected.chmod(0o755)
+
+    def test_explicit_qualified_producer_copies_five_and_resolves_config_for_final_destination(self):
+        seed_path, seed = self.startup_seed()
+        seed_bytes = seed_path.read_bytes()
+        calls = []
+        def builder(repo, native, startup=None):
+            calls.append({"native":native,"startup":copy.deepcopy(startup)})
+            return self.builder(repo, native, startup=startup)
+        result = self.assemble(startup_config=seed_path, builder=builder)
+        self.assertEqual(calls, [{"native":False,"startup":seed}])
+        config = (self.destination / "Contents/Resources/qualified-core-v2.json").resolve()
+        self.assertEqual(result["startup_config"], str(config))
+        document = json.loads(config.read_text())
+        self.assertEqual({key:value for key,value in document["startup"].items() if key not in ("provider","adapters")},
+                         {key:value for key,value in seed["startup"].items() if key not in ("provider","adapters")})
+        native = self.manifest()["build"]["native"]
+        self.assertEqual(native["adapter_profile"], {"schema_version":1,"name":"qualified-core-v2"})
+        directory = self.destination / "Contents/Resources/native"
+        self.assertEqual({path.name for path in directory.iterdir()}, set(release.QUALIFIED_NATIVE_FILES))
+        pins = [document["startup"]["provider"]] + [item["file"] for item in document["startup"]["adapters"]]
+        seed_hashes = {Path(pin["path"]).name:pin["sha256"] for pin in
+                       [seed["startup"]["provider"]] + [item["file"] for item in seed["startup"]["adapters"]]}
+        self.assertEqual({Path(pin["path"]).name for pin in pins}, set(release.QUALIFIED_NATIVE_MODULES))
+        for pin in pins:
+            path = directory / Path(pin["path"]).name
+            self.assertEqual(pin, {"path":str(path.resolve()), "sha256":release.sha(path)})
+            self.assertNotEqual(pin["sha256"], seed_hashes[path.name])
+            self.assertEqual(pin["sha256"], native["artifact_sha256"][path.name])
+            self.assertNotEqual(pin["path"], native["worker_observation"]["native_modules"][path.name]["path"])
+        self.assertEqual(seed_path.read_bytes(), seed_bytes)
+        launcher = self.destination / "Contents/MacOS/mathlab-launcher"
+        source_launcher = self.destination / "Contents/Resources/source/scripts/release-launcher.sh"
+        self.assertIn(b"mathlab_packaged_startup=true\n", launcher.read_bytes())
+        self.assertIn(release.LAUNCHER_MODE_STAMP, source_launcher.read_bytes())
+        self.assertEqual(launcher.read_bytes(), release.installed_launcher_bytes(source_launcher, True))
+        payload = {item["path"]: item for item in self.manifest()["payload"]}
+        for path in (launcher, config):
+            self.assertEqual(payload[path.relative_to(self.destination).as_posix()]["sha256"], release.sha(path))
+        release.validate(self.destination)
+
+    def test_qualified_ghostscript_metadata_matches_config_and_rejects_build_drift(self):
+        manifest = self.qualified_manifest()
+        config = json.loads((self.destination / release.STARTUP_CONFIG_PATH).read_text())
+        self.assertEqual(manifest["build"]["native"]["ghostscript"], config["startup"]["ghostscript"])
+        self.assertEqual(set(manifest["build"]["native"]["artifact_sha256"]), set(release.QUALIFIED_NATIVE_FILES))
+        for changed in (None, {}, {**config["startup"]["ghostscript"], "sha256":"b" * 64},
+                        {**config["startup"]["ghostscript"], "extra":True}):
+            with self.subTest(metadata=changed):
+                invalid = copy.deepcopy(manifest)
+                invalid["build"]["native"]["ghostscript"] = changed
+                self.refresh_metadata(invalid)
+                with self.assertRaisesRegex(RuntimeError, "Ghostscript"):
+                    release.validate(self.destination)
+        seed_path, seed = self.startup_seed()
+        def tampering_builder(repo, native, startup=None):
+            identity = self.builder(repo, native, startup)
+            Path(startup["startup"]["ghostscript"]["path"]).write_text("changed during build")
+            return identity
+        with self.assertRaisesRegex(RuntimeError, "Ghostscript"):
+            self.assemble(startup_config=seed_path, builder=tampering_builder)
+
+    def test_qualified_resealed_ghostscript_inside_bundle_is_rejected(self):
+        manifest = self.qualified_manifest()
+        ghostscript = self.destination / "Contents/Resources/export/gs"
+        ghostscript.parent.mkdir()
+        ghostscript.write_text("Synthetic executable; never run\n")
+        ghostscript.chmod(0o755)
+        pin = {"path": str(ghostscript.resolve()), "sha256": release.sha(ghostscript)}
+        self.assertRegex(pin["path"], r"^[A-Za-z0-9/_+.-]+$")
+        config_path = self.destination / release.STARTUP_CONFIG_PATH
+        config = json.loads(config_path.read_text())
+        config["startup"]["ghostscript"] = dict(pin)
+        config_path.write_text(json.dumps(config))
+        manifest["build"]["native"]["ghostscript"] = dict(pin)
+        self.refresh_metadata(manifest)
+        with self.assertRaisesRegex(RuntimeError, "outside the installed bundle"):
+            release.validate(self.destination)
+
+    def test_ghostscript_drift_after_validation_preserves_previous_destination(self):
+        seed_path, seed = self.startup_seed()
+        self.destination.mkdir(parents=True)
+        marker = self.destination / "previous-package"
+        marker.write_text("retained")
+        original_validate = release.validate
+        def tampering_validation(bundle):
+            original_validate(bundle)
+            Path(seed["startup"]["ghostscript"]["path"]).write_text("changed after validation")
+        with patch.object(release, "validate", side_effect=tampering_validation):
+            with self.assertRaisesRegex(RuntimeError, "Ghostscript"):
+                self.assemble(startup_config=seed_path)
+        self.assertEqual(marker.read_text(), "retained")
+
+    def test_installed_launcher_stamp_requires_one_unqualified_source_marker(self):
+        source = self.root / "launcher-template"
+        for data in (b"#!/bin/bash\n", release.LAUNCHER_MODE_STAMP * 2,
+                     release.LAUNCHER_MODE_STAMP + b"mathlab_packaged_startup=true\n"):
+            with self.subTest(template=data):
+                source.write_bytes(data)
+                with self.assertRaisesRegex(RuntimeError, "exactly one unqualified"):
+                    release.installed_launcher_bytes(source, True)
+        source.write_bytes(b"#!/bin/bash\n" + release.LAUNCHER_MODE_STAMP)
+        self.assertEqual(release.installed_launcher_bytes(source), source.read_bytes())
+        self.assertEqual(release.installed_launcher_bytes(source, True),
+                         b"#!/bin/bash\nmathlab_packaged_startup=true\n")
+
+    def test_qualified_launch_policy_and_config_cannot_be_downgraded_with_rehashed_metadata(self):
+        original = self.qualified_manifest()
+        launcher = self.destination / "Contents/MacOS/mathlab-launcher"
+        config = self.destination / release.STARTUP_CONFIG_PATH
+        launcher_bytes, config_bytes = launcher.read_bytes(), config.read_bytes()
+        cases = ("unstamped", "missing-config", "wrong-native-pin", "wrong-runtime-pin")
+        for change in cases:
+            with self.subTest(change=change):
+                launcher.write_bytes(launcher_bytes)
+                config.write_bytes(config_bytes)
+                if change == "unstamped":
+                    launcher.write_bytes(launcher_bytes.replace(b"mathlab_packaged_startup=true\n", release.LAUNCHER_MODE_STAMP))
+                elif change == "missing-config":
+                    config.unlink()
+                else:
+                    document = json.loads(config_bytes)
+                    field = "provider" if change == "wrong-native-pin" else "executable"
+                    document["startup"][field]["sha256"] = "f" * 64
+                    config.write_text(json.dumps(document))
+                self.refresh_metadata(copy.deepcopy(original))
+                with self.assertRaises(RuntimeError):
+                    release.validate(self.destination)
+
+    def test_nonqualified_profiles_keep_unstamped_launcher_and_reject_packaged_policy(self):
+        for with_debugger in (False, True):
+            with self.subTest(with_debugger=with_debugger):
+                self.assemble(with_debugger=with_debugger)
+                original = self.manifest()
+                launcher = self.destination / "Contents/MacOS/mathlab-launcher"
+                source = self.destination / "Contents/Resources/source/scripts/release-launcher.sh"
+                self.assertEqual(launcher.read_bytes(), source.read_bytes())
+                self.assertFalse((self.destination / release.STARTUP_CONFIG_PATH).exists())
+                launcher.write_bytes(release.installed_launcher_bytes(source, True))
+                self.refresh_metadata(original)
+                with self.assertRaisesRegex(RuntimeError, "launcher policy"):
+                    release.validate(self.destination)
+
+    def test_historical_nonqualified_launcher_without_stamp_matches_source_exactly(self):
+        for profile in ("legacy", "omitted", "four-adapter"):
+            with self.subTest(profile=profile):
+                self.assemble(with_debugger=profile == "four-adapter")
+                manifest = self.manifest()
+                if profile == "legacy":
+                    del manifest["build"]["native"]["adapter_profile"]
+                    del manifest["build"]["native"]["value_component"]
+                source_root = self.destination / "Contents/Resources/source"
+                source = source_root / "scripts/release-launcher.sh"
+                installed = self.destination / "Contents/MacOS/mathlab-launcher"
+                historical = b'#!/bin/bash\n# Historical synthetic entry point, never executed.\nexit 0\n'
+                source.write_bytes(historical)
+                installed.write_bytes(historical)
+                manifest["source"]["files"] = release.inventory(source_root)
+                manifest["source"]["export_sha256"] = release.hashlib.sha256(
+                    json.dumps(manifest["source"]["files"], sort_keys=True).encode()).hexdigest()
+                self.refresh_metadata(manifest)
+                release.validate(self.destination)
+                installed.write_bytes(historical + b"# mismatched installed entry\n")
+                self.refresh_metadata(manifest)
+                with self.assertRaisesRegex(RuntimeError, "launcher policy"):
+                    release.validate(self.destination)
+
+    def test_explicit_qualified_selector_rejects_bad_seed_or_downgraded_builder_without_fallback(self):
+        seed_path, seed = self.startup_seed()
+        self.destination.mkdir(parents=True)
+        old = self.destination / "old"
+        old.write_text("still usable")
+        calls = []
+        def downgraded(repo, native, startup=None):
+            calls.append(startup)
+            return self.builder(repo, True)
+        with self.assertRaisesRegex(RuntimeError, "adapter_profile"):
+            self.assemble(startup_config=seed_path, builder=downgraded)
+        self.assertEqual(calls, [seed])
+        self.assertEqual(old.read_text(), "still usable")
+        for change in ("wrong-runtime-pin", "conflicting-selector"):
+            with self.subTest(change=change):
+                changed = copy.deepcopy(seed)
+                if change == "wrong-runtime-pin":
+                    changed["startup"]["executable"]["sha256"] = "b" * 64
+                seed_path.write_text(json.dumps(changed))
+                with patch.object(self, "builder") as builder:
+                    with self.assertRaises(RuntimeError):
+                        self.assemble(startup_config=seed_path, with_debugger=change == "conflicting-selector")
+                builder.assert_not_called()
+                self.assertEqual(old.read_text(), "still usable")
+        for selection in ("gnuplot", "ghostscript", "runtime-directory", "executable"):
+            with self.subTest(overlapping_selection=selection):
+                changed = copy.deepcopy(seed)
+                if selection == "runtime-directory":
+                    selected = self.destination / "selected-runtime-directory"
+                    shutil.copytree(seed["startup"]["runtime_directories"][0], selected)
+                    changed["startup"]["installation_root"] = str(self.root.resolve())
+                    changed["startup"]["runtime_directories"] = [str(selected.resolve())]
+                else:
+                    selected = self.destination / ("selected-" + selection)
+                    shutil.copy2(seed["startup"][selection]["path"], selected)
+                    changed["startup"][selection] = {"path":str(selected.resolve()), "sha256":release.sha(selected)}
+                    if selection == "executable":
+                        changed["startup"]["installation_root"] = str(self.root.resolve())
+                seed_path.write_text(json.dumps(changed))
+                self.assertEqual(release.read_qualified_startup(seed_path), changed)
+                before = release.inventory(self.destination)
+                with patch.object(self, "builder") as builder, patch.object(release, "source_snapshot") as snapshot:
+                    with self.assertRaisesRegex(RuntimeError, "overlaps the package destination"):
+                        self.assemble(startup_config=seed_path)
+                builder.assert_not_called()
+                snapshot.assert_not_called()
+                self.assertEqual(release.inventory(self.destination), before)
+                self.assertEqual(old.read_text(), "still usable")
+        self.assertEqual(list(self.destination.parent.glob(".opennumlab-stage-*")), [])
+
+    def test_qualified_core_manifest_requires_identified_accepted_ready(self):
+        self.qualified_manifest()
+        release.validate(self.destination)
+
+    def test_qualified_core_rejects_missing_foreign_downgraded_and_extra_status(self):
+        original = self.qualified_manifest()
+        changes = [
+            (("worker_observation", "qualified_startup_status"), None),
+            (("worker_observation", "native_modules"), {}),
+            (("worker_observation", "native_modules", "mathlab_intrinsic_bridge.oct", "sha256"), "b" * 64),
+            (("worker_observation", "native_modules", "mathlab_intrinsic_bridge.oct", "extra"), True),
+            (("worker_observation", "native_modules", "foreign.oct"), {}),
+            (("worker_observation", "qualified_startup_status", "profile"), "four-adapter-value-v1"),
+            (("worker_observation", "qualified_startup_status", "extra"), True),
+            (("worker_observation", "qualified_startup_status", "intrinsics", "extra"), True),
+            (("worker_observation", "qualified_startup_status", "intrinsics", "version"), 1),
+            (("worker_observation", "qualified_startup_status", "intrinsics", "phase"), "configured"),
+            (("worker_observation", "qualified_startup_status", "intrinsics", "provider_file"), "/foreign/mathlab_intrinsic_bridge.oct"),
+            (("worker_observation", "qualified_startup_status", "intrinsics", "octave_api_version"), "api-v60"),
+            (("worker_observation", "qualified_startup_status", "intrinsics", "initial_path_admitted"), 1),
+            (("worker_observation", "qualified_startup_status", "intrinsics", "shutdown_registered"), False),
+            (("worker_observation", "qualified_startup_status", "intrinsics", "adapters", "debug", "path"), "/foreign/mathlab_debug_bridge.oct"),
+            (("worker_observation", "qualified_startup_status", "intrinsics", "adapters", "graphics"), {}),
+            (("worker_observation", "session_context", "invocation"), "2"),
+            (("worker_observation", "qualified_startup_status", "context", "generation"), "01"),
+            (("protocols", "intrinsic", "version"), "1"),
+            (("protocols", "intrinsic", "extra"), True),
+            (("sdk", "OCTAVE_API_VERSION"), "api-v60"),
+            (("adapter_profile", "name"), "four-adapter-value-v1"),
+        ]
+        for path, value in changes:
+            with self.subTest(path=path):
+                manifest = copy.deepcopy(original)
+                current = manifest["build"]["native"]
+                for key in path[:-1]:
+                    current = current[key]
+                current[path[-1]] = value
+                if path == ("worker_observation", "qualified_startup_status", "context", "generation"):
+                    manifest["build"]["native"]["worker_observation"]["session_context"]["generation"] = value
+                self.refresh_metadata(manifest)
+                with self.assertRaises(RuntimeError):
+                    release.validate(self.destination)
+
+    def test_qualified_core_rejects_missing_or_extra_provider_payload(self):
+        original = self.qualified_manifest()
+        provider = self.destination / "Contents/Resources/native/mathlab_intrinsic_bridge.oct"
+        content = provider.read_bytes()
+        provider.unlink()
+        self.refresh_metadata(copy.deepcopy(original))
+        with self.assertRaises(RuntimeError):
+            release.validate(self.destination)
+        provider.write_bytes(content)
+        extra = self.destination / "Contents/Resources/native/foreign.oct"
+        extra.write_bytes(content)
+        self.refresh_metadata(copy.deepcopy(original))
+        with self.assertRaises(RuntimeError):
+            release.validate(self.destination)
+
+    def test_nonqualified_manifest_variants_reject_intrinsic_status_declarations(self):
+        for profile in ("native-omitted-v1", "four-adapter-value-v1", None):
+            self.assemble(with_debugger=profile == "four-adapter-value-v1")
+            original = self.manifest()
+            if profile is None:
+                original["build"]["native"].pop("adapter_profile")
+                original["build"]["native"].pop("value_component")
+            for key, value in (("qualified_startup_status", {"profile": "qualified-core-v2"}),
+                               ("intrinsics", {"phase": "ready"}),
+                               ("native_modules", {"mathlab_intrinsic_bridge.oct": {}})):
+                with self.subTest(profile=profile, claim=key):
+                    manifest = copy.deepcopy(original)
+                    manifest["build"]["native"][key] = value
+                    self.refresh_metadata(manifest)
+                    with self.assertRaises(RuntimeError):
+                        release.validate(self.destination)
+
+    def test_legacy_manifest_cannot_declare_an_unclaimed_intrinsic_provider(self):
+        self.assemble()
+        manifest = self.manifest()
+        native = manifest["build"]["native"]
+        native.pop("adapter_profile")
+        native.pop("value_component")
+        provider = self.destination / "Contents/Resources/foreign/mathlab_intrinsic_bridge.oct"
+        provider.parent.mkdir()
+        provider.write_text("unclaimed provider")
+        self.refresh_metadata(manifest)
+        with self.assertRaises(RuntimeError):
+            release.validate(self.destination)
+
     def test_duplicate_manifest_fields_are_rejected_before_validation(self):
         self.assemble()
         path = self.destination / "Contents/Resources/release.json"
@@ -518,19 +1029,74 @@ class PackageTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Duplicate JSON field"):
             release.validate(self.destination)
 
+    def test_qualified_preflight_queries_sdk_api_config_not_header_macro(self):
+        _, seed = self.startup_seed()
+        runtime = Path(seed["startup"]["executable"]["path"])
+        runtime.write_text("#!/bin/sh\nprintf '11.3.0'\n")
+        seed["startup"]["executable"]["sha256"] = release.sha(runtime)
+        header = runtime.parent.parent / "include/octave/version.h"
+        header.parent.mkdir(parents=True)
+        header.write_text('#define OCTAVE_VERSION "11.3.0"\n#define OCTAVE_API_VERSION "api-v61"\n')
+        mkoctfile = runtime.with_name("mkoctfile")
+        mkoctfile.write_text(
+            "#!" + sys.executable + "\n"
+            "import pathlib, re, sys\n"
+            "header = pathlib.Path(__file__).parent.parent / 'include/octave/version.h'\n"
+            "macros = dict(re.findall(r'^#define (\\w+) \\\"([^\\\"]*)\\\"$', header.read_text(), re.M))\n"
+            "values = {'OCTAVE_VERSION': macros['OCTAVE_VERSION'], 'API_VERSION': macros['OCTAVE_API_VERSION']}\n"
+            "if len(sys.argv) != 3 or sys.argv[1] != '-p' or sys.argv[2] not in values:\n"
+            "    print('mkoctfile: unknown variable ' + repr(sys.argv[-1]), file=sys.stderr)\n"
+            "    sys.exit(1)\n"
+            "print(values[sys.argv[2]])\n")
+        mkoctfile.chmod(0o755)
+        rejected = subprocess.run([mkoctfile, "-p", "OCTAVE_API_VERSION"], capture_output=True, text=True, timeout=5)
+        self.assertEqual(rejected.returncode, 1)
+        self.assertIn("unknown variable", rejected.stderr)
+        self.assertTrue(header.is_file())
+        def synthetic_run(argv, cwd, **_kwargs):
+            # Keep these tiny fake utilities in the synthetic test's owned group.
+            return subprocess.check_output(argv, cwd=cwd, stderr=subprocess.STDOUT, text=True, timeout=5).strip()
+        with patch.dict(os.environ, MATHLAB_MKOCTFILE=str(mkoctfile)), \
+                patch.object(release, "run", side_effect=synthetic_run):
+            tools = release.native_preflight(self.repo, seed)
+            self.assertEqual(tools["version"], "11.3.0")
+            self.assertEqual(tools["runtime_executable_sha256"], seed["startup"]["executable"]["sha256"])
+            for api in ("api-v60", "", "v61"):
+                with self.subTest(api=api):
+                    header.write_text('#define OCTAVE_VERSION "11.3.0"\n#define OCTAVE_API_VERSION "' + api + '"\n')
+                    with self.assertRaisesRegex(RuntimeError, "SDK must match api-v61"):
+                        release.native_preflight(self.repo, seed)
+            header.write_text('#define OCTAVE_VERSION "8.4.0"\n#define OCTAVE_API_VERSION "api-v61"\n')
+            with self.assertRaisesRegex(RuntimeError, "runtime/SDK mismatch"):
+                release.native_preflight(self.repo, seed)
+            mkoctfile.write_text("#!/bin/sh\nif [ \"$2\" = OCTAVE_VERSION ]; then printf '11.3.0'; else exit 1; fi\n")
+            with self.assertRaises(subprocess.CalledProcessError) as unavailable:
+                release.native_preflight(self.repo, seed)
+            self.assertEqual(unavailable.exception.cmd[-1], "API_VERSION")
+
     def test_native_protocol_probe_uses_value_specific_arity_and_validates_limits(self):
         octave = self.root / "selected-octave"
         octave.write_text("synthetic executable")
         tools = {"octave": str(octave), "mkoctfile": "/synthetic/mkoctfile", "version": "11.3.0",
                  "runtime_executable_sha256": release.sha(octave)}
+        sdk_api = "api-v61"
         def synthetic_run(argv, *_args, **_kwargs):
             argv = [str(item) for item in argv]
             if argv[:2] == ["bash", "scripts/build-debugger.sh"]:
-                for name in release.NATIVE_FILES:
+                qualified = "--profile" in argv
+                self.assertEqual(argv, ["bash", "scripts/build-debugger.sh"] + (["--profile", "qualified-core-v2"] if qualified else []))
+                for name in release.QUALIFIED_NATIVE_FILES if qualified else release.NATIVE_FILES:
                     (self.repo / "native" / name).write_text("11.3.0\n" if name == "runtime-version.txt" else "fresh " + name)
                 return ""
             if argv[0] == str(octave):
                 expression = argv[-1]
+                if "mathlab_graphics_bridge" in expression:
+                    self.assertIn("('protocol',0)", expression)
+                    return json.dumps(release.GRAPHICS_PROTOCOL)
+                if "mathlab_intrinsic_bridge" in expression:
+                    self.assertIn("('intrinsic_protocol')", expression)
+                    self.assertNotIn("mathlab_intrinsic_bridge('protocol')", expression)
+                    return json.dumps(release.INTRINSIC_PROTOCOL)
                 for short, protocol, version in (("debug", "mathlab-debugger", 4), ("scope", "mathlab-scope", 2), ("input", "mathlab-input", 1)):
                     if "mathlab_" + short + "_bridge" in expression:
                         self.assertIn("('protocol',0)", expression)
@@ -539,7 +1105,15 @@ class PackageTests(unittest.TestCase):
                 self.assertNotIn("mathlab_value_bridge('protocol',0)", expression)
                 return json.dumps(release.VALUE_PROTOCOL)
             if argv[0] == tools["mkoctfile"]:
-                return {"OCTAVE_VERSION": "11.3.0", "CXX": "synthetic-cxx"}.get(argv[-1], "synthetic config")
+                if "-o" in argv:
+                    self.assertEqual(argv, [tools["mkoctfile"], "-DMATHLAB_QUALIFIED_CORE_V2=1", "-Wall", "-Wextra", "-Werror", "-std=c++17",
+                        "-I" + str(self.repo / "native"), str(self.repo / "native/mathlab_graphics_bridge.cc"),
+                        "-o", str(self.repo / "native" / release.GRAPHICS_NAME)])
+                    (self.repo / "native" / release.GRAPHICS_NAME).write_text("fresh graphics")
+                    return ""
+                if argv[-1] == "OCTAVE_API_VERSION":
+                    raise subprocess.CalledProcessError(1, argv, output="unknown variable")
+                return {"OCTAVE_VERSION": "11.3.0", "API_VERSION":sdk_api, "CXX": "synthetic-cxx"}.get(argv[-1], "synthetic config")
             self.assertEqual(argv, ["synthetic-cxx", "--version"])
             return "synthetic compiler"
         with patch.object(release, "run", side_effect=synthetic_run) as runner:
@@ -548,6 +1122,36 @@ class PackageTests(unittest.TestCase):
         self.assertEqual(sum("--eval" in call.args[0] for call in runner.call_args_list), 4)
         with self.assertRaisesRegex(RuntimeError, "preexisting adapters"):
             release.native_build(self.repo, tools)
+        for name in release.NATIVE_FILES:
+            (self.repo / "native" / name).unlink()
+        with patch.object(release, "run", side_effect=synthetic_run) as runner:
+            identity = release.native_build(self.repo, tools, qualified=True)
+        self.assertEqual(identity["protocols"]["intrinsic"], release.INTRINSIC_PROTOCOL)
+        self.assertEqual(identity["sdk"]["OCTAVE_API_VERSION"], "api-v61")
+        self.assertEqual(sum("--eval" in call.args[0] for call in runner.call_args_list), 5)
+        self.assertIn([tools["mkoctfile"], "-p", "API_VERSION"], [call.args[0] for call in runner.call_args_list])
+        for name in release.QUALIFIED_NATIVE_FILES:
+            (self.repo / "native" / name).unlink()
+        leftover = self.repo / "native" / release.GRAPHICS_NAME
+        leftover.write_text("preexisting graphics only")
+        with patch.object(release, "run") as forbidden:
+            with self.assertRaisesRegex(RuntimeError, "preexisting adapters"):
+                release.native_build(self.repo, tools, qualified=True, graphics=True)
+        forbidden.assert_not_called()
+        leftover.unlink()
+        with patch.object(release, "run", side_effect=synthetic_run) as runner:
+            identity = release.native_build(self.repo, tools, qualified=True, graphics=True)
+        self.assertEqual(identity["adapter_profile"], release.NATIVE_GRAPHICS_PROFILE)
+        self.assertEqual(identity["protocols"]["graphics"], release.GRAPHICS_PROTOCOL)
+        self.assertEqual(sum("--eval" in call.args[0] for call in runner.call_args_list), 6)
+        with self.assertRaisesRegex(RuntimeError, "preexisting adapters"):
+            release.native_build(self.repo, tools, qualified=True, graphics=True)
+        for name in release.qualified_native_files(release.NATIVE_GRAPHICS_PROFILE):
+            (self.repo / "native" / name).unlink()
+        sdk_api = "api-v60"
+        with patch.object(release, "run", side_effect=synthetic_run):
+            with self.assertRaisesRegex(RuntimeError, "SDK changed from api-v61"):
+                release.native_build(self.repo, tools, qualified=True)
 
     def test_native_prerequisite_failure_precedes_cargo(self):
         with patch.object(release, "native_preflight", side_effect=RuntimeError("runtime/SDK mismatch")), \
@@ -555,6 +1159,101 @@ class PackageTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "runtime/SDK mismatch"):
                 release.build(self.repo, True)
         runner.assert_not_called()
+
+    def test_qualified_build_routes_owned_fresh_config_to_observer_and_removes_it(self):
+        self.qualified_build_route()
+
+    def test_graphics6_build_routes_six_native_pins_and_graphics_selection(self):
+        self.qualified_build_route(graphics=True)
+
+    def qualified_build_route(self, graphics=False):
+        _, seed = self.startup_seed(graphics=graphics)
+        profile = release.NATIVE_GRAPHICS_PROFILE if graphics else release.NATIVE_QUALIFIED_PROFILE
+        original = copy.deepcopy(seed)
+        seed_hashes = {Path(pin["path"]).name:pin["sha256"] for pin in
+                       [seed["startup"]["provider"]] + [item["file"] for item in seed["startup"]["adapters"]]}
+        runtime = seed["startup"]["executable"]
+        tools = {"octave":runtime["path"], "mkoctfile":"/synthetic/mkoctfile", "version":"11.3.0",
+                 "runtime_executable_sha256":runtime["sha256"]}
+        expected_observation = {}
+        selected_config = []
+        linked_paths = []
+        version = "2.7.3-alpha.4"
+        cargo_build = ["cargo", "build", "--release", "--locked", "--message-format=json-render-diagnostics",
+                       "-p", "mathlab-desktop", "-p", "mathlab-cli"]
+        cargo_metadata = ["cargo", "metadata", "--locked", "--offline", "--no-deps", "--format-version", "1"]
+        native_paths = {(self.repo / "native" / name).resolve() for name in release.qualified_native_modules(profile)}
+
+        def synthetic_native(repo, selected, qualified=False, **kwargs):
+            self.assertEqual(kwargs, {"graphics": True} if graphics else {})
+            self.assertEqual((repo, selected, qualified), (self.repo, tools, True))
+            fixture = self.builder(repo, False, startup=seed)["native"]
+            expected_observation.update(copy.deepcopy(fixture["worker_observation"]))
+            # Real native_build returns protocol/SDK evidence; build must supply
+            # fresh byte hashes, worker observation and value declaration itself.
+            for key in ("artifact_sha256", "worker_observation", "value_component"):
+                fixture.pop(key)
+            return fixture
+
+        def synthetic_run(argv, cwd, timeout=120, env=None):
+            command = [str(item) for item in argv]
+            self.assertEqual(cwd, self.repo)
+            if command == cargo_build:
+                return "\n".join(json.dumps({"reason":"compiler-artifact", "target":{"name":name},
+                                             "executable":str(self.executable)}) for name in ("mathlab-desktop", "mathlab"))
+            if command == cargo_metadata:
+                return json.dumps({"packages":[{"name":name,"version":version} for name in ("mathlab-desktop","mathlab-cli")]})
+            if command == [str(self.executable), "--version"]:
+                return "mathlab " + version
+            if len(command) == 3 and command[:2] == ["otool", "-L"]:
+                path = Path(command[2]).resolve()
+                self.assertIn(path, native_paths | {self.executable.resolve()})
+                linked_paths.append(path)
+                return "synthetic linked dependencies for " + path.name
+            metadata = {("rustc", "-vV"):"synthetic rustc", ("cargo", "--version"):"synthetic cargo",
+                        ("xcrun", "--show-sdk-version"):"synthetic SDK", ("sw_vers", "-productVersion"):"synthetic OS",
+                        ("uname", "-m"):"synthetic architecture"}
+            if tuple(command) in metadata:
+                return metadata[tuple(command)]
+            raise AssertionError("Unexpected producer command: " + repr(command))
+
+        def observe(repo, cli, selected, native, startup_config=None):
+            self.assertEqual((repo, cli, selected), (self.repo, self.executable, tools))
+            self.assertIsNotNone(startup_config)
+            path = Path(startup_config)
+            self.assertTrue(path.is_file())
+            self.assertFalse(path.resolve().is_relative_to(self.repo.resolve()))
+            document = json.loads(path.read_text())
+            self.assertEqual({key:value for key,value in document["startup"].items() if key not in ("provider","adapters")},
+                             {key:value for key,value in seed["startup"].items() if key not in ("provider","adapters")})
+            self.assertEqual(set(native["artifact_sha256"]), set(release.qualified_native_files(profile)))
+            pins = [document["startup"]["provider"]] + [item["file"] for item in document["startup"]["adapters"]]
+            self.assertEqual({Path(pin["path"]).name for pin in pins}, set(release.qualified_native_modules(profile)))
+            for pin in pins:
+                built = (repo / "native" / Path(pin["path"]).name).resolve()
+                self.assertEqual(pin, {"path":str(built),"sha256":release.sha(built)})
+                self.assertNotEqual(pin["sha256"], seed_hashes[built.name])
+                self.assertEqual(pin["sha256"], native["artifact_sha256"][built.name])
+            selected_config.append(path)
+            return copy.deepcopy(expected_observation)
+
+        with patch.object(release, "native_preflight", return_value=tools) as preflight, \
+                patch.object(release, "native_build", side_effect=synthetic_native) as native_builder, \
+                patch.object(release, "run", side_effect=synthetic_run), \
+                patch.object(release, "observe_value_capability", side_effect=observe) as observer:
+            identity = release.build(self.repo, False, startup=seed)
+        preflight.assert_called_once_with(self.repo, seed)
+        native_builder.assert_called_once_with(self.repo, tools, qualified=True, **({"graphics": True} if graphics else {}))
+        observer.assert_called_once()
+        self.assertEqual(len(selected_config), 1)
+        self.assertFalse(selected_config[0].exists())
+        self.assertEqual(identity["native"]["worker_observation"], expected_observation)
+        self.assertEqual(identity["native"]["artifact_sha256"]["mathlab_intrinsic_bridge.oct"],
+                         release.sha(self.repo / "native/mathlab_intrinsic_bridge.oct"))
+        self.assertEqual(set(linked_paths), native_paths | {self.executable.resolve()})
+        self.assertEqual(len(linked_paths), 8 if graphics else 7)
+        self.assertIn("mathlab_intrinsic_bridge.oct", identity["linked_libraries"])
+        self.assertEqual(seed, original)
 
     def test_doctor_requires_actual_capabilities_and_matching_fresh_inputs(self):
         identity = self.builder(self.repo, True)
@@ -577,6 +1276,90 @@ class PackageTests(unittest.TestCase):
                 with patch.object(release, "run", return_value=json.dumps(changed)):
                     with self.assertRaises(RuntimeError):
                         release.observe_value_capability(self.repo, self.executable, tools, identity["native"])
+
+    def test_qualified_doctor_routes_config_and_requires_all_fresh_module_pins(self):
+        self.qualified_doctor_contract()
+
+    def test_graphics6_doctor_requires_selected_six_and_live_capability(self):
+        self.qualified_doctor_contract(graphics=True)
+
+    def qualified_doctor_contract(self, graphics=False):
+        native = self.qualified_manifest(graphics=graphics)["build"]["native"]
+        provider = self.repo / "native/mathlab_intrinsic_bridge.oct"
+        for name in release.qualified_native_modules(native["adapter_profile"]):
+            shutil.copyfile(self.destination / "Contents/Resources/native" / name, self.repo / "native" / name)
+        native["runtime_executable_sha256"] = release.sha(self.executable)
+        doctor = copy.deepcopy(native["worker_observation"])
+        doctor.update(runtime=str(self.executable), ready=True,
+                      runtime_executable_sha256=native["runtime_executable_sha256"])
+        modules = doctor["native_modules"]
+        for name in modules:
+            modules[name]["path"] = str((self.repo / "native" / name).resolve())
+        doctor["value_adapter"] = modules["mathlab_value_bridge.oct"]["path"]
+        ready = doctor["qualified_startup_status"]["intrinsics"]
+        ready["provider_file"] = modules[provider.name]["path"]
+        for role, adapter in ready["adapters"].items():
+            adapter["path"] = modules["mathlab_" + role + "_bridge.oct"]["path"]
+        config = self.root / "explicit-startup.json"
+        _, seed = self.startup_seed(graphics=graphics)
+        seed["startup"]["installation_root"] = str(self.root.resolve())
+        seed["startup"]["executable"] = {"path":str(self.executable.resolve()), "sha256":release.sha(self.executable)}
+        config.write_text(json.dumps(release.qualified_startup_document(seed, self.repo / "native", native["artifact_sha256"])))
+        tools = {"octave": str(self.executable)}
+        stale = {name: "/foreign/stale" for name in ("MATHLAB_OCTAVE", "OCTAVE_EXECUTABLE",
+                 "MATHLAB_DEBUG_BRIDGE", "MATHLAB_SCOPE_BRIDGE", "MATHLAB_INPUT_BRIDGE", "MATHLAB_VALUE_BRIDGE")}
+        with patch.dict(os.environ, stale), patch.object(release, "run", return_value=json.dumps(doctor)) as runner:
+            observed = release.observe_value_capability(self.repo, self.executable, tools, native, config)
+        command = runner.call_args.args[0]
+        self.assertEqual(command[2:4], ["--startup-config", str(config.resolve())])
+        self.assertNotIn("--octave", command)
+        self.assertTrue(set(stale).isdisjoint(runner.call_args.kwargs["env"]))
+        self.assertEqual(observed["qualified_startup_status"], doctor["qualified_startup_status"])
+        variants = []
+        for field in ("native_modules", "qualified_startup_status", "session_context"):
+            changed = copy.deepcopy(doctor)
+            changed.pop(field)
+            variants.append(changed)
+        foreign = copy.deepcopy(doctor)
+        foreign["native_modules"][provider.name]["path"] = "/foreign/" + provider.name
+        foreign["qualified_startup_status"]["intrinsics"]["provider_file"] = "/foreign/" + provider.name
+        variants.append(foreign)
+        bad_hash = copy.deepcopy(doctor)
+        bad_hash["native_modules"][provider.name]["sha256"] = "0" * 64
+        variants.append(bad_hash)
+        if graphics:
+            for field in ("sha256", "path"):
+                changed = copy.deepcopy(doctor)
+                changed["native_modules"][release.GRAPHICS_NAME][field] = "b" * 64 if field == "sha256" else "/foreign/" + release.GRAPHICS_NAME
+                variants.append(changed)
+            missing_capability = copy.deepcopy(doctor)
+            missing_capability["worker_capabilities"].remove(release.GRAPHICS_CAPABILITY)
+            variants.append(missing_capability)
+        for index, changed in enumerate(variants):
+            with self.subTest(index=index), patch.object(release, "run", return_value=json.dumps(changed)):
+                with self.assertRaises(RuntimeError):
+                    release.observe_value_capability(self.repo, self.executable, tools, native, config)
+        ghostscript = Path(native["ghostscript"]["path"])
+        original_ghostscript = ghostscript.read_bytes()
+        def tamper_ghostscript(*_args, **_kwargs):
+            ghostscript.write_bytes(original_ghostscript + b"# changed during doctor\n")
+            return json.dumps(doctor)
+        with patch.object(release, "run", side_effect=tamper_ghostscript):
+            with self.assertRaisesRegex(RuntimeError, "Ghostscript"):
+                release.observe_value_capability(self.repo, self.executable, tools, native, config)
+        ghostscript.write_bytes(original_ghostscript)
+        with patch.object(release, "run", return_value=json.dumps(doctor)):
+            provider.write_text("changed provider after observation")
+            with self.assertRaisesRegex(RuntimeError, "freshly built native module"):
+                release.observe_value_capability(self.repo, self.executable, tools, native, config)
+
+    def test_doctor_rejects_implicit_qualified_or_configured_legacy_selection(self):
+        with patch.object(release, "run") as runner:
+            for profile, config in ((release.NATIVE_QUALIFIED_PROFILE, None),
+                                    (release.NATIVE_REQUIRED_PROFILE, self.root / "explicit.json")):
+                with self.subTest(profile=profile), self.assertRaisesRegex(RuntimeError, "explicit startup configuration"):
+                    release.observe_value_capability(self.repo, self.executable, {}, {"adapter_profile": profile}, config)
+        runner.assert_not_called()
 
     def launch(self, bundle=None, args=(), project=None):
         capture = self.root / "captured-arguments"
@@ -619,6 +1402,13 @@ class PackageTests(unittest.TestCase):
         relative = os.path.relpath(project, Path.cwd())
         values = self.launch(args=("--cwd", relative, "chosen.m"))
         self.assertEqual(values, [str(project), "--cwd", str(project), "chosen.m"])
+        config = self.root / "explicit startup Ω.json"
+        config.write_text("{}\n")
+        for index, args in enumerate((("--startup-config", str(config)), ("--startup-config=" + str(config),))):
+            startup_project = self.root / ("startup-only project " + str(index))
+            values = self.launch(args=args, project=startup_project)
+            self.assertEqual(values, [str(startup_project), "--cwd", str(startup_project), "--open",
+                                      str(startup_project / "getting_started.m"), *args])
 
     def test_removed_executable_permission_is_rejected(self):
         self.assemble()

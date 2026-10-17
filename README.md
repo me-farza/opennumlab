@@ -4,21 +4,26 @@
 
 <img src="assets/opennumlab-logo.png" alt="OpenNumLab: a golden lamp releasing a blue mathematical surface" width="480">
 
-OpenNumLab is an open-source, **Rust-based scientific desktop and command-line application with GNU Octave as its execution engine**. It is an early alpha intended to grow into a familiar environment for MATLAB users. The desktop, session management, and CLI are written in Rust; GNU Octave and its numerical dependencies are not Rust implementations.
+OpenNumLab is an open-source scientific desktop and CLI, preparing its first **v0.1.0-alpha development preview**. The application is written in Rust and uses a separately installed GNU Octave process for its main language and numerical execution. An experimental Rust arithmetic backend is available explicitly in the CLI.
 
-The project was previously called NumJinn and Open MathLab. Existing `mathlab` commands, `mathlab-*` crates and `MATHLAB_*` environment variables remain stable during this display-name change. Development uses the private [me-farza/opennumlab repository](https://github.com/me-farza/opennumlab).
+The long-term goal is a Rust-native scientific environment with MATLAB-compatible code, files and familiar workflows. This alpha delivers a tested subset; complete MATLAB/Simulink coverage, identical interface behavior and a performance advantage remain goals requiring separate evidence. See the [alpha notes and known gaps](docs/release/V0.1.0_ALPHA.md) before trying it on a project.
 
-This repository implements the first integrated foundation. It does **not** provide the complete MATLAB/Simulink ecosystem, establish exact MATLAB compatibility, or demonstrate a speed advantage over MATLAB. GNU Octave describes its language as mostly compatible with MATLAB; compatibility still needs to be assessed per project and API variant. [GNU Octave](https://octave.org/about)
+The project was previously called NumJinn and Open MathLab. Existing `mathlab` commands, `mathlab-*` crates and `MATHLAB_*` environment variables retain their current names. The project repository is [me-farza/opennumlab](https://github.com/me-farza/opennumlab). The recipes below build from source; they do not imply an available or qualified binary download.
 
 ## Start it
 
-Install a stable Rust toolchain, GNU Octave, and a graphics toolkit. On macOS with Homebrew:
+Start from a source checkout with its `Cargo.lock`. Use a Rust toolchain compatible with the locked dependencies (workspace minimum: 1.88), a platform compiler/linker, GNU Octave, and a graphics toolkit. The macOS app target currently being qualified is Apple silicon; Linux source builds need the system libraries listed by `scripts/setup.sh`. Native Windows engine startup remains unsupported.
+
+On macOS with an existing Homebrew installation and Rust toolchain:
 
 ```sh
 brew install octave gnuplot
-cargo run -p mathlab-cli -- doctor
-cargo run -p mathlab-desktop
+cargo build --locked -j1 -p mathlab-cli -p mathlab-desktop
+cargo run --locked -j1 -p mathlab-cli -- doctor
+cargo run --locked -j1 -p mathlab-desktop
 ```
+
+Cargo may download the locked Rust dependencies. GNU Octave, gnuplot/fonts, optional scientific packages and the platform SDK are external prerequisites. For an extracted source archive, follow the [Git-free build recipe](docs/release/SOURCE_ARCHIVE.md#ordinary-builds-after-extraction); app packaging requires a clean committed Git checkout.
 
 Run `./scripts/setup.sh` for platform guidance. That script prints commands and reports installed tools; it does not install anything. On Linux, the desktop also needs the development libraries listed by the script. The application finds `octave-cli` or `octave` on `PATH`, recognizes common Homebrew locations, or uses `MATHLAB_OCTAVE=/absolute/path/to/octave-cli`.
 
@@ -30,7 +35,9 @@ cargo run -p mathlab-desktop -- --open examples/getting_started.m
 
 ## Familiar workflow
 
-The desktop uses the names and arrangement familiar to MATLAB users: Current Folder, Editor, Command Window, Workspace, Command History, and Figures. Write MATLAB/Octave source in the Editor, run it in one persistent Octave session, inspect and edit matrix pages in the Variable Editor, and use the Command Window to continue working with the same variables. Numeric and logical 2-D values, including sparse matrices, support class-preserving scalar edits. Other supported containers have bounded read-only previews. **Apps → Packages** opens the installed package list with versions, descriptions, and a Load button; packages loaded there become available in that desktop session.
+The desktop uses familiar panel roles: Current Folder, Editor, Command Window, Workspace, Command History, and Figures. Write MATLAB/Octave source in the Editor, run it in one persistent Octave session, inspect and edit matrix pages in the Variable Editor, and use the Command Window to continue working with the same variables. Numeric and logical 2-D values, including sparse matrices, support class-preserving scalar edits. Other supported containers have bounded read-only previews. **Apps → Packages** opens the installed package list with versions, descriptions, and a Load button; packages loaded there become available in that desktop session.
+
+These are current application bindings. Complete MATLAB shortcut, focus, dialog and layout compatibility remains under validation.
 
 | Action | Shortcut |
 | --- | --- |
@@ -38,7 +45,7 @@ The desktop uses the names and arrangement familiar to MATLAB users: Current Fol
 | Toggle breakpoint while idle | F12 or click the line gutter |
 | Step / step in / step out | F10 / F11 / Shift+F11 |
 | Quit debugging | Shift+F5 |
-| Run current `%%` section | Ctrl+Enter |
+| Run current `%%` section | Ctrl+Enter (Cmd+Enter on macOS) |
 | Run selection | F9 |
 | Find / replace | Ctrl+F / Ctrl+H (Cmd on macOS) |
 | Go to line | Ctrl+G (Cmd+G on macOS) |
@@ -74,6 +81,14 @@ cargo run -p mathlab-cli -- doctor --json
 ```
 
 The CLI supports `--octave PATH`, `--directory DIRECTORY`, `--json`, and `--timeout SECONDS`. Compatibility checks have a 30 second deadline per fixture by default. `eval` and `run` each create a new session. `repl` keeps variables between commands and supports `:workspace`, `:clear`, `:restart`, `:cd PATH`, `:run FILE`, and `:quit`; execution deadlines also apply to REPL evaluations. With the input adapter enabled, one stdin reader routes lines to active input requests or REPL commands, preserving empty lines and whitespace. Terminal replies use terminal echo; piped replies use native echo. Human-readable commands stream raw console bytes; JSON execution returns the bounded aggregate with truncation and decoding-loss fields. JSON REPL emits records without prompts or a banner, and input replies still come from stdin. `packages --load NAME` verifies that an installed package can be loaded in that command's session; packages loaded there do not persist into a separate `eval` or `run` process. Figures from CLI execution are preserved in `.mathlab/figures/` inside the selected working directory.
+
+### Experimental Rust arithmetic
+
+```sh
+cargo run --locked -j1 -p mathlab-cli -- eval --backend rust '[1,2;3,4]*[1;2]' --json
+```
+
+This explicit, bounded route evaluates real double arrays with literals, parentheses, unary signs, `+`, `-`, `*`, `.*`, `./` and `.'`. It returns typed shape and binary64 data in JSON and reports unsupported input without an Octave fallback. It is one-shot: assignments, persistent Rust CLI sessions, functions, scripts and general MATLAB syntax are not enabled by this release scope. The Rust session and discrete-accumulator simulation libraries are experimental APIs; they do not replace the default desktop/REPL engine or provide a Simulink environment.
 
 ## Try the examples
 
@@ -111,7 +126,9 @@ Prepared breakpoints use Octave's public breakpoint table through aliases in the
 ./scripts/verify.sh --require-octave --with-toolboxes --with-debugger
 ```
 
-The script checks formatting, builds/tests the Rust workspace, and runs original Octave fixtures for array semantics, functions/classes/closures, dense/sparse linear algebra, FFT, declared MAT types, and SVG figure export. It also runs fixtures through the Rust adapter, including prepared local functions. Without a runtime, the default script explicitly skips Octave checks; `--require-octave` makes absence a failure. `--with-control` requires the optional control package. `--with-toolboxes` additionally checks signal filtering, control responses, binary image connectivity/morphology, normal-distribution values/regression, and least-squares fitting using the optional scientific profile. `--with-debugger` builds the optional native Octave adapter with `mkoctfile` and runs real paused-scope debugger proofs. CI installs Octave, gnuplot, fonts, and the scientific packages available from Ubuntu before running its checks. CI runtime/package versions can differ from the local development installation and remain visible in the logs.
+Set `CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1` when running these checks on a development machine. An available Octave runtime requires its matching `mkoctfile`, development headers and C++ compiler: the script builds the exact-value adapter before workspace tests. `--with-debugger` builds the additional adapters. A runtime/SDK mismatch fails explicitly.
+
+The script checks formatting, builds/tests the Rust workspace, and runs original Octave fixtures for array semantics, functions/classes/closures, dense/sparse linear algebra, FFT, declared MAT types, and SVG figure export. It also runs fixtures through the Rust adapter, including prepared local functions. Without a runtime, the default script explicitly skips Octave checks; `--require-octave` makes absence a failure. `--with-control` requires the optional control package. `--with-toolboxes` additionally checks signal filtering, control responses, binary image connectivity/morphology, normal-distribution values/regression, and least-squares fitting using the optional scientific profile. `--with-debugger` builds the optional native Octave adapter with `mkoctfile` and runs real paused-scope debugger proofs. The CI configuration defines its runtime/package checks; the results of the selected release revision must be read separately. Local passing checks do not establish hosted CI or installed-app acceptance.
 
 [Compatibility manifests](compatibility/README.md) list the exact smoke-test scope. A passing fixture is evidence for its checked behavior on that runtime; it is not a percentage of MATLAB support. The [selected three-route conformance cases](compatibility/conformance/README.md) distinguish fresh MATLAB execution, saved reference replay, raw Octave and the actual application. Missing reference evidence remains explicit; the separate MATLAB investigation does not automatically qualify application behavior.
 
@@ -130,7 +147,7 @@ Use `./scripts/package-macos.sh --with-debugger` to include all four native adap
 
 ## Architecture and next steps
 
-The Cargo workspace separates `mathlab-engine` (Octave process protocol and persistent session), `mathlab-language` (script-local function preparation and source mapping), `mathlab-debugger` (typed debugger transport), `mathlab-cli` (batch/REPL/diagnostics/conformance commands), and `mathlab-desktop` (native Rust UI). `octave/mathlab_worker.m` runs user source in the Octave base workspace and returns output, errors, workspace metadata, and exported figures. The optional native debugger adapter uses Octave's public event and breakpoint APIs; it must be built for the selected runtime ABI. See [native debugger development](native/README.md).
+The Cargo workspace separates `mathlab-engine` (Octave process protocol and sessions, plus the opt-in Rust session API), `mathlab-language` (source preparation and bounded Rust expression parsing), `mathlab-array` (Rust array arithmetic), `mathlab-simulation` (experimental discrete accumulators), `mathlab-debugger` (typed debugger transport), `mathlab-cli` (batch/REPL/diagnostics/conformance commands), and `mathlab-desktop` (native Rust UI). `octave/mathlab_worker.m` runs user source in the Octave base workspace and returns output, errors, workspace metadata, and exported figures. The optional native debugger adapter uses Octave's public event and breakpoint APIs; it must be built for the selected runtime ABI. See [native debugger development](native/README.md).
 
 The [kernel readiness audit](docs/KERNEL_READINESS.md) describes the checked session contract and the remaining compatibility, resource-accounting and performance work. The [console contract](docs/CONSOLE_PROTOCOL.md) explains output bounds, interruption fences, and frontend completion barriers.
 
@@ -140,5 +157,7 @@ The next stages are robust debugger workflows, interactive graphics, modern MATL
 - [Development plan](DEVELOPMENT_PLAN.md)
 - [Functionality catalog](FUNCTIONALITY_CATALOG.md)
 - [Integration strategy](INTEGRATION_STRATEGY.md)
+
+Contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md) for the architecture, focused checks, bug reports and useful first contributions.
 
 The application and original examples/fixtures are licensed under **GPL-3.0-or-later**; see [LICENSE](LICENSE). Third-party components retain their own licenses and notices; see [THIRD_PARTY.md](THIRD_PARTY.md). This is an independent project and is not affiliated with MathWorks. MATLAB and Simulink names describe intended interoperability.

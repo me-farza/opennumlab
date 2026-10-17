@@ -5,10 +5,22 @@
 #[cfg(all(test, unix))]
 mod cancellation_boundary_tests;
 mod console;
+pub mod graphics;
 mod input;
 mod protocol;
+mod qualified_ready;
+pub mod rust_session;
+pub mod startup_config;
+mod trusted_startup;
+mod trusted_worker;
+pub use trusted_startup::{AdapterConfig, AdapterRole, PinnedFile, TrustedStartupConfig};
+use trusted_startup::{AdmittedStartup, PreparedStartup, WorkerArguments};
 #[cfg(test)]
 mod protocol_startup_tests;
+#[cfg(all(test, unix))]
+mod qualified_ready_tests;
+#[cfg(all(test, unix))]
+mod trusted_startup_runtime_tests;
 #[cfg(all(test, unix))]
 mod value_bridge_recovery_tests;
 pub mod value_edit;
@@ -21,6 +33,8 @@ mod value_edit_submission_tests;
 #[cfg(all(test, unix))]
 mod value_edit_worker_tests;
 mod value_page;
+#[cfg(test)]
+mod wire_path_tests;
 use console::{ConsoleCapture, ConsoleHub, ConsoleTransport, MergedPipe, TransportEvent};
 pub use console::{ConsoleEvent, ConsoleEventKind, ConsoleSubscription};
 use input::InputHub;
@@ -31,6 +45,11 @@ pub use input::{
 pub use protocol::{
     BindingToken, BoundVariable, BoundVariableSlice, MutationReceipt, SessionContext,
     WorkerCapabilities, WorkerLimits, WorkspaceSnapshot,
+};
+use qualified_ready::QualifiedReadyProfile;
+pub use qualified_ready::{
+    AdapterReady, IntrinsicsReady, QUALIFIED_GRAPHICS_STARTUP_PROFILE, QUALIFIED_STARTUP_PROFILE,
+    QualifiedStartupStatus,
 };
 pub use value_page::{
     DecimalU64, NumericClass, NumericComponents, PageData, PageSelection, PageWindow,
@@ -109,6 +128,11 @@ pub enum Error {
     Io(io::Error),
     Json(serde_json::Error),
     Protocol(String),
+    /// A caller or resolved path cannot cross the exact UTF-8 JSON boundary.
+    NonUtf8Path {
+        role: &'static str,
+        path: PathBuf,
+    },
     Worker(EngineError),
     ProcessExited(String),
     Timeout,
@@ -122,6 +146,11 @@ impl fmt::Display for Error {
         match self {
             Self::Io(error) => write!(formatter, "{error}"),
             Self::Json(error) => write!(formatter, "Invalid engine response: {error}"),
+            Self::NonUtf8Path { role, path } => write!(
+                formatter,
+                "The {role} cannot be represented as an exact UTF-8 JSON path: {}",
+                path.display()
+            ),
             Self::Protocol(message) | Self::LimitExceeded(message) => formatter.write_str(message),
             Self::Worker(error) => write!(formatter, "{}", error.message),
             Self::ProcessExited(details) => write!(formatter, "Octave process exited. {details}"),
@@ -397,6 +426,11 @@ pub struct Engine {
     console_helper: PathBuf,
     version: String,
     capabilities: Option<WorkerCapabilities>,
+    // Set before spawn only by explicit qualified construction; ordinary
+    // startup carries no admitted profile or accepted Ready context.
+    trusted_startup: Option<PreparedStartup>,
+    qualified_ready_profile: Option<QualifiedReadyProfile>,
+    qualified_ready_context: Option<SessionContext>,
     prepared_sources: Vec<PreparedSource>,
     active_sources: BTreeMap<PathBuf, PathBuf>,
     next_preparation_id: u64,
@@ -413,7 +447,39 @@ impl Engine {
         Self::start_with_worker(config, WORKER)
     }
 
+    /// Start an explicit caller-pinned startup profile: `qualified-core-v2`, or
+    /// `qualified-graphics-v2` when a graphics adapter is selected.
+    /// The ordinary constructor and launcher keep their existing behavior.
+    /// Admitted adapters must be enabled before numerical user execution.
+    pub fn start_qualified(
+        working_directory: PathBuf,
+        startup: TrustedStartupConfig,
+    ) -> Result<Self> {
+        wire_path(&working_directory, "qualified initial working directory")?;
+        if !working_directory.is_absolute() {
+            return Err(Error::Protocol(
+                "Qualified working directory must be absolute".into(),
+            ));
+        }
+        let working_directory =
+            canonical_wire_path(&working_directory, "qualified initial working directory")?;
+        let startup = startup.admit()?;
+        let config = EngineConfig {
+            executable: startup.executable().to_owned(),
+            working_directory,
+        };
+        Self::start_with_profile(config, WORKER, Some(startup))
+    }
+
     fn start_with_worker(config: EngineConfig, worker: &str) -> Result<Self> {
+        Self::start_with_profile(config, worker, None)
+    }
+
+    fn start_with_profile(
+        config: EngineConfig,
+        worker: &str,
+        startup: Option<AdmittedStartup>,
+    ) -> Result<Self> {
         if cfg!(windows) {
             return Err(Error::Protocol(
                 "The ordered console worker launcher currently requires a Unix shell. Windows session launch is not yet supported.".into(),
@@ -425,20 +491,63 @@ impl Engine {
                 config.working_directory.display()
             )));
         }
-        let session = tempfile::Builder::new()
-            .prefix("mathlab-session-")
-            .tempdir()?;
-        let worker =
-            format!("{worker}\n{VALUE_PAGE_WORKER}\n{VALUE_EDIT_WORKER}\n{READY_JSON_WORKER}");
+        let mut session_builder = tempfile::Builder::new();
+        session_builder.prefix("mathlab-session-");
+        #[cfg(unix)]
+        if startup.is_some() {
+            use std::os::unix::fs::PermissionsExt;
+            session_builder.permissions(fs::Permissions::from_mode(0o700));
+        }
+        let session = session_builder.tempdir()?;
+        let (worker, registry_source) = if let Some(admitted) = startup.as_ref() {
+            // Verify the current ordinary sources before selecting their reviewed
+            // callback-routed variant; stale copies must not hide source drift.
+            if worker != include_str!("trusted_worker/legacy_worker.m")
+                || VALUE_PAGE_WORKER != include_str!("trusted_worker/legacy_value_page.m")
+            {
+                return Err(Error::Protocol("The current worker/page baseline changed; requalify the complete owned closure".into()));
+            }
+            let graphics = admitted.has_adapter(AdapterRole::Graphics);
+            let program = trusted_worker::qualify_worker_source(
+                trusted_worker::OwnedWorkerParts {
+                    worker: if graphics {
+                        include_str!("trusted_worker/inputs/mathlab_worker_graphics.m")
+                    } else {
+                        include_str!("trusted_worker/inputs/mathlab_worker.m")
+                    },
+                    value_page: include_str!("trusted_worker/inputs/mathlab_value_page.m"),
+                    value_edit: VALUE_EDIT_WORKER,
+                    ready_json: READY_JSON_WORKER,
+                },
+                graphics.then_some(include_str!(
+                    "trusted_worker/inputs/mathlab_graphics_service.m"
+                )),
+            )?;
+            if program.required_primitives != admitted.required_primitives() {
+                return Err(Error::Protocol(
+                    "Worker and native bootstrap primitive manifests differ".into(),
+                ));
+            }
+            (program.source, program.registry_source)
+        } else {
+            (
+                format!("{worker}\n{VALUE_PAGE_WORKER}\n{VALUE_EDIT_WORKER}\n{READY_JSON_WORKER}"),
+                SCOPE_REGISTRY,
+            )
+        };
         fs::write(session.path().join("mathlab_worker.m"), worker)?;
         fs::create_dir(session.path().join("registry"))?;
         fs::write(
             session.path().join("registry/mathlab_scope_register.m"),
-            SCOPE_REGISTRY,
+            registry_source,
         )?;
         fs::create_dir_all(session.path().join("cache"))?;
         let console_helper = console::write_fence_helper(session.path())?;
         let input = InputHub::new(session.path())?;
+        let trusted_startup = startup
+            .map(|admitted| admitted.prepare(session.path()))
+            .transpose()?;
+        let qualified_ready_profile = trusted_startup.as_ref().map(PreparedStartup::ready_profile);
         let mut engine = Self {
             config,
             session,
@@ -460,6 +569,9 @@ impl Engine {
             console_helper,
             version: String::new(),
             capabilities: None,
+            trusted_startup,
+            qualified_ready_profile,
+            qualified_ready_context: None,
             prepared_sources: Vec::new(),
             active_sources: BTreeMap::new(),
             next_preparation_id: 1,
@@ -471,14 +583,16 @@ impl Engine {
             edit_history_uncertain: false,
         };
         engine.spawn()?;
-        if let Some(scope_bridge) = std::env::var_os("MATHLAB_SCOPE_BRIDGE") {
-            engine.enable_scope_bridge(Path::new(&scope_bridge))?;
-        }
-        if let Some(input_bridge) = std::env::var_os("MATHLAB_INPUT_BRIDGE") {
-            engine.enable_input_adapter(Path::new(&input_bridge))?;
-        }
-        if let Some(value_bridge) = std::env::var_os("MATHLAB_VALUE_BRIDGE") {
-            engine.enable_value_bridge(Path::new(&value_bridge))?;
+        if engine.trusted_startup.is_none() {
+            if let Some(scope_bridge) = std::env::var_os("MATHLAB_SCOPE_BRIDGE") {
+                engine.enable_scope_bridge(Path::new(&scope_bridge))?;
+            }
+            if let Some(input_bridge) = std::env::var_os("MATHLAB_INPUT_BRIDGE") {
+                engine.enable_input_adapter(Path::new(&input_bridge))?;
+            }
+            if let Some(value_bridge) = std::env::var_os("MATHLAB_VALUE_BRIDGE") {
+                engine.enable_value_bridge(Path::new(&value_bridge))?;
+            }
         }
         Ok(engine)
     }
@@ -487,15 +601,46 @@ impl Engine {
         &self.version
     }
 
-    /// Negotiated ordinary-worker capabilities. Native adapters have separate
-    /// version/ABI checks and are not implied by this handshake.
+    /// Return the identity accepted by the latest qualified Ready, while that
+    /// invocation still owns the open transport. Configuration alone does not
+    /// produce this observation; retirement, stale context and ordinary startup
+    /// return `None`. This is startup admission, not full product qualification.
+    pub fn qualified_startup_status(&self) -> Option<QualifiedStartupStatus> {
+        let profile = self.qualified_ready_profile.as_ref()?;
+        let context = self.qualified_ready_context.as_ref()?;
+        self.validate_context(context).ok()?;
+        Some(profile.accepted_status(context.clone()))
+    }
+
+    /// Last accepted protocol identity/limits for diagnostics. A qualified close
+    /// clears every capability; before acceptance this returns an inert snapshot.
+    /// Use require_capability for live authority, including transport state.
     pub fn capabilities(&self) -> &WorkerCapabilities {
-        self.capabilities
-            .as_ref()
-            .expect("Engine startup validated capabilities")
+        static EMPTY: std::sync::OnceLock<WorkerCapabilities> = std::sync::OnceLock::new();
+        self.capabilities.as_ref().unwrap_or_else(|| {
+            EMPTY.get_or_init(|| WorkerCapabilities {
+                name: String::new(),
+                version: 0,
+                capabilities: Vec::new(),
+                limits: WorkerLimits {
+                    variable_cells: 0,
+                    response_bytes: 0,
+                },
+            })
+        })
     }
 
     pub fn require_capability(&self, name: &str) -> Result<()> {
+        if !self.is_transport_open() {
+            return Err(Error::Protocol(format!(
+                "Engine transport is closed; capability {name} is unavailable. Restart the session."
+            )));
+        }
+        if self.qualified_ready_profile.is_some() && self.qualified_ready_context.is_none() {
+            return Err(Error::Protocol(
+                "Qualified worker has no accepted live Ready context".into(),
+            ));
+        }
         self.capabilities().require(name)
     }
 
@@ -549,7 +694,10 @@ impl Engine {
     /// Previously captured @input handles retain their old builtin, so late
     /// activation is rejected until the numerical process has been restarted.
     pub fn enable_input_adapter(&mut self, bridge_path: &Path) -> Result<InputHandle> {
-        let bridge_path = fs::canonicalize(bridge_path)?;
+        let bridge_path = canonical_wire_path(bridge_path, "input adapter path")?;
+        if let Some(startup) = &self.trusted_startup {
+            startup.validate_adapter_path(AdapterRole::Input, &bridge_path)?;
+        }
         if !bridge_path.is_file()
             || bridge_path
                 .extension()
@@ -584,6 +732,7 @@ impl Engine {
     }
 
     fn install_input_adapter(&mut self, bridge_path: &Path) -> Result<()> {
+        let bridge_path = wire_path(bridge_path, "input adapter path")?;
         self.request(
             json!({"command":"enable_input_bridge","bridge_path":bridge_path}),
             Some(COMMAND_TIMEOUT),
@@ -594,7 +743,10 @@ impl Engine {
     /// Install an optional debugger adapter compiled for this Octave runtime ABI.
     /// A clone can inspect/control pauses while execute blocks on another thread.
     pub fn enable_debugger(&mut self, bridge_path: &Path) -> Result<Debugger> {
-        let bridge_path = fs::canonicalize(bridge_path)?;
+        let bridge_path = canonical_wire_path(bridge_path, "debugger adapter path")?;
+        if let Some(startup) = &self.trusted_startup {
+            startup.validate_adapter_path(AdapterRole::Debug, &bridge_path)?;
+        }
         if !bridge_path.is_file()
             || bridge_path
                 .extension()
@@ -631,7 +783,10 @@ impl Engine {
     /// Enable optional Octave per-file bindings for retained script-local scopes.
     /// The adapter must implement protocol mathlab-scope version 2 for this ABI.
     pub fn enable_scope_bridge(&mut self, bridge_path: &Path) -> Result<()> {
-        let bridge_path = fs::canonicalize(bridge_path)?;
+        let bridge_path = canonical_wire_path(bridge_path, "scope adapter path")?;
+        if let Some(startup) = &self.trusted_startup {
+            startup.validate_adapter_path(AdapterRole::Scope, &bridge_path)?;
+        }
         if !bridge_path.is_file()
             || bridge_path
                 .extension()
@@ -659,6 +814,7 @@ impl Engine {
     }
 
     fn install_scope_bridge(&mut self, bridge_path: &Path) -> Result<()> {
+        let bridge_path = wire_path(bridge_path, "scope adapter path")?;
         self.request(
             json!({"command":"enable_scope_bridge","bridge_path":bridge_path}),
             Some(COMMAND_TIMEOUT),
@@ -669,7 +825,10 @@ impl Engine {
     /// Enable optional exact dense-complex component access for this Octave ABI.
     /// The adapter is a narrow native helper, not a Rust numerical evaluator.
     pub fn enable_value_bridge(&mut self, bridge_path: &Path) -> Result<()> {
-        let bridge_path = fs::canonicalize(bridge_path)?;
+        let bridge_path = canonical_wire_path(bridge_path, "value adapter path")?;
+        if let Some(startup) = &self.trusted_startup {
+            startup.validate_adapter_path(AdapterRole::Value, &bridge_path)?;
+        }
         if !bridge_path.is_file()
             || bridge_path
                 .extension()
@@ -709,6 +868,7 @@ impl Engine {
     }
 
     fn install_value_bridge(&mut self, bridge_path: &Path) -> Result<()> {
+        let bridge_path = wire_path(bridge_path, "value adapter path")?;
         let (ready, _) = self.request(
             json!({"command":"enable_value_bridge","bridge_path":bridge_path}),
             Some(COMMAND_TIMEOUT),
@@ -720,12 +880,14 @@ impl Engine {
     }
 
     fn install_debugger(&mut self, bridge_path: &Path) -> Result<()> {
+        let bridge_path = wire_path(bridge_path, "debugger adapter path")?;
         let directory = tempfile::Builder::new()
             .prefix("debugger-")
             .tempdir_in(self.session.path())?;
+        let debug_directory = wire_path(directory.path(), "debugger session directory")?;
         self.request(
             json!({"command":"enable_debugger","bridge_path":bridge_path,
-                            "debug_directory":directory.path()}),
+                            "debug_directory":debug_directory}),
             Some(COMMAND_TIMEOUT),
         )?;
         self.debugger = Some(Debugger::new(directory.path()));
@@ -824,6 +986,7 @@ impl Engine {
                 "Editor source exceeds the 8 MiB execution limit.".into(),
             ));
         }
+        wire_path(path, "source path")?;
         let candidate = if path.is_absolute() {
             path.to_owned()
         } else {
@@ -840,10 +1003,12 @@ impl Engine {
                 .ok_or_else(|| Error::Protocol("Editor path has no directory.".into()))?;
             fs::canonicalize(parent)?.join(filename)
         };
+        wire_path(&path, "resolved source path")?;
         Ok(path)
     }
 
     fn prepare_source_request(&mut self, source: &str, path: &Path, buffer: bool) -> Result<Value> {
+        let path_text = wire_path(path, "source path")?;
         if let Some(cached) = self.prepared_sources.iter().find(|cached| {
             cached.original_path == path
                 && cached.original_source == source
@@ -851,7 +1016,7 @@ impl Engine {
                     || !cached.local_functions.is_empty()
                     || (self.debugger.is_some() && cached.source_kind == SourceKind::Script))
         }) {
-            let request = prepared_request(cached, self.debugger.is_some());
+            let request = prepared_request(cached, self.debugger.is_some())?;
             let current_scope = cached.materialized.script_path.clone();
             let index = self
                 .prepared_sources
@@ -889,15 +1054,17 @@ impl Engine {
                 .map_err(|error| Error::Protocol(error.to_string()))?
                 == SourceKind::Script;
         if !buffer && !prepared.is_transformed() && !debug_script {
+            let request = json!({"command":"run_file","path":path_text});
             self.active_sources.insert(path.to_owned(), path.to_owned());
             self.register_direct_debug_source(path)?;
-            return Ok(json!({"command":"run_file","path":path}));
+            return Ok(request);
         }
         let directory = self
             .session
             .path()
             .join("prepared")
             .join(format!("generation-{}", self.next_preparation_id));
+        wire_path(&directory, "prepared source directory")?;
         self.next_preparation_id += 1;
         let materialized = prepared.write_to(&directory)?;
         let snapshot_path = directory.join("original.mlsnapshot");
@@ -931,7 +1098,7 @@ impl Engine {
         } else {
             None
         };
-        self.prepared_sources.push(PreparedSource {
+        let prepared_source = PreparedSource {
             original_path: path.to_owned(),
             original_source: source.to_owned(),
             materialized,
@@ -949,7 +1116,9 @@ impl Engine {
                     end_line: function.span.end_line,
                 })
                 .collect(),
-        });
+        };
+        let request = prepared_request(&prepared_source, self.debugger.is_some())?;
+        self.prepared_sources.push(prepared_source);
         self.active_sources.insert(
             path.to_owned(),
             self.prepared_sources
@@ -960,10 +1129,7 @@ impl Engine {
                 .clone(),
         );
         self.register_debug_source(self.prepared_sources.len() - 1)?;
-        Ok(prepared_request(
-            self.prepared_sources.last().expect("prepared source"),
-            self.debugger.is_some(),
-        ))
+        Ok(request)
     }
 
     fn register_debug_source(&self, index: usize) -> Result<()> {
@@ -1309,14 +1475,14 @@ impl Engine {
     }
 
     fn ensure_value_edit_certain(&self) -> Result<()> {
-        self.require_capability(value_edit::CAP_ATOMIC_RANGE_EDIT)?;
+        // A submitted ambiguity survives capability retirement on close.
         if self.edit_history_uncertain {
             return Err(value_edit::EditError::UncertainCommit(
                 "explicitly reset edit history or restart before another write/undo/redo".into(),
             )
             .into());
         }
-        Ok(())
+        self.require_capability(value_edit::CAP_ATOMIC_RANGE_EDIT)
     }
 
     fn submit_value_edit(
@@ -1480,6 +1646,17 @@ impl Engine {
     }
 
     fn validate_context(&self, context: &SessionContext) -> Result<()> {
+        if !self.is_transport_open()
+            || (self.qualified_ready_profile.is_some() && self.qualified_ready_context.is_none())
+        {
+            return Err(Error::Protocol(
+                "Worker context is no longer live; restart the session.".into(),
+            ));
+        }
+        self.validate_context_identity(context)
+    }
+
+    fn validate_context_identity(&self, context: &SessionContext) -> Result<()> {
         if context.worker_id != self.response_prefix
             || context.generation != self.generation
             || context.invocation != self.invocation
@@ -1547,6 +1724,7 @@ impl Engine {
 
     pub fn set_directory(&mut self, path: &Path) -> Result<()> {
         let path = self.resolve_session_path(path)?;
+        let path = wire_path(&path, "working directory")?;
         let (value, _) = self.request(
             json!({"command": "set_directory", "path": path}),
             Some(COMMAND_TIMEOUT),
@@ -1594,15 +1772,56 @@ impl Engine {
     }
 
     fn resolve_session_path(&self, path: &Path) -> Result<PathBuf> {
+        wire_path(path, "session path")?;
         let candidate = if path.is_absolute() {
             path.to_owned()
         } else {
             self.config.working_directory.join(path)
         };
-        Ok(fs::canonicalize(candidate)?)
+        canonical_wire_path(&candidate, "resolved session path")
     }
 
     fn spawn(&mut self) -> Result<()> {
+        let result = self.spawn_inner();
+        if result.is_err() && self.trusted_startup.is_some() {
+            // Any configured startup/reenable failure retires the entire selected
+            // process. stop() is owned-child-only and keeps edit uncertainty.
+            self.stop();
+        }
+        result
+    }
+
+    fn trusted_worker_arguments(&self, announce_ready: bool) -> WorkerArguments<'_> {
+        WorkerArguments {
+            announce_ready,
+            debugger_enabled: !announce_ready && self.debugger.is_some(),
+            response_prefix: &self.response_prefix,
+            generation: self.generation,
+            console_helper: &self.console_helper,
+            invocation: self.invocation,
+            // A new child has prebound code, not installed features. The existing
+            // post-Ready install sequence restores configured features. Same-PID
+            // recovery passes only the features already installed in that child.
+            scope_bridge: if announce_ready {
+                None
+            } else {
+                self.scope_bridge.as_deref()
+            },
+            input_bridge: if announce_ready {
+                None
+            } else {
+                self.input_bridge.as_deref()
+            },
+            value_bridge: if announce_ready {
+                None
+            } else {
+                self.value_bridge.as_deref()
+            },
+        }
+    }
+
+    fn spawn_inner(&mut self) -> Result<()> {
+        self.retire_qualified_ready();
         self.retire_value_bridge_capability();
         let _ = fs::remove_file(self.session.path().join("request.json"));
         let _ = fs::remove_file(self.session.path().join("request.tmp"));
@@ -1628,25 +1847,39 @@ impl Engine {
         let session_path = octave_string(&fs::canonicalize(self.session.path())?)?;
         let nonce = octave_string(Path::new(&self.response_prefix))?;
         let helper_path = octave_string(&self.console_helper)?;
-        let startup = format!(
-            "addpath ({session_path}); mathlab_worker ({session_path}, true, false, '', {nonce}, {}, {helper_path}, {});",
-            self.generation, self.invocation
-        );
+        let startup = if let Some(prepared) = &self.trusted_startup {
+            prepared.startup_expression(
+                self.trusted_worker_arguments(true),
+                &self.config.working_directory,
+            )?
+        } else {
+            format!(
+                "addpath ({session_path}); mathlab_worker ({session_path}, true, false, '', {nonce}, {}, {helper_path}, {});",
+                self.generation, self.invocation
+            )
+        };
         let pipe = MergedPipe::new()?;
-        let child = Command::new(&self.config.executable)
-            .args([
-                "--quiet",
-                "--no-gui",
-                "--no-history",
-                "--no-init-file",
-                "--no-site-file",
-                "--persist",
-                "--eval",
-                &startup,
-            ])
-            .current_dir(&self.config.working_directory)
-            .env("QT_QPA_PLATFORM", "offscreen")
-            .env("XDG_CACHE_HOME", self.session.path().join("cache"))
+        let mut command = if let Some(prepared) = &self.trusted_startup {
+            prepared.command(&startup)?
+        } else {
+            let mut command = Command::new(&self.config.executable);
+            command
+                .args([
+                    "--quiet",
+                    "--no-gui",
+                    "--no-history",
+                    "--no-init-file",
+                    "--no-site-file",
+                    "--persist",
+                    "--eval",
+                    &startup,
+                ])
+                .current_dir(&self.config.working_directory)
+                .env("QT_QPA_PLATFORM", "offscreen")
+                .env("XDG_CACHE_HOME", self.session.path().join("cache"));
+            command
+        };
+        let child = command
             .stdin(Stdio::piped())
             .stdout(pipe.stdout()?)
             .stderr(pipe.stderr()?)
@@ -1662,7 +1895,13 @@ impl Engine {
             self.console.clone(),
             self.input.clone(),
         )?);
-        let (ready, _) = self.read_response(0, Some(STARTUP_TIMEOUT))?;
+        let (ready, _) = self
+            .read_response(0, Some(STARTUP_TIMEOUT))
+            .inspect_err(|_| {
+                if self.qualified_ready_profile.is_some() {
+                    let _ = self.terminate_transport();
+                }
+            })?;
         self.accept_ready(&ready)?;
         if let Some(bridge_path) = self.debug_bridge.clone() {
             self.install_debugger(&bridge_path)?;
@@ -1680,24 +1919,81 @@ impl Engine {
     }
 
     fn accept_ready(&mut self, ready: &Value) -> Result<()> {
+        // All callers (initial startup, value enable, cancellation ping and
+        // same-PID re-entry) share one parse/commit and rejection boundary.
+        let staged = self.stage_ready(ready);
+        let (capabilities, context, version, working_directory) = match staged {
+            Ok(staged) => staged,
+            Err(error) if self.qualified_ready_profile.is_some() => {
+                let close = self.terminate_transport();
+                let close_details = close.err().map_or_else(String::new, |error| {
+                    format!("; owned-child close reported: {error}")
+                });
+                // Never return a loader-style Worker error here: after request
+                // publication it must pass through the existing uncertainty
+                // wrapper, even when the invalid Ready names a native error.
+                return Err(Error::Protocol(format!(
+                    "Qualified Ready rejected; restart is required: {error}{close_details}"
+                )));
+            }
+            Err(error) => return Err(error),
+        };
+        self.capabilities = Some(capabilities);
+        self.version = version;
+        self.config.working_directory = working_directory;
+        if self.qualified_ready_profile.is_some() {
+            self.qualified_ready_context = Some(context);
+        }
+        Ok(())
+    }
+
+    fn stage_ready(
+        &self,
+        ready: &Value,
+    ) -> Result<(WorkerCapabilities, SessionContext, String, PathBuf)> {
+        if self.qualified_ready_profile.is_some() && !self.is_transport_open() {
+            return Err(Error::Protocol(
+                "Cannot accept Ready on a closed qualified transport".into(),
+            ));
+        }
         let capabilities: WorkerCapabilities = serde_json::from_value(ready["protocol"].clone())?;
         capabilities.validate()?;
         let context: SessionContext = serde_json::from_value(ready["context"].clone())?;
-        self.validate_context(&context)?;
-        self.capabilities = Some(capabilities);
-        self.version = ready
+        self.validate_context_identity(&context)?;
+        let version = ready
             .get("version")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::Protocol("Worker omitted Octave version".into()))?
-            .into();
-        self.config.working_directory = serde_json::from_value(ready["working_directory"].clone())?;
-        Ok(())
+            .to_owned();
+        let working_directory: PathBuf =
+            serde_json::from_value(ready["working_directory"].clone())?;
+        if let Some(profile) = &self.qualified_ready_profile {
+            profile.validate(ready, &version)?;
+            qualified_ready::validate_path(
+                wire_path(&working_directory, "Ready working directory")?.as_str(),
+            )?;
+        }
+        Ok((capabilities, context, version, working_directory))
+    }
+
+    fn retire_qualified_ready(&mut self) {
+        if self.qualified_ready_profile.is_some() {
+            self.qualified_ready_context = None;
+            if let Some(capabilities) = self.capabilities.as_mut() {
+                capabilities.capabilities.clear();
+            }
+        }
     }
 
     fn send_request(&mut self, mut request: Value, active: bool) -> Result<u64> {
         if !self.is_transport_open() {
             return Err(Error::Protocol(
                 "Engine transport is closed; restart the session.".into(),
+            ));
+        }
+        if self.qualified_ready_profile.is_some() && self.qualified_ready_context.is_none() {
+            return Err(Error::Protocol(
+                "Qualified worker has no accepted live Ready context".into(),
             ));
         }
         let id = self.next_id;
@@ -1957,7 +2253,11 @@ impl Engine {
                                 .join(format!("response-{invocation}-{request_id}.json")),
                         );
                     }
-                    self.resume_worker()?;
+                    self.resume_worker().inspect_err(|_| {
+                        if self.qualified_ready_profile.is_some() {
+                            let _ = self.terminate_transport();
+                        }
+                    })?;
                     let (ready, ready_capture) =
                         self.read_response_raw(0, Some(STARTUP_TIMEOUT))?;
                     if !ready.ok {
@@ -2074,6 +2374,15 @@ impl Engine {
     }
 
     fn resume_worker(&mut self) -> Result<()> {
+        let result = self.resume_worker_inner();
+        if result.is_err() && self.trusted_startup.is_some() {
+            self.stop();
+        }
+        result
+    }
+
+    fn resume_worker_inner(&mut self) -> Result<()> {
+        self.retire_qualified_ready();
         self.retire_value_bridge_capability();
         self.invocation += 1;
         self.input
@@ -2104,10 +2413,14 @@ impl Engine {
             .map(octave_string)
             .transpose()?
             .unwrap_or_else(|| "''".into());
-        let command = format!(
-            "addpath ({session_path}); mathlab_worker ({session_path}, false, {enabled}, {scope_path}, {response_prefix}, {}, {helper_path}, {}, {input_path}, {value_path});\n",
-            self.generation, self.invocation
-        );
+        let command = if let Some(prepared) = &self.trusted_startup {
+            prepared.recovery_expression(self.trusted_worker_arguments(false))?
+        } else {
+            format!(
+                "addpath ({session_path}); mathlab_worker ({session_path}, false, {enabled}, {scope_path}, {response_prefix}, {}, {helper_path}, {}, {input_path}, {value_path});\n",
+                self.generation, self.invocation
+            )
+        };
         let mut guard = self
             .child
             .lock()
@@ -2122,6 +2435,16 @@ impl Engine {
     }
 
     fn terminate_transport(&mut self) -> Result<()> {
+        if self.qualified_ready_profile.is_some() {
+            self.retire_qualified_ready();
+            // stop() already kills and waits for this Engine's owned Child,
+            // clears active state, closes input and stops the console reader.
+            // The numerical edit history dies with that child; no operation is
+            // sent to clear user data, and the host uncertainty latch survives.
+            let result = self.cancellation_handle().terminate();
+            self.stop();
+            return result;
+        }
         self.retire_value_bridge_capability();
         self.input.close();
         let result = self.cancellation_handle().terminate();
@@ -2132,6 +2455,7 @@ impl Engine {
     }
 
     fn stop(&mut self) {
+        self.retire_qualified_ready();
         self.input.close();
         self.active.store(false, Ordering::Release);
         if let Ok(mut guard) = self.child.lock()
@@ -2152,13 +2476,26 @@ impl Drop for Engine {
     }
 }
 
-fn prepared_request(source: &PreparedSource, debugger_enabled: bool) -> Value {
-    let mut request = json!({"command":"run_file", "path":source.materialized.script_path,
-    "source_directory":source.materialized.script_path.parent(),
+fn prepared_request(source: &PreparedSource, debugger_enabled: bool) -> Result<Value> {
+    let script_path = wire_path(&source.materialized.script_path, "prepared script path")?;
+    let source_directory = source
+        .materialized
+        .script_path
+        .parent()
+        .map(|path| wire_path(path, "prepared source directory"))
+        .transpose()?;
+    let factory_path = source
+        .factory_path
+        .as_deref()
+        .map(|path| wire_path(path, "prepared factory path"))
+        .transpose()?;
+    let original_path = wire_path(&source.original_path, "original source path")?;
+    let mut request = json!({"command":"run_file", "path":script_path,
+    "source_directory":source_directory,
     "keep_source_directory":!source.materialized.function_paths.is_empty(),
     "local_names":source.local_functions.iter().map(|function| &function.name).collect::<Vec<_>>(),
-    "factory_path":source.factory_path,
-    "original_path":source.original_path,
+    "factory_path":factory_path,
+    "original_path":original_path,
     "original_source":source.original_source,
     "source_kind":match source.source_kind {
         SourceKind::Script => "script", SourceKind::Function => "function", SourceKind::Class => "class"
@@ -2175,7 +2512,7 @@ fn prepared_request(source: &PreparedSource, debugger_enabled: bool) -> Value {
             .expect("prepared request object")
             .remove("source_directory");
     }
-    request
+    Ok(request)
 }
 
 fn debug_source_descriptor(original_path: PathBuf, request: &Value) -> Result<PreparedDebugSource> {
@@ -2303,6 +2640,28 @@ fn parse_scalar_literal(literal: &str) -> Result<ScalarLiteral> {
         imaginary: canonical(imaginary),
         integer,
     })
+}
+
+/// Return an owned, exact UTF-8 spelling for a path sent as JSON data.
+///
+/// This does not canonicalize, resolve, quote, or inspect the filesystem. The
+/// returned identity never substitutes lossy display text for the caller's path.
+pub fn wire_path(path: &Path, role: &'static str) -> Result<String> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| Error::NonUtf8Path {
+            role,
+            path: path.to_owned(),
+        })
+}
+
+// Validate both the caller spelling and the actual resolved wire identity.
+// In particular, a valid UTF-8 alias may resolve to a non-UTF-8 target.
+fn canonical_wire_path(path: &Path, role: &'static str) -> Result<PathBuf> {
+    wire_path(path, role)?;
+    let resolved = fs::canonicalize(path)?;
+    wire_path(&resolved, role)?;
+    Ok(resolved)
 }
 
 fn octave_string(path: &Path) -> Result<String> {

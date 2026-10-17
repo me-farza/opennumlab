@@ -2,6 +2,7 @@
 // Narrow Octave 11.3.0 graphics lifetime witness. A retained native object owns
 // its properties allocation, so recycled numerical handles cannot authorize a
 // replacement after listeners, DeleteFcn, or dynamic properties are removed.
+#include "mathlab_adapter_binding_v2.h"
 #include <octave/oct.h>
 #include <octave/defun-dld.h>
 #include <octave/error.h>
@@ -27,6 +28,12 @@
 #include <utility>
 
 namespace {
+mathlab_adapter_binding_v2::binding& intrinsic_binding () {
+  // Transport objects only; the existing graphics ledger owns numerical state.
+  static auto *value = new mathlab_adapter_binding_v2::binding;
+  return *value;
+}
+
 constexpr std::size_t max_entries = 4096;
 constexpr std::size_t max_epoch_bytes = 512;
 constexpr std::size_t max_key_bytes = 128;
@@ -98,58 +105,29 @@ bool supported_object (const octave::graphics_object& object) {
 DEFMETHOD_DLD (mathlab_graphics_bridge, interp, args, nargout,
               "Retain and compare native graphics lifetimes in an owned epoch")
 {
+  if (mathlab_adapter_binding_v2::is_bind_operation (args)) {
+    mathlab_adapter_binding_v2::bind (intrinsic_binding (), interp, args, nargout,
+                                    "graphics", "mathlab_graphics_bridge");
+    return octave_value_list ();
+  }
+  mathlab_adapter_binding_v2::active (intrinsic_binding (), interp);
+  if (args.length () == 0 && nargout == 0) {
+    // The provider's retained shutdown proxy calls this before interpreter
+    // teardown. Graphics properties can retain user callbacks, so releasing
+    // them from the static ledger's destructor is too late.
+    auto& state = ledger ();
+    if (state.owner && state.owner != &interp)
+      error_with_id ("MathLab:GraphicsBridgeArguments",
+                     "Native graphics cleanup belongs to another interpreter");
+    state.epoch.clear ();
+    state.owner = nullptr;
+    state.objects.clear ();
+    return octave_value_list ();
+  }
   if (args.length () < 1 || nargout > 1)
     error_with_id ("MathLab:GraphicsBridgeArguments",
                    "Expected protocol, open, capture, or check");
   const auto command = primitive_text (args(0), 16, "Command");
-  if (command == "bindings") {
-    if (args.length () != 1)
-      error_with_id ("MathLab:GraphicsBridgeArguments",
-                     "Bindings accepts no additional arguments");
-    // @builtin is name-resolving in Octave and can later select builtin.m.
-    // This constructor binds the actual intrinsic function object instead.
-    auto function = interp.get_symbol_table ().find_built_in_function ("builtin");
-    if (! function.is_defined ())
-      error_with_id ("MathLab:GraphicsUnsupported",
-                     "The genuine primitive dispatcher is unavailable");
-    auto bridge = interp.get_symbol_table ().find_function ("mathlab_graphics_bridge");
-    if (! bridge.is_defined ())
-      error_with_id ("MathLab:GraphicsUnsupported", "The native bridge binding is unavailable");
-    octave_scalar_map bindings;
-    bindings.assign ("dispatcher", octave_value (new octave_fcn_handle (function)));
-    bindings.assign ("bridge", octave_value (new octave_fcn_handle (bridge)));
-    return ovl (bindings);
-  }
-  if (command == "base_names" || command == "base_metadata") {
-    const bool metadata = command == "base_metadata";
-    if (args.length () != (metadata ? 2 : 1))
-      error_with_id ("MathLab:GraphicsBridgeArguments", "Invalid primitive base query arguments");
-    octave_value_list query;
-    if (metadata) {
-      const auto name = primitive_text (args(1), 63, "Variable name");
-      if (! ((name[0] >= 'A' && name[0] <= 'Z') || (name[0] >= 'a' && name[0] <= 'z') || name[0] == '_'))
-        error_with_id ("MathLab:GraphicsBridgeArguments", "Expected a primitive variable identifier");
-      for (const char c : name)
-        if (! ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'))
-          error_with_id ("MathLab:GraphicsBridgeArguments", "Expected a primitive variable identifier");
-      query(0) = name;
-    }
-    auto function = interp.get_symbol_table ().find_built_in_function (metadata ? "whos" : "who");
-    if (! function.is_defined ())
-      error_with_id ("MathLab:GraphicsUnsupported", "The genuine primitive workspace query is unavailable");
-    auto& evaluator = interp.get_evaluator ();
-    const auto frame = evaluator.current_call_stack_frame_number ();
-    octave::unwind_action restore ([&evaluator, frame] () { evaluator.restore_frame (frame); });
-    evaluator.goto_base_frame ();
-    if (metadata) {
-      const auto value = evaluator.varval (query(0).string_value ());
-      if (! value.is_defined () || value.isobject ()
-          || ! (value.isnumeric () || value.islogical () || value.is_string ()))
-        error_with_id ("MathLab:GraphicsUnsupported",
-                       "Native byte accounting requires a primitive numeric, logical, or character value");
-    }
-    return function.function_value ()->call (evaluator, 1, query);
-  }
   if (command == "protocol") {
     if (args.length () != 1
         && ! (args.length () == 2 && args(1).is_double_type ()

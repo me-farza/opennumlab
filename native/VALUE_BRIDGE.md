@@ -14,13 +14,13 @@ the worker still owns binding validation, history and the single base assignment
 The four-adapter build script compiled the owned adapter with Octave 11.3 on
 macOS arm64. The combined source passed 404 workspace test entrypoints, including
 exact dense-complex read/write/undo/redo, startup/restart/Stop, failed-loader
-recovery and desktop transaction routing. The [follow-up report](../artifacts/cp03-followup-validation/RESULTS.json)
+recovery and desktop transaction routing. The follow-up report (local evidence unavailable in source exports: `../artifacts/cp03-followup-validation/RESULTS.json`)
 retains exact inputs, executables and results. Earlier isolated loader probes
 reject foreign M-file and native-module paths before protocol entry and include
 ordinary-call and configured-module positive controls.
 No installed application, full CP03, performance or general memory claim follows.
 
-The retained [native probe report](../artifacts/cp03-value-bridge-extensions/report.json)
+The retained native probe report (local evidence unavailable in source exports: `../artifacts/cp03-value-bridge-extensions/report.json`)
 identifies the exact private module, runtime, commands and results. Its baseline,
 original probe and extension probe all exited successfully; all three retained
 the same shutdown diagnostic, including the baseline without the module.
@@ -97,7 +97,7 @@ public typed-page/binding/session/input targets and current workspace check,
 Clippy and all compiled test targets with the matching four-module profile.
 Setup guidance, CI development-SDK dependencies, native release gates, source
 allowlists, package/launcher provisioning, broader resource variants and installed
-qualification remain open. See the [release-owner handoff](../artifacts/cp03-value-provisioning-release-handoff.json).
+qualification remain open. See the release-owner handoff (local evidence unavailable in source exports: `../artifacts/cp03-value-provisioning-release-handoff.json`).
 Octave 8.4 and 11.3 have separate ABI/runtime gates; the separate 8.4 readiness
 producer correction remains pending. These 11.3 results do not qualify another
 runtime or complete every case listed above.

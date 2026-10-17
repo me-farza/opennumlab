@@ -8,8 +8,8 @@ input compatibility, and no performance advantage has been established.
 
 Runtime evidence uses GNU Octave 11.3.0 (Homebrew 11.3.0_1) on macOS arm64. Targeted
 input and frontend evidence is listed below. Earlier full-suite/package records
-in [VALIDATION.md](../artifacts/VALIDATION.md) and
-[verification.log](../artifacts/verification.log) must be read with their recorded
+in VALIDATION.md (local evidence unavailable in source exports: `../artifacts/VALIDATION.md`) and
+verification.log (local evidence unavailable in source exports: `../artifacts/verification.log`) must be read with their recorded
 scope; they do not by themselves validate a later input/debugger revision. The
 actual desktop Stop-after-input-consumption regression passes against the final
 native interrupt adapter; its bounded acceptance scope is described below.
@@ -163,7 +163,7 @@ original request's first End is the last required session event.
 Actual Octave regressions verify cancellation before Begin, before mailbox
 consumption, between metadata and End, and after End while settling recovery. They
 also verify that unrelated idle recovery does not disarm a queued request's
-cancellation; see [the boundary-test log](../artifacts/console-engine-boundary-tests.log).
+cancellation; see the boundary-test log (local evidence unavailable in source exports: `../artifacts/console-engine-boundary-tests.log`).
 These are tested cases on the stated runtime and platform, not an exhaustive
 cross-platform guarantee. Hard termination or deadline failure retains already
 delivered console events but loses the numerical workspace. Native routines may
@@ -432,31 +432,31 @@ release-file gate to prove output arrives before evaluation can finish, then che
 single delivery, timeout partial output, JSON metadata, idle background output and
 REPL restart. Desktop tests cover its real worker subscription, event barriers,
 decoding, loss and display limits. The
-[boundary-test log](../artifacts/console-engine-boundary-tests.log) records targeted
+boundary-test log (local evidence unavailable in source exports: `../artifacts/console-engine-boundary-tests.log`) records targeted
 request/fence interruption regressions.
 
 [Input integration test sources](../crates/mathlab-engine/tests/input_session.rs)
 include caller scope, Unicode/string/empty replies, builtin and nested input, EOF,
 clear behavior, SIGINT/restart, malformed replies and late-activation rejection.
-[Input engine evidence](../artifacts/input-engine-tests.log),
-[CLI evidence](../artifacts/cli-input-tests.log),
-[terminal echo probe](../artifacts/cli-input-tty-probe.json),
-[desktop unit evidence](../artifacts/desktop-input-tests.log) and
-[paused desktop reply evidence](../artifacts/desktop-paused-input-test.log) record
-specific runs. The [final desktop worker group](../artifacts/desktop-input-native-tests.log)
+Input engine evidence (local evidence unavailable in source exports: `../artifacts/input-engine-tests.log`),
+CLI evidence (local evidence unavailable in source exports: `../artifacts/cli-input-tests.log`),
+terminal echo probe (local evidence unavailable in source exports: `../artifacts/cli-input-tty-probe.json`),
+desktop unit evidence (local evidence unavailable in source exports: `../artifacts/desktop-input-tests.log`) and
+paused desktop reply evidence (local evidence unavailable in source exports: `../artifacts/desktop-paused-input-test.log`) record
+specific runs. The final desktop worker group (local evidence unavailable in source exports: `../artifacts/desktop-input-native-tests.log`)
 passes all five actual-worker tests with the debugger and input adapters enabled. A successful Rust test that takes an optional-adapter skip branch
-is not evidence that its native path ran. The [actual desktop Stop
-regression](../artifacts/desktop-app-stop-test.log),
+is not evidence that its native path ran. The actual desktop Stop
+regression (local evidence unavailable in source exports: `../artifacts/desktop-app-stop-test.log`),
 `app_stop_interrupts_a_paused_evaluation_after_input_has_already_been_consumed`,
 passes after the entered expression has begun and the read has finished. It checks
 outer `MathLab:Interrupted` completion, prompt release of the pending Evaluate,
 cleared busy state, no queued source submission and preserved base workspace in a
-subsequent request. The [native causal Stop report](../artifacts/debug-input-stop-report.json)
+subsequent request. The native causal Stop report (local evidence unavailable in source exports: `../artifacts/debug-input-stop-report.json`)
 separately checks quiet/live modes at a waiting read, during the entered expression
 and in nested watches, including cleanup and absence of later statements.
 
 Full enabled/fallback verification, static analysis and packaged evidence are
-recorded separately in [VALIDATION.md](../artifacts/VALIDATION.md); check their
+recorded separately in VALIDATION.md (local evidence unavailable in source exports: `../artifacts/VALIDATION.md`); check their
 revision and enabled modules before applying an older result to new behavior.
 
 The original audit probes below explain why the former protocol was replaced.
@@ -465,11 +465,11 @@ regressions or evidence that the old behavior persists:
 
 | Probe | Observed old behavior | Recorded output |
 | --- | --- | --- |
-| disp('A1'); system('printf B2'); disp('C3'); fprintf(stderr,'D4'); in evalc | Raw stdout was B2; captured output was A1\nC3\nD4. Prepending reordered foreground output. | [order](../artifacts/console-output-probe-order.json) |
-| Public interpreter_events observer, server mode disabled/enabled | Only enabled mode forwarded language stdout fragments; stderr, warnings and system output bypassed it. | [events](../artifacts/console-output-probe-events.json) |
-| Piped input('VALUE> ','s') | Prompt and response worked through raw stdin, but public input/prompt events did not prove an input-request hook. | [input](../artifacts/console-output-probe-input.json) |
-| Two non-newline writes separated by pause(.4) with immediate output | Raw byte reads received PARTIAL about 405 ms before DONE; line buffering was unnecessary. | [partial bytes](../artifacts/console-output-probe-partial.json) |
-| Print, assign interrupt_saved=7, loop, then SIGINT | Old captured output was empty while workspace value 7 survived. | [interrupt](../artifacts/console-output-probe-interrupt.json) |
+| disp('A1'); system('printf B2'); disp('C3'); fprintf(stderr,'D4'); in evalc | Raw stdout was B2; captured output was A1\nC3\nD4. Prepending reordered foreground output. | order (local evidence unavailable in source exports: `../artifacts/console-output-probe-order.json`) |
+| Public interpreter_events observer, server mode disabled/enabled | Only enabled mode forwarded language stdout fragments; stderr, warnings and system output bypassed it. | events (local evidence unavailable in source exports: `../artifacts/console-output-probe-events.json`) |
+| Piped input('VALUE> ','s') | Prompt and response worked through raw stdin, but public input/prompt events did not prove an input-request hook. | input (local evidence unavailable in source exports: `../artifacts/console-output-probe-input.json`) |
+| Two non-newline writes separated by pause(.4) with immediate output | Raw byte reads received PARTIAL about 405 ms before DONE; line buffering was unnecessary. | partial bytes (local evidence unavailable in source exports: `../artifacts/console-output-probe-partial.json`) |
+| Print, assign interrupt_saved=7, loop, then SIGINT | Old captured output was empty while workspace value 7 survived. | interrupt (local evidence unavailable in source exports: `../artifacts/console-output-probe-interrupt.json`) |
 
 Those timings are illustrative, not a latency benchmark. The temporary native
 event observer used for the audit was not an installed product component. Public

@@ -28,12 +28,24 @@ fn main() {
         root.join("octave/mathlab_value_page.m"),
         root.join("octave/mathlab_value_edit.m"),
         root.join("octave/mathlab_ready_json.m"),
+        root.join("crates/mathlab-engine/src/trusted_worker/core_worker.m"),
+        root.join("crates/mathlab-engine/src/trusted_worker/graphics_service.m"),
+        root.join("crates/mathlab-engine/src/trusted_worker/qualified_registry.m"),
+        root.join("crates/mathlab-engine/src/trusted_worker/legacy_worker.m"),
+        root.join("crates/mathlab-engine/src/trusted_worker/legacy_value_page.m"),
+        root.join("crates/mathlab-engine/src/trusted_worker/inputs/mathlab_worker.m"),
+        root.join("crates/mathlab-engine/src/trusted_worker/inputs/mathlab_value_page.m"),
+        root.join("crates/mathlab-engine/src/trusted_worker/inputs/mathlab_value_edit.m"),
+        root.join("crates/mathlab-engine/src/trusted_worker/inputs/mathlab_ready_json.m"),
+        root.join("crates/mathlab-engine/src/trusted_worker/inputs/mathlab_graphics_service.m"),
+        root.join("crates/mathlab-engine/src/trusted_worker/inputs/mathlab_worker_graphics.m"),
     ];
     for name in [
         "mathlab-cli",
         "mathlab-engine",
         "mathlab-language",
         "mathlab-debugger",
+        "mathlab-array",
     ] {
         let base = root.join("crates").join(name);
         files.push(base.join("Cargo.toml"));

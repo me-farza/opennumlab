@@ -232,6 +232,57 @@ class SourceArchiveTests(unittest.TestCase):
         self.assertFalse(any(b"VALUE_PROVISIONING_PRIVATE_SENTINEL" in data for _, data in members.values()))
         self.assertEqual(source.verify(self.output), manifest)
 
+    def test_exact_optional_contributor_and_operator_provenance_from_fixed_commit(self):
+        selected = {
+            "CONTRIBUTING.md": "# Original contributor fixture\n",
+            "crates/mathlab-language/tests/fixtures/operator_native_reference_v1.provenance.json":
+                '{"schema_version":1,"fixture":"PUB01 original provenance"}\n',
+        }
+        minimal = self.create(output=self.root / "minimal-source")
+        self.assertTrue(source.policy.ROOT_FILES.issubset({r["path"] for r in minimal["files"]}))
+        self.assertFalse(set(selected).intersection(r["path"] for r in minimal["files"]))
+        self.assertEqual(source.verify(self.root / "minimal-source"), minimal)
+        denied = (
+            "docs/CONTRIBUTING.md",
+            "crates/mathlab-language/tests/fixtures/unrelated.json",
+            "crates/mathlab-language/tests/fixtures/operator_native_reference_v2.provenance.json",
+            "crates/mathlab-language/tests/fixtures/nested/operator_native_reference_v1.provenance.json",
+            "crates/research/fixture.rs", "crates/evidence/fixture.rs", "crates/local/fixture.rs",
+        )
+        for name, text in selected.items():
+            self.write(name, text).chmod(0o644)
+        for name in denied:
+            self.write(name, "PUB01_DENIED_SENTINEL\n")
+        self.git("add", ".")
+        # Keep both Git names on case-insensitive hosts without creating two
+        # colliding worktree files; only the exact uppercase path is optional.
+        blob = self.git("hash-object", "-w", "--", "docs/CONTRIBUTING.md")
+        self.git("-c", "core.ignorecase=false", "update-index", "--add", "--cacheinfo",
+                 "100644," + blob + ",contributing.md")
+        self.git("commit", "-qm", "Exact optional source fixtures")
+        reference = self.git("rev-parse", "HEAD")
+        for name in selected:
+            self.write(name, "PUB01_DIRTY_WORKTREE\n").chmod(0o755)
+        self.create(reference=reference)
+        manifest, members = self.archive_contents()
+        self.assertEqual(manifest["source"]["commit"], reference)
+        records = {record["path"]: record for record in manifest["files"]}
+        prefix = manifest["archive"]["root"] + "/"
+        for name, text in selected.items():
+            with self.subTest(path=name):
+                data = text.encode()
+                member, exported = members[prefix + name]
+                self.assertEqual(exported, data)
+                self.assertEqual(member.mode, 0o644)
+                self.assertEqual(records[name]["mode"], "0644")
+                self.assertFalse(records[name]["executable"])
+                self.assertEqual(records[name]["sha256"], hashlib.sha256(data).hexdigest())
+                self.assertEqual(records[name]["git_blob"], self.git("rev-parse", reference + ":" + name))
+        self.assertFalse(set(records).intersection((*denied, "contributing.md")))
+        self.assertFalse(any(b"PUB01_DENIED_SENTINEL" in data or b"PUB01_DIRTY_WORKTREE" in data
+                             for _, data in members.values()))
+        self.assertEqual(source.verify(self.output), manifest)
+
     def test_forbidden_tracked_and_untracked_content_is_absent(self):
         denied = ("docs/research/private.md", "docs/research/evidence/local.mat", "artifacts/report.json",
                   "crates/vendor/source.rs", "native/vendor.oct", "tests/fixtures/generated.slx",

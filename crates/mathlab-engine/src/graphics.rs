@@ -5,13 +5,11 @@
 //! remain separate from the object tokens used here. All requests use the
 //! ordinary serialized owner, including cancellation and recovery settlement.
 
-use crate::{
-    DecimalU64, Engine, Error, ExecutionResult, Result, SessionContext, WorkerCapabilities,
-};
+use crate::{DecimalU64, Engine, Error, ExecutionResult, Result, SessionContext};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json, value::RawValue};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub const CAP_GRAPHICS_REGISTRY: &str = "graphics_registry.v1";
 pub const MAX_NODES: usize = 128;
@@ -23,40 +21,6 @@ pub const MAX_NAME_BYTES: usize = 256;
 const MAX_ID_BYTES: usize = 128;
 const MAX_WORKER_ID_BYTES: usize = 256;
 const MAX_TYPE_BYTES: usize = 64;
-
-/// Qualify the complete private worker closure, including protocol publication.
-/// Native graphics enable upgrades this private dispatcher to an internal handle
-/// bound to Octave's actual builtin object. A simple @builtin still name-resolves.
-/// The fixed base-workspace seams are versioned; unknown source fails explicitly.
-pub(crate) fn qualify_worker_source(source: &str) -> Result<String> {
-    let names = "names = builtin('evalin', 'base', \"(@builtin) ('who')\");";
-    let metadata = "selected = builtin('evalin', 'base', builtin('sprintf', \"(@builtin) ('whos', '%s')\", name));";
-    if source.matches(names).count() != 2 || source.matches(metadata).count() != 1 {
-        return Err(Error::Protocol(
-            "The graphics primitive worker seam changed; integration must be reviewed.".into(),
-        ));
-    }
-    let source = source
-        .replace(names, "names = mathlab_graphics_base_names ();")
-        .replace(
-            metadata,
-            "selected = mathlab_graphics_base_metadata (name);",
-        );
-    let mut qualified = String::with_capacity(source.len() + 8192);
-    for line in source.lines() {
-        qualified.push_str(line);
-        qualified.push('\n');
-        let declaration = line.trim_start();
-        if declaration.starts_with("function ")
-            && !declaration.contains("mathlab_graphics_primitives (")
-        {
-            let indent = &line[..line.len() - declaration.len()];
-            qualified.push_str(indent);
-            qualified.push_str("  builtin = mathlab_graphics_primitives ();\n");
-        }
-    }
-    Ok(qualified)
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -552,16 +516,6 @@ fn decode_query(
     Ok(query)
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GraphicsReady {
-    version: String,
-    working_directory: PathBuf,
-    protocol: WorkerCapabilities,
-    #[serde(deserialize_with = "strict_session_context")]
-    context: SessionContext,
-}
-
 impl Engine {
     /// Enable the optional native lifetime bridge from an exact existing file.
     /// Restart requires explicit re-enabling; recovery retains the pinned bridge
@@ -570,28 +524,25 @@ impl Engine {
         if !self.capabilities().supports(CAP_GRAPHICS_REGISTRY) && self.user_execution_started {
             return Err(Error::Protocol("Enable the qualified graphics profile before user execution; restart to select it.".into()));
         }
-        let bridge_path = std::fs::canonicalize(bridge_path)?;
+        let bridge_path = crate::canonical_wire_path(bridge_path, "graphics adapter path")?;
+        if let Some(startup) = &self.trusted_startup {
+            startup.validate_adapter_path(crate::AdapterRole::Graphics, &bridge_path)?;
+        }
         if !bridge_path.is_file() {
             return Err(Error::Protocol(
                 "The graphics bridge path must name a file.".into(),
             ));
         }
-        let (raw, _) = self.request_raw(
+        let bridge_path = crate::wire_path(&bridge_path, "graphics adapter path")?;
+        let (ready, _) = self.request(
             json!({"command": "enable_graphics", "bridge_path": bridge_path}),
             Some(crate::COMMAND_TIMEOUT),
-            MAX_RESPONSE_BYTES + 4096,
         )?;
-        let ready: GraphicsReady = decode(raw.get().as_bytes())?;
-        ready.protocol.validate()?;
-        ready.protocol.require(CAP_GRAPHICS_REGISTRY)?;
-        self.validate_context(&ready.context)?;
-        if ready.version.is_empty() {
+        self.accept_ready(&ready)?;
+        if self.version.is_empty() {
             return Err(invalid("graphics readiness omitted the runtime version"));
         }
-        self.capabilities = Some(ready.protocol);
-        self.version = ready.version;
-        self.config.working_directory = ready.working_directory;
-        Ok(())
+        self.require_capability(CAP_GRAPHICS_REGISTRY)
     }
 
     fn graphics_request_raw(
@@ -721,28 +672,11 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn graphics_primitive_qualification_is_closed_over_the_pinned_worker_seams() {
-        let source = format!(
-            "{}\n{}\n{}",
-            crate::WORKER,
-            crate::VALUE_PAGE_WORKER,
-            crate::GRAPHICS_WORKER
-        );
-        let qualified = qualify_worker_source(&source).unwrap();
-        assert!(qualified.contains("function mathlab_worker"));
-        assert!(qualified.contains("names = mathlab_graphics_base_names ();"));
-        assert!(qualified.contains("selected = mathlab_graphics_base_metadata (name);"));
-        assert!(qualified.contains("  builtin = mathlab_graphics_primitives ();"));
-        assert!(!qualified.contains("function [dispatcher, bridge] = mathlab_graphics_primitives (mode = 0, candidate = [], native_bridge = [])\n  builtin ="));
-        assert!(
-            qualify_worker_source(
-                &source.replace("names = builtin('evalin'", "names = unsupported('evalin'")
-            )
-            .is_err()
-        );
-    }
+    #[cfg(unix)]
+    use crate::AdapterRole;
+    use crate::WorkerCapabilities;
+    #[cfg(unix)]
+    use std::path::PathBuf;
 
     fn context() -> SessionContext {
         SessionContext {
@@ -1026,59 +960,61 @@ mod tests {
                 "limits": {"variable_cells": 2000, "response_bytes": 33554432},
             },
         });
-        let ready: GraphicsReady = decode(&bytes(&response)).unwrap();
-        ready.protocol.validate().unwrap();
-        assert!(ready.protocol.require(CAP_GRAPHICS_REGISTRY).is_err());
+        let protocol: WorkerCapabilities =
+            serde_json::from_value(response["protocol"].clone()).unwrap();
+        protocol.validate().unwrap();
+        assert!(protocol.require(CAP_GRAPHICS_REGISTRY).is_err());
         response["protocol"]["capabilities"]
             .as_array_mut()
             .unwrap()
             .push(json!(CAP_GRAPHICS_REGISTRY));
-        let ready: GraphicsReady = decode(&bytes(&response)).unwrap();
-        ready.protocol.validate().unwrap();
-        ready.protocol.require(CAP_GRAPHICS_REGISTRY).unwrap();
+        let protocol: WorkerCapabilities =
+            serde_json::from_value(response["protocol"].clone()).unwrap();
+        protocol.validate().unwrap();
+        protocol.require(CAP_GRAPHICS_REGISTRY).unwrap();
         response["context"]["invocation"] = json!(3);
-        assert!(decode::<GraphicsReady>(&bytes(&response)).is_err());
+        assert!(strict_session_context(response["context"].clone()).is_err());
     }
 
-    /// Unlike the eight codec tests above, this test must use the real worker
-    /// and native bridge. Raw malformed JSON values bypass the Rust validators
-    /// so the backend's pre-set validation is exercised independently.
+    /// Unlike the eight codec tests above, this explicitly selected test uses
+    /// the qualified worker and admitted native bridges. Raw malformed JSON
+    /// values bypass Rust validators to exercise backend pre-set validation.
+    #[cfg(unix)]
     #[test]
-    fn actual_worker_rejects_raw_values_and_idempotent_enable_keeps_lifetimes() {
-        let required = std::env::var("MATHLAB_REQUIRE_GRAPHICS_TESTS").as_deref() == Ok("1");
-        let Some(executable) = crate::discover_octave() else {
-            assert!(
-                !required,
-                "required graphics backend validation needs installed Octave"
-            );
-            eprintln!("SKIP graphics backend validation: no installed Octave executable.");
-            return;
+    #[ignore = "requires explicitly selected qualified V2 runtime and all five native adapters"]
+    fn qualified_worker_rejects_raw_values_and_idempotent_enable_keeps_lifetimes() {
+        // Every missing prerequisite is a hard failure once this case is
+        // selected. No legacy discovery or skip-as-pass path is permitted.
+        let config = crate::trusted_startup_runtime_tests::selected_graphics_config();
+        let adapter = |role| {
+            config
+                .adapters
+                .iter()
+                .find(|entry| entry.role == role)
+                .expect("selected graphics fixture must admit every adapter role")
+                .file
+                .path
+                .as_path()
         };
-        let Some(bridge) = std::env::var_os("MATHLAB_GRAPHICS_BRIDGE") else {
-            assert!(
-                !required,
-                "required graphics backend validation needs MATHLAB_GRAPHICS_BRIDGE"
-            );
-            eprintln!("SKIP graphics backend validation: MATHLAB_GRAPHICS_BRIDGE is unset.");
-            return;
-        };
-        let bridge = PathBuf::from(bridge);
-        assert!(
-            bridge.is_file(),
-            "graphics bridge is missing: {}",
-            bridge.display()
-        );
+        let bridge = adapter(AdapterRole::Graphics);
         let directory = tempfile::Builder::new()
             .prefix("numjinn-graphics-raw-test-")
             .tempdir()
             .unwrap();
-        let mut engine = Engine::start(crate::EngineConfig {
-            executable,
-            working_directory: directory.path().to_owned(),
-        })
-        .unwrap();
+        let mut engine =
+            Engine::start_qualified(directory.path().to_owned(), config.clone()).unwrap();
+        engine
+            .enable_input_adapter(adapter(AdapterRole::Input))
+            .unwrap();
+        engine
+            .enable_scope_bridge(adapter(AdapterRole::Scope))
+            .unwrap();
+        engine
+            .enable_value_bridge(adapter(AdapterRole::Value))
+            .unwrap();
+        engine.enable_debugger(adapter(AdapterRole::Debug)).unwrap();
         assert!(!engine.capabilities().supports(CAP_GRAPHICS_REGISTRY));
-        engine.enable_graphics_service(&bridge).unwrap();
+        engine.enable_graphics_service(bridge).unwrap();
         let fixtures =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/graphics");
         let quoted = fixtures.to_string_lossy().replace('\'', "''");
@@ -1093,7 +1029,7 @@ mod tests {
 
         let before = engine.graphics_snapshot().unwrap();
         assert_eq!(before.nodes.len(), 3);
-        engine.enable_graphics_service(&bridge).unwrap();
+        engine.enable_graphics_service(bridge).unwrap();
         let enabled_again = engine.graphics_snapshot().unwrap();
         assert_eq!(enabled_again.nodes.len(), before.nodes.len());
         for node in &before.nodes {
@@ -1110,7 +1046,17 @@ mod tests {
             b"not a native module; must be rejected before loading",
         )
         .unwrap();
-        assert_raw_rejection(engine.enable_graphics_service(&wrong));
+        assert!(matches!(
+            engine.enable_graphics_service(&wrong),
+            Err(Error::Protocol(_))
+        ));
+        // Independently exercise the worker's same-module check, bypassing
+        // qualified public path admission just as malformed mutations below
+        // bypass the public value validators.
+        assert_raw_rejection(engine.request(
+            json!({"command": "enable_graphics", "bridge_path": wrong}),
+            Some(crate::COMMAND_TIMEOUT),
+        ));
         assert!(
             engine
                 .enable_graphics_service(&directory.path().join("missing.oct"))
@@ -1173,6 +1119,7 @@ mod tests {
         assert_backend_properties_unchanged(&mut engine);
     }
 
+    #[cfg(unix)]
     fn assert_raw_rejection<T>(result: Result<T>) {
         match result {
             Err(Error::Worker(error)) => assert!(
@@ -1185,6 +1132,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn live_token(engine: &mut Engine, kind: &str) -> GraphicsToken {
         engine
             .graphics_snapshot()
@@ -1202,6 +1150,7 @@ mod tests {
             .token
     }
 
+    #[cfg(unix)]
     fn assert_backend_properties_unchanged(engine: &mut Engine) {
         let result = engine.execute(
             "assert(builtin('get',graphics_line,'linewidth')==1.5); assert(!builtin('any',builtin('get',graphics_axes,'xlim')!=raw_before_xlim)); assert(!builtin('any',builtin('get',graphics_axes,'ylim')!=raw_before_ylim)); assert(builtin('strcmp',builtin('get',graphics_axes,'xlimmode'),raw_before_xmode)); assert(builtin('strcmp',builtin('get',graphics_axes,'ylimmode'),raw_before_ymode));"
