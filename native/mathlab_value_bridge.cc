@@ -190,7 +190,8 @@ struct double_types {
     if (value.type_id() == octave_complex_matrix::static_type_id())
       return static_cast<const octave_complex_matrix&>(value.get_rep()).matrix_ref();
     complex_array result(selected.source_shape);
-    std::memcpy(result.rwdata(), data(value), sizeof(complex));
+    // fortran_vec() is the COW write accessor shared by Octave 8.4 and 11.x.
+    std::memcpy(result.fortran_vec(), data(value), sizeof(complex));
     return result;
   }
   static bool real_type(const octave_value& value) { return genuine_double_real(value); }
@@ -212,7 +213,7 @@ struct single_types {
     if (value.type_id() == octave_float_complex_matrix::static_type_id())
       return static_cast<const octave_float_complex_matrix&>(value.get_rep()).matrix_ref();
     complex_array result(selected.source_shape);
-    std::memcpy(result.rwdata(), data(value), sizeof(complex));
+    std::memcpy(result.fortran_vec(), data(value), sizeof(complex));
     return result;
   }
   static bool real_type(const octave_value& value) { return genuine_single_real(value); }
@@ -247,8 +248,8 @@ components<Types> capture(const octave_value& source, const selection& selected)
   using real = typename Types::real;
   components<Types> result(selected.rows, selected.columns);
   const auto *data = Types::data(source);
-  auto *re = result.re.rwdata();
-  auto *im = result.im.rwdata();
+  auto *re = result.re.fortran_vec();
+  auto *im = result.im.fortran_vec();
   for (std::size_t index = 0; index < selected.offsets.size(); ++index) {
     OCTAVE_QUIT;
     const real *parts = reinterpret_cast<const real *>(data + selected.offsets[index]);
@@ -282,15 +283,15 @@ octave_value_list replace(const octave_value& source, const selection& selected,
   const auto im_input = Types::real_values(imag_input);
   components<Types> after(selected.rows, selected.columns);
   const auto bytes = selected.offsets.size() * sizeof(real);
-  std::memcpy(after.re.rwdata(), re_input.data(), bytes);
-  std::memcpy(after.im.rwdata(), im_input.data(), bytes);
+  std::memcpy(after.re.fortran_vec(), re_input.data(), bytes);
+  std::memcpy(after.im.fortran_vec(), im_input.data(), bytes);
   auto before = capture<Types>(source, selected);
   // Build every bounded return object before the full leaf COW allocation.
   const octave_value before_value = before.as_value();
   const octave_value after_value = after.as_value();
   OCTAVE_QUIT;
   auto replacement = Types::cow_array(source, selected);
-  auto *destination = replacement.rwdata(); // COW detaches only admitted full logical leaf
+  auto *destination = replacement.fortran_vec(); // COW detaches only admitted full logical leaf
   const auto *re = after.re.data(), *im = after.im.data();
   for (std::size_t index = 0; index < selected.offsets.size(); ++index) {
     OCTAVE_QUIT;

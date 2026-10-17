@@ -754,7 +754,7 @@ class PackageTests(unittest.TestCase):
         self.assertEqual(launcher.read_bytes(), release.installed_launcher_bytes(source_launcher, True))
         payload = {item["path"]: item for item in self.manifest()["payload"]}
         for path in (launcher, config):
-            self.assertEqual(payload[path.relative_to(self.destination).as_posix()]["sha256"], release.sha(path))
+            self.assertEqual(payload[path.resolve().relative_to(self.destination.resolve()).as_posix()]["sha256"], release.sha(path))
         release.validate(self.destination)
 
     def test_qualified_ghostscript_metadata_matches_config_and_rejects_build_drift(self):
@@ -1290,7 +1290,7 @@ class PackageTests(unittest.TestCase):
             shutil.copyfile(self.destination / "Contents/Resources/native" / name, self.repo / "native" / name)
         native["runtime_executable_sha256"] = release.sha(self.executable)
         doctor = copy.deepcopy(native["worker_observation"])
-        doctor.update(runtime=str(self.executable), ready=True,
+        doctor.update(runtime=str(self.executable.resolve()), ready=True,
                       runtime_executable_sha256=native["runtime_executable_sha256"])
         modules = doctor["native_modules"]
         for name in modules:
