@@ -17,6 +17,8 @@ pub struct SavedDocument {
 
 #[derive(Serialize, Deserialize)]
 pub struct Session {
+    #[serde(default)]
+    pub rust_modules: Vec<PathBuf>,
     pub version: u32,
     pub directory: PathBuf,
     pub executable: Option<PathBuf>,
@@ -84,6 +86,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let path = temporary.path().join(".mathlab/session.json");
         let session = Session {
+            rust_modules:Vec::new(),
             version: 1,
             directory: temporary.path().into(),
             executable: None,

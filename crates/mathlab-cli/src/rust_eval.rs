@@ -72,7 +72,7 @@ fn envelope(outcome: &str) -> Value {
         "profile": "arithmetic-v1", "outcome": outcome})
 }
 
-fn error_record(error: &ArithmeticExpressionErrorV1) -> Value {
+pub(super) fn error_record(error: &ArithmeticExpressionErrorV1) -> Value {
     let span = error.span();
     let cause = match error {
         ArithmeticExpressionErrorV1::Syntax {

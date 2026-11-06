@@ -541,3 +541,153 @@ regressions execute genuine helper-named user functions and same-name base handl
 including an actual paused debugger scope. Malformed local expressions return
 structured execution errors without running preceding user statements. Known-deviation tests retain explicit fallback assertions when this
 capability is disabled and check the stronger native behavior when it is enabled.
+
+`rust_program::ProgramSessionV1` executes the immutable located program AST through
+an explicit continuation machine. It supports isolated local-function frames,
+atomic multioutput caller assignment, column-valued loops and typed logical
+conditions. Errors, Stop and resource exhaustion retain completed script effects
+and previously emitted callee displays; subsequent requests can recover. The
+separate keyed cancellation barrier stays active across statement publications.
+
+This initial `rust-program-execution-v1` profile retains 16-by-16 values and
+explicit frame/task/value/work/event budgets. The single `Arc` control allocation
+uses stable std allocation, with a 64-byte logical metadata allowance and test
+preflight; allocator overhead/Arc ABI/RSS are not inferred and global OOM may
+abort. Value/vector/name reservations are fallible. Arity, output, resolution,
+condition and empty-column policies are qualified project rules pending native
+reconciliation. Variadic formals, general matrix powers/solves, growth and
+logical-mask assignment are unsupported. Existing v1 APIs/protocols stay intact;
+CLI, larger arrays, advanced types and desktop integration are later milestones.
+
+Reference reconciliation separates an unassigned local call's observed `nargout`
+(0) from implicit result delivery. An available first declared output becomes
+`ans`; zero outputs or an unset first output leave `ans` unchanged. Explicit
+output requests retain their counts and required-output checks. F05 qualifies
+its single assigned-output case. Phase B G16 also qualifies successful bare calls
+with an unset first output and no new `ans`; G18 qualifies requested counts
+0/1/2/2 for bare/single/multiple/discarded outputs. This Rust profile qualifies
+only its admitted bare/single/named-multiple contexts (0/1/2); ignored-output
+syntax `[~,x]` remains unsupported and open. It does not execute full G18.
+Event details and unobserved output combinations remain project policies. Repeated simple output targets are now admitted: RHS executes once and
+one atomic transaction applies occurrences left to right, so the rightmost value
+wins without duplicate bindings. Unsuppressed per-occurrence value snapshots
+follow the existing project event policy; native F15 only qualifies suppressed
+last-write behavior. Existing quotas and failure/Stop prefix guarantees remain.
+
+Phase B control reconciliation rejects NaN in an `if`/`elseif`/`while` condition
+with the existing located `Type` diagnostic, preserving prior effects. Native
+G01 establishes the NaN rejection only: later Inf/logical cases were unreached.
+The Rust profile scans each complete nonempty condition for NaN, even after a
+zero, as explicit project array policy; empty/all-nonzero truth is unchanged.
+Short-circuit operand conversion and other logical operations are unchanged.
+`for` over `Mx0` now initializes its loop variable to canonical double `0x0`
+without executing its body (G08); `0xN` still executes N times with `0x1` columns
+(G07). Empty initialization uses the existing atomic publication, revision and
+suppressed-event policy; allocation failure and Stop preserve a complete prefix.
+
+## Opt-in scientific-v1 program API (draft)
+
+`rust_program::scientific::ScientificProgramSessionV1` accepts the same immutable
+located `ProgramModuleV1`. `prepare` returns a keyed prepared request; cancellation,
+function scopes, branches, loops and atomic caller publications use the same
+machine source as the legacy profile. Private profile methods select values and
+kernels. Legacy concrete value/task/frame types are retained; no enlarged value
+enum is inserted into the old session. Test-only frozen c355 source witnesses
+compare layouts, initial reservation formulas, allocation faults, Stop/fuel and
+complete effect/value traces. Those tests must pass before asserting equivalence.
+
+The scientific session exposes borrowed `binding(name)` and `bindings()` views.
+Values expose full canonical shapes, class and complex flag, plus
+`read_range(offset,count)` with complete real/complex/logical borrowed slices.
+No mutable workspace reference or fallible workspace enumeration is exposed.
+
+This first profile has rank≤8, ≤2^20 elements/value, ≤16 MiB/value, a 64 MiB
+payload budget and 16 MiB visible metadata budget. Maximum request allowances are
+5 million control transitions and 1 billion scalar-work units. Source, function,
+frame, binding and event caps remain bounded. Actual provider reservations are
+charged individually before allocation, with successful capacities checked.
+Prepared copy/fill/finite-check futures suspend before ≤128-unit chunks;
+arithmetic jobs resume through bounded ≤32768-unit continuations. Binding,
+caller-output, display-snapshot and indexed-candidate copies await those same
+preparation futures. Primitive checkpoint callbacks also forward
+Stop during provider preparation. Budgets do not reset across local calls or
+loop statements. Only completed candidates enter the existing publication CAS.
+The three stable std source/module/control Arc allocations retain their qualified
+global-OOM boundary; fallible provider storage is separate.
+
+Constructors accept dimension arguments or a real row-vector shape.
+Trailing-one axes normalize to rank≥2; interior singleton and zero axes persist.
+Indexing initially accepts one linear selector or exactly the canonical rank.
+Full axes stay symbolic, `end` uses the corresponding extent, and positive
+integer vector selectors are checked completely. Fixed-shape writes stage one
+candidate and scatter in column-major order; duplicate visits are rightmost wins.
+Complex RHS promotes real-double targets; logical class does not silently become
+double. Growth, empty-RHS deletion and other-axis collapse are unsupported.
+
+Real/complex N-D element operations, real/imag/conj, 2-D transpose/adjoint,
+2-D matrix multiplication and matrix left solve are included. Ordered complex
+comparisons are refused. General noninteger powers, matrix right solve, N-D
+matrix products/for iteration, sparse storage and classes are not silently
+approximated. The legacy exact sum/mean/product proof is not widened; larger
+scientific reductions remain separate work. `norm_inf` is a bounded sequential
+component-L1 diagnostic, not exact reduction or native bit parity.
+
+Solver stats expose the last attempted factorization's initial/max-U component
+metrics, work, completion flag and maximum observed growth, including partial
+attempts that fail after construction. Completed solve count is separate.
+The original frequency-response example runs actual functions, construction,
+indexing, complex solve, residual diagnostics and atomic tensor page writes.
+Sparse CSC/Poisson-PCG, classes, broader numerical operations and desktop
+integration remain required milestones.
+
+Cooperative execution uses stack-pinned standard Rust futures and a nonallocating
+yield primitive, without Box, thread, new dependency or host-stack recursion for
+language calls. The internal suspended state is required to fit 1 MiB (checked
+by the targeted future-size test); hosts must provide at least 2 MiB available
+stack for the core plus their own caller/checkpoint/waker needs. Allocation
+system-call latency and arbitrary caller callbacks/wakers remain outside CPU
+quantum guarantees. Legacy layout/operation/fault equivalence is an execution
+gate, not inferred from the mechanism. Dropping the cooperative future abandons
+its key, restores the completed workspace prefix including an empty reserved
+binding pool, and discards the deliberately abandoned result/event report.
+Request Stop and continue polling to obtain the normal retained-events outcome.
+Growth diagnostics preserve exact initial/max-U metric words. Ratio overflow is
+reported as hex Inf with an explicit nonfinite/overflow classification and never
+fails an otherwise successful solve; zero initial metric is explicitly undefined.
+
+Scientific matrix literals admit at most 256 source rows. This fixed assembly
+metadata cap returns Resource before publication when exceeded; it does not
+limit the row axis of constructed arrays to 256. Each literal operand shape/class
+scan charges one unit and awaits a cooperative checkpoint before inspecting it.
+
+
+### Scientific V2 program profile
+
+`rust_program::scientific_v2::ScientificProgramSessionV2` specializes the same located-AST machine with typed dense/CSC storage. Every accepted legacy and scientific-v1 public value/session/task layout, operation order, allocation site, quota and schema remains unchanged. The new profile has its own value/task/frame specialization; no storage tag is added to V1. `bindings()` exposes borrowed typed values.
+
+Supported sparse operations are five-argument `sparse(i,j,v,m,n)`, scalar index/value expansion, `issparse`, `nnz`, `nzmax`, `size`, `numel`, and sparse-left/dense-right multiplication. Unsupported operations refuse before publishing a partial result. Bare native constants remain outside this scope; `inf()` and `nan()` provide explicit values for qualified edge fixtures. Sparse function arguments/results and displays use independent copies, with existing caller isolation and publication barriers.
+
+A stack-only operation scope charges every actual provider reservation against64MiB aggregate retained value payload. It includes retained bindings/operands, converted index buffers, constructor permutations and private candidates; replacement and successful output transfer release consumed input/scratch charges exactly once. Error and Future drop destroy child candidates/owned operands before releasing their scope charge. Borrowed operands remain charged until the shared machine releases them. Failed accounting invariants poison the request rather than resetting a counter. Stats report operations, sparse constructors/products, peak operation reservations, peak live payload, primitive work and transitions.
+
+Budgets remain1,000,000,000 primitive units and5,000,000 transitions. Each complete32768-unit operation quantum charges a transition in addition to AST scheduling. New provider/adapter/copy CPU checkpoints suspend in blocks of at most128 charged units; unchanged fallback numeric jobs poll at most128 units apart and yield before/after at most32768 charged units. Existing allocator/system-call and three host-Arc OOM qualifications remain. The private request future is stack pinned, not boxed or threaded; tests bound its size and exercise every suspension drop/Stop and allocation-fault prefix. Actual measured full-workload resource fit remains a validation gate. The 32³ Poisson-PCG workload passed within these bounds; other workloads require their own measurement.
+
+`examples/scientific/poisson_pcg.m` assembles a32³ Poisson matrix from bulk triplets and solves it in a user-defined Jacobi-PCG function, capped at512 iterations. It uses generic numeric/matrix operations, explicit true-residual confirmation, and no production domain builtin or manufactured solution shortcut. Independent tests inspect every223232 CSC entry and32768 returned solution values. Full complex/sparse/N-D/scaling, classes, numerical coverage and desktop integration remain broader goals.
+
+
+### Class-v1 runtime (opt-in)
+
+The bounded library/CLI profile passed 191 acceptance cases, including 52 class cases and four original-versus-current numeric-profile compatibility cases. Desktop integration is a separate milestone.
+
+The class profile specializes the existing AST/control machine with genuine scalar value-object records and generational handle references. Numeric/dense/CSC properties execute through the accepted scientific-v2 providers. Value assignment and returned value mutators eagerly copy value records/numeric buffers while retaining shared handle identities. Constructors seed their output receiver without adding a visible argument; dot-method nargin includes the explicit receiver. Derived methods resolve against the dynamic class and inherit prelinked properties. No classes are encoded as numeric scalars.
+
+Source modules are an explicit immutable closure. A session fixes ordered class-source identities on first admission, permits new entry text with identical definitions, and rejects changed/reordered definitions before effects until reset. Object IDs validate session owner, reset epoch, slot and generation. Borrowed session views are live; retained event snapshots hold immutable graph/type/identity/validity metadata and remain readable after deletion or session drop. Host-created copies of opaque IDs are not portable strong heap roots.
+
+Private constructor receiver writes do not advance the workspace revision or handle_mutations. An unsuppressed display remains visible and advances the ordinary effect sequence once; semicolons suppress that event. This is a project output policy, not a native constructor-formatting claim. Writes/delete of published shared handles advance revision/effect sequence even inside a method/function which later errors. Property/default preparation is cooperative; candidates and counters precede the no-allocation/no-await publication barrier. The prepared heap version must still match at commit; accounting/version invariant failures poison the session until reset.
+
+The flat heap supports up to1024 records,64 properties each,64MiB payload and16MiB runtime metadata, with unchanged1B/5M work limits. Actual retained vectors and numeric capacities are counted once, including private/deferred garbage. Fixed-stack tracing visits VM/default/private roots; partial GC remains safe on Stop/drop. No host-stack recursive object destruction or COW is used. One bounded Arc-backed private-root registry supplies owned RAII leases across suspended operations; its stable-std allocation/system OOM boundary is explicitly qualified, while all Vec/numeric reserves remain fallible. Class sessions are thread-affine (!Send/!Sync); immutable outcome snapshots and the existing keyed cancellation handle are independent from mutable heap access.
+
+Initial limits are explicit: acyclic objects only; no class arrays, multiple inheritance, superclass-constructor calls/custom-base construction, overloaded operators/custom indexing, user delete/finalizers, access attributes, reflection or validators. Handle identity equality is built in. Handle-valued defaults are cached once per declaring class/session, shared between instances; constructor-created handles remain distinct. `persistent` and char-valued `class()` instrumentation remain Unsupported rather than simulated. These exclusions remain roadmap work, not full class completion.
+
+Numeric properties support whole-value reads and replacement. Chained member-array indexing such as `obj.Dense(1)` and `obj.Dense(1)=value` is not admitted initially; bind the numeric property to a local variable, index that value, then replace the whole property. This is separate from custom object indexing.
+
+Class value-copy traversal uses a lazily fallible, session-owned1024-entry work Vec rather than a large inline async-frame array. Its actual capacity stays charged to metadata across requests, is reused without cumulative reservation, and is dropped by reset/session destruction. Request completion/drop clears traversal IDs; private candidates remain charged in the object heap until safe GC. The1MiB suspended-future assertion does not alone guarantee default-stack execution: constructor, move/pin, polling and synchronous API paths must also pass the unchanged default-stack tests.

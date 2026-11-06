@@ -12,6 +12,8 @@ use std::time::Instant;
 
 mod conformance;
 mod rust_eval;
+mod rust_repl;
+mod rust_program;
 mod stdin_input;
 mod streaming;
 mod value_probe;
@@ -77,9 +79,37 @@ enum Action {
         /// Display the resulting workspace.
         #[arg(long)]
         workspace: bool,
+        /// Execute this file through the opt-in bounded Rust program runtime.
+        #[arg(long)]
+        rust_program: bool,
+        /// Lower the Rust program's shared control-transition allowance.
+        #[arg(long,requires="rust_program",value_parser=clap::value_parser!(u64).range(0..=1_000_000))]
+        program_transition_fuel: Option<u64>,
+        /// Lower the Rust program's shared primitive-work allowance.
+        #[arg(long,requires="rust_program",value_parser=clap::value_parser!(u64).range(0..=100_000_000))]
+        program_primitive_fuel: Option<u64>,
+        /// Select the additive scientific execution/API/JSON schema.
+        #[arg(long,requires="rust_program",value_parser=["scientific-v1","scientific-v2","class-v1"])]
+        profile: Option<String>,
+        /// Explicit immutable class module files; no ambient class search.
+        #[arg(long="module-file",requires="profile")]
+        module_files: Vec<PathBuf>,
+        #[arg(long,requires="profile",conflicts_with="program_transition_fuel",value_parser=clap::value_parser!(u64).range(0..=5_000_000))]
+        scientific_transition_fuel: Option<u64>,
+        #[arg(long,requires="profile",conflicts_with="program_primitive_fuel",value_parser=clap::value_parser!(u64).range(0..=1_000_000_000))]
+        scientific_primitive_fuel: Option<u64>,
+        /// Export one complete binding to a new destination; never overwrite.
+        #[arg(long,requires_all=["profile","export_file"])]
+        export_binding: Option<String>,
+        #[arg(long,requires_all=["profile","export_binding"])]
+        export_file: Option<PathBuf>,
     },
     /// Start a persistent command-line session.
-    Repl,
+    Repl {
+        /// Select a persistent execution backend; Octave remains the default.
+        #[arg(long, value_enum, default_value_t = EvalBackend::Octave)]
+        backend: EvalBackend,
+    },
     /// Run the assertion fixtures listed in a compatibility manifest.
     Check { manifest: PathBuf },
     /// Compare shared typed fixtures through raw Octave, MathLab and an explicit reference.
@@ -155,14 +185,19 @@ where
             ));
         }
     }
-    if matches!(
-        &cli.command,
+    let rust_command = match &cli.command {
         Action::Eval {
             backend: EvalBackend::Rust,
             ..
-        }
-    ) {
-        let incompatible = if cli.timeout.is_some() {
+        } => Some(("eval", false)),
+        Action::Repl {
+            backend: EvalBackend::Rust,
+        } => Some(("repl", true)),
+        Action::Run{rust_program:true,..}=>Some(("run --rust-program",true)),
+        _ => None,
+    };
+    if let Some((command, supports_timeout)) = rust_command {
+        let incompatible = if cli.timeout.is_some() && !supports_timeout {
             Some("--timeout")
         } else if cli.octave.is_some() {
             Some("--octave")
@@ -176,7 +211,7 @@ where
         if let Some(flag) = incompatible {
             return Err(Cli::command().error(
                 clap::error::ErrorKind::ArgumentConflict,
-                format!("eval --backend rust cannot be used with {flag}"),
+                if matches!(cli.command, Action::Run { rust_program:true, .. }) { format!("{command} cannot be used with {flag}") } else { format!("{command} --backend rust cannot be used with {flag}") },
             ));
         }
     }
@@ -191,6 +226,28 @@ fn run() -> Result<()> {
     } = &cli.command
     {
         return rust_eval::run(code, cli.json);
+    }
+    if let Action::Repl {
+        backend: EvalBackend::Rust,
+    } = &cli.command
+    {
+        return rust_repl::run(
+            cli.json,
+            cli.timeout
+                .map(|seconds| std::time::Duration::from_secs(seconds.get())),
+        );
+    }
+    if let Action::Run{file,workspace,rust_program:true,program_transition_fuel,program_primitive_fuel,profile,module_files,scientific_transition_fuel,scientific_primitive_fuel,export_binding,export_file}=&cli.command{
+        let timeout=cli.timeout.map(|s|std::time::Duration::from_secs(s.get()));
+        if !module_files.is_empty()&&profile.as_deref()!=Some("class-v1"){anyhow::bail!("--module-file requires --profile class-v1")}
+        let exit=if profile.as_deref()==Some("class-v1"){
+            rust_program::class::run(file,module_files,cli.json,*workspace,timeout,scientific_transition_fuel.or(*program_transition_fuel),scientific_primitive_fuel.or(*program_primitive_fuel),export_binding.as_deref().zip(export_file.as_deref()))
+        }else if profile.as_deref()==Some("scientific-v2"){
+            rust_program::scientific_v2::run(file,cli.json,*workspace,timeout,scientific_transition_fuel.or(*program_transition_fuel),scientific_primitive_fuel.or(*program_primitive_fuel),export_binding.as_deref().zip(export_file.as_deref()))
+        }else if profile.as_deref()==Some("scientific-v1"){
+            rust_program::scientific::run(file,cli.json,*workspace,timeout,scientific_transition_fuel.or(*program_transition_fuel),scientific_primitive_fuel.or(*program_primitive_fuel),export_binding.as_deref().zip(export_file.as_deref()))
+        }else{rust_program::run(file,cli.json,*workspace,timeout,*program_transition_fuel,*program_primitive_fuel)};
+        if exit!=0{std::process::exit(exit)}return Ok(());
     }
     // Load explicit selection once, including on diagnostic failure paths. An
     // invalid selection must never cause runtime discovery or a legacy start.
@@ -274,7 +331,7 @@ fn run() -> Result<()> {
         "Octave was not found. Install GNU Octave, set MATHLAB_OCTAVE, or pass --octave /path/to/octave-cli. See scripts/setup-runtime.sh.",
     )?;
     match cli.command {
-        Action::Repl => repl(
+        Action::Repl { .. } => repl(
             start_engine(&executable, directory, startup_config.as_ref())?,
             startup_config.as_ref(),
             cli.json,
@@ -296,7 +353,7 @@ fn run() -> Result<()> {
             print_result(&result, cli.json, true, printer.is_some())?;
             fail_on_execution_error(&result)
         }
-        Action::Run { file, workspace } => {
+        Action::Run { file, workspace, .. } => {
             let file = file.canonicalize().context("The script does not exist")?;
             let mut engine = start_engine(&executable, directory.clone(), startup_config.as_ref())?;
             let printer = start_printer(&engine, cli.json)?;
@@ -908,6 +965,29 @@ fn repl(
 mod tests {
     use super::*;
     #[test]
+    fn rust_program_flag_is_local_and_old_run_stays_default() {
+        assert!(matches!(parse_cli_from(["mathlab", "run", "script.m"]).unwrap().command, Action::Run { rust_program:false, .. }));
+        assert!(matches!(parse_cli_from(["mathlab", "--json", "run", "--rust-program", "--workspace", "script.m"]).unwrap().command, Action::Run { rust_program:true, workspace:true, .. }));
+        assert!(parse_cli_from(["mathlab", "--rust-program", "script.m"]).is_err());
+        assert!(parse_cli_from(["mathlab", "run", "--program-transition-fuel", "1", "script.m"]).is_err());
+        assert!(parse_cli_from(["mathlab", "run", "--rust-program", "--program-primitive-fuel", "100000001", "script.m"]).is_err());
+    }
+
+    #[test]
+    fn rust_program_rejects_native_options_in_either_position() {
+        for (flag, value) in [("--octave", "missing"), ("--startup-config", "missing"), ("--directory", "missing")] {
+            for prefix in [true,false] {
+                let mut args=vec!["mathlab"];
+                if prefix { args.extend([flag,value]); }
+                args.extend(["run", "--rust-program", "script.m"]);
+                if !prefix { args.extend([flag,value]); }
+                assert!(parse_cli_from(args).is_err());
+            }
+        }
+        assert!(parse_cli_from(["mathlab", "--timeout", "1", "run", "--rust-program", "--program-transition-fuel", "0", "script.m"]).is_ok());
+    }
+
+    #[test]
     fn rust_eval_selector_is_local_and_octave_remains_default() {
         for args in [
             vec!["mathlab", "eval", "1+2"],
@@ -931,7 +1011,6 @@ mod tests {
             }
         ));
         assert!(parse_cli_from(["mathlab", "--backend", "rust", "eval", "1+2"]).is_err());
-        assert!(parse_cli_from(["mathlab", "repl", "--backend", "rust"]).is_err());
         assert!(parse_cli_from(["mathlab", "eval", "--backend", "auto", "1+2"]).is_err());
     }
 
@@ -949,6 +1028,66 @@ mod tests {
                     args.extend([flag, value]);
                 }
                 args.extend(["eval", "--backend", "rust", "1"]);
+                if !before {
+                    args.extend([flag, value]);
+                }
+                let error = parse_cli_from(args).err().unwrap();
+                assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+                assert!(error.to_string().contains(flag));
+            }
+        }
+    }
+
+    #[test]
+    fn rust_repl_is_explicit_and_allows_session_deadlines() {
+        for args in [
+            vec!["mathlab", "repl"],
+            vec!["mathlab", "repl", "--backend", "octave"],
+        ] {
+            assert!(matches!(
+                parse_cli_from(args).unwrap().command,
+                Action::Repl {
+                    backend: EvalBackend::Octave
+                }
+            ));
+        }
+        for args in [
+            vec!["mathlab", "repl", "--backend", "rust"],
+            vec!["mathlab", "--timeout", "1", "repl", "--backend", "rust"],
+            vec![
+                "mathlab",
+                "repl",
+                "--backend",
+                "rust",
+                "--timeout",
+                "1",
+                "--json",
+            ],
+        ] {
+            assert!(matches!(
+                parse_cli_from(args).unwrap().command,
+                Action::Repl {
+                    backend: EvalBackend::Rust
+                }
+            ));
+        }
+        assert!(parse_cli_from(["mathlab", "--backend", "rust", "repl"]).is_err());
+        assert!(parse_cli_from(["mathlab", "repl", "--backend", "auto"]).is_err());
+    }
+
+    #[test]
+    fn rust_repl_rejects_octave_options_before_runtime_discovery() {
+        for (flag, value) in [
+            ("--octave", "missing"),
+            ("--startup-config", "missing.json"),
+            ("--directory", "missing"),
+        ] {
+            for before in [false, true] {
+                let mut args = vec!["mathlab"];
+                if before {
+                    args.extend([flag, value]);
+                }
+                args.extend(["repl", "--backend", "rust"]);
                 if !before {
                     args.extend([flag, value]);
                 }

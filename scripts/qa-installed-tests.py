@@ -135,7 +135,9 @@ if action == "doctor":
         print("x"*100000, flush=True)
         time.sleep(10)
     if mode == "doctor-timeout":
-        child = "import pathlib,time; time.sleep(1); pathlib.Path("+repr(os.environ["QA_FAKE_CHILD_MARKER"])+").write_text('survived')"
+        child = ("import json,os,pathlib,time; "
+                 "print(json.dumps({'event':'owned-child-running','pid':os.getpid(),'pgid':os.getpgrp()}),flush=True); "
+                 "time.sleep(1); pathlib.Path("+repr(os.environ["QA_FAKE_CHILD_MARKER"])+").write_text('survived')")
         subprocess.Popen([sys.executable,"-c",child])
         time.sleep(10)
     capabilities = ["typed_nd_page.v1", "atomic_range_edit.v1"]
@@ -1617,10 +1619,40 @@ class InstalledQATests(unittest.TestCase):
     def test_timeout_kills_the_complete_owned_child_process_group(self):
         marker = self.root / "child-survived"
         self.environment["QA_FAKE_CHILD_MARKER"] = str(marker)
-        report = self.run_qa("doctor-timeout", timeout=0.3)
+        real_run = qa.Runner.run
+        def doctor_deadline_only(runner, label, argv, *args, **kwargs):
+            normal_timeout = runner.timeout
+            if label == "doctor":
+                runner.timeout = 0.3
+            try:
+                return real_run(runner, label, argv, *args, **kwargs)
+            finally:
+                runner.timeout = normal_timeout
+        with patch.object(qa.Runner, "run", doctor_deadline_only):
+            report = self.run_qa("doctor-timeout", timeout=5)
+        self.assertEqual(report["checks"]["cli_version"]["status"], "passed", json.dumps(report, indent=2))
+        version = next(item for item in report["commands"] if item["id"] == "cli-version")
+        self.assertEqual(version["timeout_seconds"], 5)
         self.assertEqual(report["checks"]["doctor"]["status"], "failed", json.dumps(report, indent=2))
         command = next(item for item in report["commands"] if item["id"] == "doctor")
+        self.assertEqual(command["timeout_seconds"], 0.3)
         self.assertTrue(command["timed_out"])
+        self.assertEqual(command["cleanup_status"], "passed")
+        self.assertFalse(command["cleanup_errors"])
+        self.assertEqual(command["exit_code"], -qa.signal.SIGKILL)
+        child_rows = []
+        for line in (Path(report["report_directory"]) / command["stdout_log"]).read_text().splitlines():
+            try:
+                value = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(value, dict) and value.get("event") == "owned-child-running":
+                child_rows.append(value)
+        self.assertEqual(len(child_rows), 1, "Timeout must reach a running owned descendant, not just process startup")
+        self.assertIs(type(child_rows[0]["pid"]), int)
+        self.assertGreater(child_rows[0]["pid"], 0)
+        self.assertNotEqual(child_rows[0]["pid"], command["pid"])
+        self.assertEqual(child_rows[0]["pgid"], command["pid"], "Descendant must belong to the real doctor's process group")
         time.sleep(1.05)
         self.assertFalse(marker.exists(), "the spawned child survived its process-group deadline")
         self.assertFalse(Path(report["temporary_project"]).exists())

@@ -1,12 +1,12 @@
 # Third-party provenance
 
-Open MathLab's application source is GPL-3.0-or-later. Its scientific execution engine is a separately installed GNU Octave process. The application does not translate the Octave codebase into Rust, and this repository does not redistribute an Octave binary. Exact Rust dependency versions are recorded in `Cargo.lock`.
+Open MathLab's application source is GPL-3.0-or-later. The explicit Rust program profiles implement their own bounded language and numerical execution and do not discover, start or require GNU Octave or MATLAB. Ordinary/default execution routes retain the separately installed GNU Octave backend; they are distinct from the explicit Rust routes. The application does not translate the Octave codebase into Rust, and this repository does not redistribute an Octave or MATLAB binary. Exact Rust dependency versions are recorded in `Cargo.lock`.
 
-The optional native debugger adapter is project-owned GPL-3.0-or-later C++ code using GNU Octave's public interpreter/event/breakpoint interfaces. `--with-debugger` builds an `.oct` module against the selected local Octave development installation. The macOS bundle includes that module, its recorded compiler runtime version, and the corresponding C++ source. It still requires a compatible separately installed Octave runtime. Numerical algorithms and interpreter implementation remain supplied by Octave.
+The optional native debugger adapter is project-owned GPL-3.0-or-later C++ code using GNU Octave's public interpreter/event/breakpoint interfaces. `--with-debugger` builds an `.oct` module against the selected local Octave development installation. The macOS bundle includes that module, its recorded compiler runtime version, and the corresponding C++ source. It still requires a compatible separately installed Octave runtime. Those optional adapters forward execution to Octave; they do not supply the independent Rust profile algorithms or interpreter.
 
 | Component | Role | Upstream license / source |
 | --- | --- | --- |
-| GNU Octave | Persistent MATLAB-style language and numerical execution | GPL-3.0-or-later; [project](https://octave.org/about), [COPYING](https://github.com/gnu-octave/octave/blob/default/COPYING), [Homebrew runtime metadata](https://formulae.brew.sh/formula/octave) |
+| GNU Octave | External legacy/default execution backend; not required by explicit Rust profiles | GPL-3.0-or-later; [project](https://octave.org/about), [COPYING](https://github.com/gnu-octave/octave/blob/default/COPYING), [Homebrew runtime metadata](https://formulae.brew.sh/formula/octave) |
 | egui / eframe | Native Rust desktop | MIT OR Apache-2.0; [upstream](https://github.com/emilk/egui), [MIT](https://github.com/emilk/egui/blob/0.33.3/LICENSE-MIT), [Apache](https://github.com/emilk/egui/blob/0.33.3/LICENSE-APACHE) |
 | rfd | Native file dialogs | MIT; [upstream](https://github.com/PolyMeilex/rfd) |
 | image | Decode figure PNG previews | MIT OR Apache-2.0; [upstream](https://github.com/image-rs/image) |
@@ -22,6 +22,8 @@ python3 scripts/generate-notices.py dist/licenses
 ```
 
 By default the script inventories the actual Cargo **normal/build dependency tree** for `mathlab-desktop` and `mathlab-cli` on the configured target or Rust host. The local `aarch64-apple-darwin` build selects **160 external crates**. Inactive optional dependencies, dependencies for other platforms, and dev-only dependencies are excluded from that default tree. `--target TRIPLE`, `--package NAME`, and `--all-platforms` allow explicit inventories of other configurations.
+
+A headless CLI distribution must select its own target-specific closure with `--package mathlab-cli --target TARGET --require-complete`. It must not reuse the desktop dependency count or claim that optional GUI/Octave components are included or required. The exact selected inventory and original license texts remain release gates; the Rust profile scope does not imply support for every MATLAB language or numerical feature.
 
 The generated `index.json` records package names, versions, license expressions, repositories, copied texts, immutable upstream source URLs, SHA-256 hashes, and any missing texts. It also scans nested notices, including egui's bundled-font OFL, Ubuntu-font, and emoji font MIT terms. Where published crates omit their shared-workspace notices, original texts are retained under `third-party/licenses/` at the exact git commits in the crates' `.cargo_vcs_info.json`; the generator verifies the recorded file hashes before copying them. `scripts/fetch-upstream-licenses.py` is an explicit network operation for updating those retained notices after dependency changes. It does not run automatically during packaging.
 

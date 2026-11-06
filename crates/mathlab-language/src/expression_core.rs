@@ -25,6 +25,7 @@ pub(crate) enum CoreTokenKind {
     Number,
     Identifier,
     Assign,
+    Colon,
     Plus,
     Minus,
     Star,
@@ -43,8 +44,36 @@ pub(crate) struct CoreNode {
     pub span: SourceSpan,
     pub kind: CoreNodeKind,
 }
+// Session call markers have a source span but produce no expression value.
+#[derive(Debug)]
+pub(crate) enum CallArgument {
+    Expression(LiteralNodeIdV1),
+    FullAxis(SourceSpan),
+}
+impl CallArgument {
+    pub(crate) fn expression(&self) -> Option<LiteralNodeIdV1> {
+        match self { Self::Expression(id) => Some(*id), Self::FullAxis(_) => None }
+    }
+}
 #[derive(Debug)]
 pub(crate) enum CoreNodeKind {
+    IndexedWrite {
+        target_span: SourceSpan,
+        selection_span: SourceSpan,
+        arguments: Vec<CallArgument>,
+        rhs: LiteralNodeIdV1,
+    },
+    Range {
+        start: LiteralNodeIdV1,
+        step: Option<LiteralNodeIdV1>,
+        end: LiteralNodeIdV1,
+        colon_span: SourceSpan,
+        second_colon_span: Option<SourceSpan>,
+    },
+    Call {
+        callee_span: SourceSpan,
+        arguments: Vec<CallArgument>,
+    },
     Identifier {
         identifier_span: SourceSpan,
     },
@@ -114,7 +143,7 @@ impl CoreParsed {
         )?;
         for node in self.nodes {
             let kind = match node.kind {
-                CoreNodeKind::Identifier { .. } => {
+                CoreNodeKind::IndexedWrite { .. } | CoreNodeKind::Identifier { .. } | CoreNodeKind::Call { .. } | CoreNodeKind::Range { .. } => {
                     unreachable!("legacy profiles reject identifiers during lexing")
                 }
                 CoreNodeKind::Number { literal_span } => LiteralNodeKindV1::Number {
@@ -175,6 +204,22 @@ pub(crate) struct NodeView<'a> {
 }
 #[derive(Clone, Copy)]
 pub(crate) enum NodeKindView<'a> {
+    IndexedWrite {
+        target_span: &'a SourceSpan,
+        selection_span: &'a SourceSpan,
+        arguments: &'a [CallArgument],
+        rhs: LiteralNodeIdV1,
+    },
+    Construction { rows: &'a [Vec<LiteralNodeIdV1>] },
+    Range {
+        start: LiteralNodeIdV1,
+        step: Option<LiteralNodeIdV1>,
+        end: LiteralNodeIdV1,
+    },
+    Call {
+        callee_span: &'a SourceSpan,
+        arguments: &'a [CallArgument],
+    },
     Identifier {
         identifier_span: &'a SourceSpan,
     },
@@ -227,6 +272,15 @@ impl NodeArena for CoreParsed {
         NodeView {
             span: &node.span,
             kind: match &node.kind {
+                CoreNodeKind::Range { start, step, end, .. } => {
+                    NodeKindView::Range { start:*start, step:*step, end:*end }
+                }
+                CoreNodeKind::IndexedWrite { target_span, selection_span, arguments, rhs } => {
+                    NodeKindView::IndexedWrite { target_span, selection_span, arguments, rhs: *rhs }
+                }
+                CoreNodeKind::Call { callee_span, arguments } => {
+                    NodeKindView::Call { callee_span, arguments }
+                }
                 CoreNodeKind::Identifier { identifier_span } => {
                     NodeKindView::Identifier { identifier_span }
                 }
@@ -247,7 +301,14 @@ impl NodeArena for CoreParsed {
                     operand: *operand,
                 },
                 CoreNodeKind::Group { inner } => NodeKindView::Group { inner: *inner },
-                CoreNodeKind::Matrix { rows } => NodeKindView::Matrix { rows },
+                CoreNodeKind::Matrix { rows } => {
+                    // Legacy parsers only create numeric rows. Session retains the
+                    // same core carrier/IDs and exposes expression rows privately.
+                    if rows.iter().flatten().all(|id| matches!(self.nodes[id.index()].kind,
+                        CoreNodeKind::Number { .. } | CoreNodeKind::Signed { .. })) {
+                        NodeKindView::Matrix { rows }
+                    } else { NodeKindView::Construction { rows } }
+                }
                 CoreNodeKind::Binary {
                     operator,
                     left,
@@ -356,7 +417,7 @@ impl From<CoreParseError> for LiteralExpressionErrorV1 {
                     CoreTokenKind::CloseBracket => LiteralTokenKindV1::CloseBracket,
                     CoreTokenKind::Comma => LiteralTokenKindV1::Comma,
                     CoreTokenKind::Semicolon => LiteralTokenKindV1::Semicolon,
-                    CoreTokenKind::Identifier | CoreTokenKind::Assign => {
+                    CoreTokenKind::Identifier | CoreTokenKind::Assign | CoreTokenKind::Colon => {
                         unreachable!("legacy profiles reject session tokens during lexing")
                     }
                     CoreTokenKind::Star
@@ -723,6 +784,7 @@ where
             byte => {
                 let kind = match byte {
                     b'=' if session => CoreTokenKind::Assign,
+                    b':' if session => CoreTokenKind::Colon,
                     b'+' => CoreTokenKind::Plus,
                     b'-' => CoreTokenKind::Minus,
                     b'*' if arithmetic => CoreTokenKind::Star,
@@ -770,6 +832,7 @@ struct Parser<'a> {
     depth: usize,
     arithmetic: bool,
     session: bool,
+    bracket_entry: bool,
     nodes: Vec<CoreNode>,
 }
 
@@ -851,11 +914,56 @@ impl Parser<'_> {
     }
 
     fn expression(&mut self) -> Result<LiteralNodeIdV1, CoreParseError> {
+        let start = self.sum_expression()?;
+        if !self.session || !self.peek().is_some_and(|token| token.kind==CoreTokenKind::Colon) {
+            return Ok(start);
+        }
+        self.charge(false,false)?;
+        let colon_span = self.at();
+        self.position += 1;
+        let middle = self.sum_expression()?;
+        let (step,end,second_colon_span) = if self.peek().is_some_and(|token| token.kind==CoreTokenKind::Colon) {
+            self.charge(false,false)?;
+            let second = self.at();
+            self.position += 1;
+            (Some(middle),self.sum_expression()?,Some(second))
+        } else {
+            (None,middle,None)
+        };
+        Ok(self.store(CoreNode {
+            span:cover(&self.nodes[start.index()].span,&self.nodes[end.index()].span),
+            kind:CoreNodeKind::Range {start,step,end,colon_span,second_colon_span},
+        }))
+    }
+
+    fn ascii_gap_before(&self) -> bool {
+        self.position > 0 && self.peek().is_some_and(|next| {
+            let gap = &self.source.as_bytes()[self.tokens[self.position - 1].end..next.start];
+            !gap.is_empty() && gap.iter().all(|&b| matches!(b, b' ' | b'\t'))
+        })
+    }
+
+    fn attached_prefix_after_gap(&self) -> bool {
+        if !self.ascii_gap_before() { return false; }
+        let mut at = self.position;
+        while let Some(sign) = self.tokens.get(at).filter(|t|
+            matches!(t.kind, CoreTokenKind::Plus | CoreTokenKind::Minus)) {
+            let Some(next) = self.tokens.get(at + 1) else { return false; };
+            if sign.end != next.start { return false; }
+            at += 1;
+        }
+        self.tokens.get(at).is_some_and(|t| matches!(t.kind,
+            CoreTokenKind::Number | CoreTokenKind::Identifier |
+            CoreTokenKind::OpenParen | CoreTokenKind::OpenBracket))
+    }
+
+    fn sum_expression(&mut self) -> Result<LiteralNodeIdV1, CoreParseError> {
         let mut left = self.product()?;
         while self.peek().is_some_and(|token| {
             token.kind == CoreTokenKind::Plus
                 || (self.arithmetic && token.kind == CoreTokenKind::Minus)
         }) {
+            if self.bracket_entry && self.attached_prefix_after_gap() { break; }
             self.charge(false, false)?;
             let operator_span = self.at();
             let operator = match self.peek().expect("binary token").kind {
@@ -990,12 +1098,15 @@ impl Parser<'_> {
                 self.charge(false, false)?;
                 let at = self.at();
                 self.position += 1;
-                Ok(self.store(CoreNode {
-                    span: at.clone(),
-                    kind: CoreNodeKind::Identifier {
-                        identifier_span: at,
-                    },
-                }))
+                if self.peek().is_some_and(|token| token.kind == CoreTokenKind::OpenParen)
+                    && !(self.bracket_entry && self.ascii_gap_before()) {
+                    self.call(at)
+                } else {
+                    Ok(self.store(CoreNode {
+                        span: at.clone(),
+                        kind: CoreNodeKind::Identifier { identifier_span: at },
+                    }))
+                }
             }
             Some(CoreTokenKind::Number | CoreTokenKind::Plus | CoreTokenKind::Minus) => {
                 self.signed()
@@ -1004,7 +1115,10 @@ impl Parser<'_> {
                 self.charge(true, false)?;
                 let start = self.at();
                 self.position += 1;
+                let outer_boundary = self.bracket_entry;
+                self.bracket_entry = false;
                 let inner = self.expression()?;
+                self.bracket_entry = outer_boundary;
                 if !self
                     .peek()
                     .is_some_and(|token| token.kind == CoreTokenKind::CloseParen)
@@ -1022,6 +1136,48 @@ impl Parser<'_> {
             Some(CoreTokenKind::OpenBracket) => self.matrix(),
             _ => Err(self.expected(ExpectedSyntaxV1::Primary).into()),
         }
+    }
+
+    fn call(&mut self, callee_span: SourceSpan) -> Result<LiteralNodeIdV1, CoreParseError> {
+        // Charge the call delimiter and each argument in addition to its expression.
+        // The caller already charged the callee. Only session primaries reach here.
+        self.charge(true, false)?;
+        self.position += 1;
+        let outer_boundary = self.bracket_entry;
+        self.bracket_entry = false;
+        let mut arguments = Vec::new();
+        if !self.peek().is_some_and(|token| token.kind == CoreTokenKind::CloseParen) {
+            loop {
+                self.charge(false, false)?;
+                let argument = if self.peek().is_some_and(|token| token.kind == CoreTokenKind::Colon)
+                    && self.tokens.get(self.position + 1).is_some_and(|token|
+                        matches!(token.kind, CoreTokenKind::Comma | CoreTokenKind::CloseParen)) {
+                    let span = self.at();
+                    self.position += 1;
+                    CallArgument::FullAxis(span)
+                } else { CallArgument::Expression(self.expression()?) };
+                let span = match &argument {
+                    CallArgument::Expression(id) => self.nodes[id.index()].span.clone(),
+                    CallArgument::FullAxis(span) => span.clone(),
+                };
+                push(&mut arguments, argument, self.source, LiteralStageV1::Parse, &span)?;
+                if !self.peek().is_some_and(|token| token.kind == CoreTokenKind::Comma) {
+                    break;
+                }
+                self.position += 1;
+            }
+        }
+        if !self.peek().is_some_and(|token| token.kind == CoreTokenKind::CloseParen) {
+            return Err(self.expected(ExpectedSyntaxV1::CloseParen));
+        }
+        let end = self.at();
+        self.position += 1;
+        self.depth -= 1;
+        self.bracket_entry = outer_boundary;
+        Ok(self.store(CoreNode {
+            span: cover(&callee_span, &end),
+            kind: CoreNodeKind::Call { callee_span, arguments },
+        }))
     }
 
     fn signed(&mut self) -> Result<LiteralNodeIdV1, CoreParseError> {
@@ -1066,6 +1222,50 @@ impl Parser<'_> {
     }
 
     fn matrix(&mut self) -> Result<LiteralNodeIdV1, CoreParseError> {
+        if !self.session { return self.numeric_matrix(); }
+        self.charge(true, false)?;
+        let start = self.at();
+        self.position += 1;
+        let outer_boundary = self.bracket_entry;
+        self.bracket_entry = true;
+        let mut rows = Vec::new();
+        if !self.peek().is_some_and(|t| t.kind == CoreTokenKind::CloseBracket) {
+            loop {
+                let mut row = Vec::new();
+                loop {
+                    let entry = self.expression()?;
+                    push(&mut row, entry, self.source, LiteralStageV1::Parse,
+                        &self.nodes[entry.index()].span)?;
+                    if self.peek().is_some_and(|t| t.kind == CoreTokenKind::Comma) {
+                        self.position += 1;
+                    } else if !(self.ascii_gap_before() && self.peek().is_some_and(|t|
+                        matches!(t.kind, CoreTokenKind::Number | CoreTokenKind::Identifier |
+                            CoreTokenKind::OpenParen | CoreTokenKind::OpenBracket |
+                            CoreTokenKind::Plus | CoreTokenKind::Minus))) {
+                        break;
+                    }
+                }
+                push(&mut rows, row, self.source, LiteralStageV1::Parse, &start)?;
+                if self.peek().is_some_and(|t| t.kind == CoreTokenKind::Semicolon) {
+                    self.position += 1;
+                } else { break; }
+            }
+        }
+        if !self.peek().is_some_and(|t| t.kind == CoreTokenKind::CloseBracket) {
+            return Err(self.expected(ExpectedSyntaxV1::MatrixSeparatorOrClose));
+        }
+        let end = self.at();
+        self.position += 1;
+        self.depth -= 1;
+        self.bracket_entry = outer_boundary;
+        // The private view distinguishes expression rows; numeric rows retain
+        // their historical core carrier, node IDs, admission and exact bits.
+        Ok(self.store(CoreNode {
+            span: cover(&start, &end), kind: CoreNodeKind::Matrix { rows },
+        }))
+    }
+
+    fn numeric_matrix(&mut self) -> Result<LiteralNodeIdV1, CoreParseError> {
         self.charge(true, false)?;
         let start = self.at();
         self.position += 1;
@@ -1084,11 +1284,24 @@ impl Parser<'_> {
                     LiteralStageV1::Parse,
                     &self.nodes[first.index()].span,
                 )?;
-                while self
-                    .peek()
-                    .is_some_and(|token| token.kind == CoreTokenKind::Comma)
-                {
-                    self.position += 1;
+                loop {
+                    if self.peek().is_some_and(|token| token.kind == CoreTokenKind::Comma) {
+                        self.position += 1;
+                    } else {
+                        // Only Session numeric matrices gain implicit separators.
+                        // signed() already consumed a Number, so its token ends the entry.
+                        let Some(next) = self.peek().filter(|_| self.session) else { break };
+                        let gap = &self.source.as_bytes()[self.tokens[self.position - 1].end..next.start];
+                        let numeric = match next.kind {
+                            CoreTokenKind::Number => true,
+                            CoreTokenKind::Plus | CoreTokenKind::Minus => self.tokens.get(self.position + 1)
+                                .is_some_and(|number| number.kind == CoreTokenKind::Number && next.end == number.start),
+                            _ => false,
+                        };
+                        if gap.is_empty() || !gap.iter().all(|&byte| matches!(byte, b' ' | b'\t')) || !numeric {
+                            break;
+                        }
+                    }
                     let entry = self.signed()?;
                     push(
                         &mut row,
@@ -1156,7 +1369,7 @@ where
         numbers: 0,
         depth: 0,
         arithmetic,
-        session: false,
+        session: false, bracket_entry: false,
         nodes,
     };
     let root = parser.expression()?;
@@ -1186,6 +1399,42 @@ pub(crate) struct CoreStatement {
     pub suppressed: bool,
 }
 
+// Only Session call-argument leaves defer the reserved lowercase keyword.
+// Scan balanced parenthesis ancestry; construction brackets preserve call context.
+fn bracket_entry_at(tokens: &[Token], at: usize) -> bool {
+    let mut closed = 0_usize;
+    for token in tokens[..at].iter().rev() {
+        match token.kind {
+            CoreTokenKind::CloseParen | CoreTokenKind::CloseBracket => closed += 1,
+            CoreTokenKind::OpenParen | CoreTokenKind::OpenBracket if closed != 0 => closed -= 1,
+            CoreTokenKind::OpenParen => return false,
+            CoreTokenKind::OpenBracket => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn contextual_end(tokens: &[Token], at: usize) -> bool {
+    if tokens.get(at + 1).is_some_and(|t| t.kind == CoreTokenKind::OpenParen) {
+        return false; // A keyword never becomes a callee.
+    }
+    let mut parentheses = 0_usize;
+    let mut in_call = false;
+    for index in (0..at).rev() {
+        match tokens[index].kind {
+            CoreTokenKind::CloseParen => parentheses += 1,
+            CoreTokenKind::OpenParen if parentheses != 0 => parentheses -= 1,
+            CoreTokenKind::OpenParen => {
+                in_call |= index > 0 && tokens[index - 1].kind == CoreTokenKind::Identifier
+                    && !(tokens[index - 1].end < tokens[index].start && bracket_entry_at(tokens, index));
+            }
+            _ => {}
+        }
+    }
+    in_call
+}
+
 pub(crate) fn parse_session_core<E>(
     source: Arc<str>,
     scan_number: fn(&Arc<str>, usize, usize, usize) -> Option<Result<usize, E>>,
@@ -1196,8 +1445,11 @@ where
 {
     let frame = frame(&source)?;
     let tokens = lex_with_number_scanner(&source, frame, scan_number, true, true)?;
-    for token in &tokens {
+    for (index, token) in tokens.iter().enumerate() {
         if token.kind == CoreTokenKind::Identifier {
+            if &source[token.start..token.end] == "end" && contextual_end(&tokens, index) {
+                continue;
+            }
             validate_identifier(&source, &token.span(frame.line))?;
         }
     }
@@ -1226,10 +1478,10 @@ where
         numbers: 0,
         depth: 0,
         arithmetic: true,
-        session: true,
+        session: true, bracket_entry: false,
         nodes,
     };
-    let target = match (expression_tokens.first(), expression_tokens.get(1)) {
+    let mut target = match (expression_tokens.first(), expression_tokens.get(1)) {
         (Some(name), Some(assign))
             if name.kind == CoreTokenKind::Identifier && assign.kind == CoreTokenKind::Assign =>
         {
@@ -1241,7 +1493,27 @@ where
         }
         _ => None,
     };
-    let root = parser.expression()?;
+    let mut root = parser.expression()?;
+    if target.is_none() && parser.peek().is_some_and(|token| token.kind == CoreTokenKind::Assign) {
+        // Parse once: a direct call header becomes the private write root.
+        let direct = matches!(&parser.nodes[root.index()].kind, CoreNodeKind::Call {callee_span,..}
+            if expression_tokens.first().is_some_and(|t| t.kind == CoreTokenKind::Identifier
+                && t.start == callee_span.start));
+        if !direct { return Err(parser.expected(ExpectedSyntaxV1::EndOfExpression).into()); }
+        parser.charge(false, false)?;
+        parser.position += 1;
+        assert_eq!(root.index() + 1, parser.nodes.len());
+        let header = parser.nodes.pop().expect("direct call is the last parsed node");
+        let CoreNodeKind::Call {callee_span, arguments} = header.kind else { unreachable!() };
+        let rhs = parser.expression()?;
+        target = Some(callee_span.clone());
+        root = parser.store(CoreNode {
+            span: cover(&header.span, &parser.nodes[rhs.index()].span),
+            kind: CoreNodeKind::IndexedWrite {
+                target_span: callee_span, selection_span: header.span, arguments, rhs,
+            },
+        });
+    }
     if parser.peek().is_some() {
         return Err(parser.expected(ExpectedSyntaxV1::EndOfExpression).into());
     }
@@ -1321,7 +1593,7 @@ where
         }
     }
 
-    // Matrices cannot contain matrices under this grammar; their postorder
+    // Numeric Matrix nodes cannot contain other matrices; their postorder
     // arena order is therefore also their opening-byte order. Check all geometry
     // before allocating any column-major constructor payload.
     for index in 0..parsed.len() {
@@ -1429,7 +1701,7 @@ mod tests {
             numbers: 256,
             depth: 32,
             arithmetic: false,
-            session: false,
+            session: false, bracket_entry: false,
             nodes: Vec::new(),
         };
         let error: LiteralExpressionErrorV1 = parser.charge(true, true).unwrap_err().into();
@@ -1528,4 +1800,150 @@ mod tests {
         }
         assert!(values.is_empty());
     }
+
+    #[test]
+    fn session_range_retains_original_colon_and_operand_spans() {
+        use crate::session_expression::SessionExpressionErrorV1;
+        fn scanner(source:&Arc<str>,start:usize,end:usize,line:usize)
+            -> Option<Result<usize,SessionExpressionErrorV1>> {
+            scan_exact_integer(source,start,end,line).map(|r| r.map_err(Into::into))
+        }
+        let source:Arc<str> = Arc::from("% π header\n  (1+1):2:8; % tail\n");
+        let statement = parse_session_core::<SessionExpressionErrorV1>(Arc::clone(&source),scanner,|_,_| Ok(())).unwrap();
+        assert!(statement.suppressed);
+        match &statement.parsed.root().kind {
+            CoreNodeKind::Range {start,step:Some(step),end,colon_span,second_colon_span:Some(second)} => {
+                for (id,text) in [(*start,"(1+1)"),(*step,"2"),(*end,"8")] {
+                    let span = &statement.parsed.node(id).unwrap().span;
+                    assert_eq!(&source[span.start..span.end],text);
+                    assert_eq!(span.start_line,2);
+                }
+                let offsets = source.match_indices(':').map(|(i,_)| i).collect::<Vec<_>>();
+                assert_eq!((colon_span.start,colon_span.end),(offsets[0],offsets[0]+1));
+                assert_eq!((second.start,second.end),(offsets[1],offsets[1]+1));
+                assert_eq!((colon_span.start_line,second.start_line),(2,2));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    #[test]
+    fn session_matrix_gap_retains_original_nodes_spans_and_charges() {
+        use crate::session_expression::SessionExpressionErrorV1;
+        fn scanner(source:&Arc<str>,start:usize,end:usize,line:usize)
+            -> Option<Result<usize,SessionExpressionErrorV1>> {
+            scan_exact_integer(source,start,end,line).map(|r|r.map_err(Into::into))
+        }
+        for matrix in ["[1  -2;3\t+4]","[1,-2;3,+4]","[1,- 2;3,+ 4]"] {
+            let source:Arc<str>=Arc::from(format!("% π header\n  {matrix} % tail"));
+            let frame=frame(&source).unwrap();
+            let tokens=lex_with_number_scanner(&source,frame,scanner,true,true).unwrap();
+            let mut parser=Parser {source:&source,frame,tokens:&tokens,position:0,charged_nodes:0,numbers:0,depth:0,arithmetic:true,session:true, bracket_entry: false,nodes:Vec::with_capacity(7)};
+            let root=parser.matrix().unwrap();
+            assert_eq!((parser.charged_nodes,parser.numbers,parser.depth,parser.nodes.len()),(7,4,0,7));
+            let node=&parser.nodes[root.index()];assert_eq!(&source[node.span.start..node.span.end],matrix);
+            assert_eq!(node.span.start_line,2);
+            let mut numbers=Vec::new();let mut signs=Vec::new();
+            for node in &parser.nodes {
+                assert_eq!(node.span.start_line,2);
+                match &node.kind {
+                    CoreNodeKind::Number {literal_span}=>numbers.push(&source[literal_span.start..literal_span.end]),
+                    CoreNodeKind::Signed {sign_span,number,..}=>{
+                        signs.push(&source[sign_span.start..sign_span.end]);
+                        assert_eq!((node.span.start,node.span.end),(sign_span.start,parser.nodes[number.index()].span.end));
+                        assert_eq!(&source[parser.nodes[number.index()].span.start..parser.nodes[number.index()].span.end],if signs.len()==1 {"2"} else {"4"});
+                    },
+                    CoreNodeKind::Matrix {rows}=>assert_eq!(rows.iter().map(Vec::len).collect::<Vec<_>>(),[2,2]),
+                    other=>panic!("unexpected synthetic node: {other:?}"),
+                }
+            }
+            assert_eq!(numbers,["1","2","3","4"]);assert_eq!(signs,["-","+"]);
+        }
+    }
+
+    #[test]
+    fn session_full_axis_argument_spans_nodes_and_charges() {
+        use crate::session_expression::SessionExpressionErrorV1;
+        fn scanner(source:&Arc<str>,start:usize,end:usize,line:usize)
+            -> Option<Result<usize,SessionExpressionErrorV1>> {
+            scan_exact_integer(source,start,end,line).map(|r|r.map_err(Into::into))
+        }
+        for (expression,charged,numbers,nodes,markers) in [
+            ("A(end)",4,0,2,0),("A((end))",5,0,3,0),("A(:)",3,0,1,1),("A(:,:)",4,0,1,2),("A(1,:)",5,1,2,1),
+            ("A(:,1)",5,1,2,1),("A(1,2)",6,2,3,0),("A(B(:),:)",7,0,2,2),
+        ] {
+            let source:Arc<str>=Arc::from(format!("% π header\n  {expression} % tail"));
+            let frame=frame(&source).unwrap();let tokens=lex_with_number_scanner(&source,frame,scanner,true,true).unwrap();
+            let mut parser=Parser {source:&source,frame,tokens:&tokens,position:0,charged_nodes:0,numbers:0,depth:0,arithmetic:true,session:true, bracket_entry: false,nodes:Vec::with_capacity(nodes)};
+            let root=parser.expression().unwrap();
+            assert_eq!((parser.charged_nodes,parser.numbers,parser.depth,parser.nodes.len()),(charged,numbers,0,nodes),"{expression}");
+            assert_eq!(&source[parser.nodes[root.index()].span.start..parser.nodes[root.index()].span.end],expression);
+            let mut seen=0;
+            for node in &parser.nodes {
+                if let CoreNodeKind::Call {arguments,..}=&node.kind {
+                    for argument in arguments {
+                        if let CallArgument::FullAxis(span)=argument {
+                            assert_eq!(&source[span.start..span.end],":");assert_eq!(span.start_line,2);seen+=1;
+                        }
+                    }
+                }
+            }
+            assert_eq!(seen,markers);
+        }
+        // A marker consumes the existing argument charge, without a Number charge.
+        let source:Arc<str>=Arc::from("A(:)");let frame=frame(&source).unwrap();let tokens=lex_with_number_scanner(&source,frame,scanner,true,true).unwrap();
+        let mut parser=Parser {source:&source,frame,tokens:&tokens,position:0,charged_nodes:1021,numbers:256,depth:0,arithmetic:true,session:true, bracket_entry: false,nodes:Vec::with_capacity(1)};
+        parser.expression().unwrap();assert_eq!((parser.charged_nodes,parser.numbers),(1024,256));
+    }
+
+    #[test]
+    fn session_construction_numeric_fastpath_nodes_charges_and_rows() {
+        use crate::session_expression::SessionExpressionErrorV1;
+        fn scanner(source:&Arc<str>,start:usize,end:usize,line:usize)
+            -> Option<Result<usize,SessionExpressionErrorV1>> {
+            scan_exact_integer(source,start,end,line).map(|r|r.map_err(Into::into))
+        }
+        for expression in ["[]","[1 -2;3 +4]","[1,- 2;3,+ 4]","[-0,+0]","[1 2,3;4,5 6]"] {
+            let source:Arc<str>=Arc::from(format!("% π original\n  {expression} % tail"));
+            let frame=frame(&source).unwrap();let tokens=lex_with_number_scanner(&source,frame,scanner,true,true).unwrap();
+            let parse=|new| {
+                let mut parser=Parser {source:&source,frame,tokens:&tokens,position:0,charged_nodes:0,numbers:0,depth:0,arithmetic:true,session:true,bracket_entry:false,nodes:Vec::with_capacity(32)};
+                let root=if new {parser.matrix()} else {parser.numeric_matrix()}.unwrap();
+                assert!(matches!(parser.nodes[root.index()].kind,CoreNodeKind::Matrix {..}));
+                (format!("{:?}",parser.nodes),root.index(),parser.charged_nodes,parser.numbers,parser.position,parser.depth)
+            };
+            assert_eq!(parse(true),parse(false),"{expression}");
+        }
+        let source:Arc<str>=Arc::from("[A B;C]");let frame=frame(&source).unwrap();let tokens=lex_with_number_scanner(&source,frame,scanner,true,true).unwrap();
+        let mut parser=Parser {source:&source,frame,tokens:&tokens,position:0,charged_nodes:0,numbers:0,depth:0,arithmetic:true,session:true,bracket_entry:false,nodes:Vec::with_capacity(4)};
+        let root=parser.matrix().unwrap();assert_eq!((parser.nodes.len(),parser.charged_nodes,parser.numbers,parser.depth),(4,4,0,0));
+        let parsed=CoreParsed {source:Arc::clone(&source),nodes:parser.nodes,root};
+        let NodeKindView::Construction {rows}=parsed.view(root).kind else {panic!("expected private construction view");};assert_eq!(rows.iter().map(Vec::len).collect::<Vec<_>>(),[2,1]);
+    }
+
+    #[test]
+    fn session_indexed_write_root_postorder_spans_charges_and_projection_isolation() {
+        use crate::session_expression::SessionExpressionErrorV1;
+        fn scanner(source:&Arc<str>,start:usize,end:usize,line:usize)
+            -> Option<Result<usize,SessionExpressionErrorV1>> {
+            scan_exact_integer(source,start,end,line).map(|r|r.map_err(Into::into))
+        }
+        let source:Arc<str>=Arc::from("% π header\n  A(end,:)=([1;2]); % tail");
+        let statement=parse_session_core::<SessionExpressionErrorV1>(Arc::clone(&source),scanner,|_,_|Ok(())).unwrap();
+        assert!(statement.suppressed);assert!(matches!(statement.effect,CoreStatementEffect::Assign(_)));
+        let parsed=statement.parsed;assert_eq!(parsed.nodes.len(),6);assert_eq!(parsed.root.index(),5);
+        let CoreNodeKind::IndexedWrite {target_span,selection_span,arguments,rhs}=&parsed.root().kind else {panic!("private write root required");};
+        assert_eq!(&source[target_span.start..target_span.end],"A");assert_eq!(&source[selection_span.start..selection_span.end],"A(end,:)");assert_eq!(&source[parsed.root().span.start..parsed.root().span.end],"A(end,:)=([1;2])");assert_eq!(parsed.root().span.start_line,2);
+        assert_eq!(arguments[0].expression().unwrap().index(),0);assert!(matches!(arguments[1],CallArgument::FullAxis(_)));assert_eq!(rhs.index(),4);
+        assert_eq!(&source[parsed.nodes[rhs.index()].span.start..parsed.nodes[rhs.index()].span.end],"([1;2])");
+        assert!(matches!(parsed.view(parsed.root).kind,NodeKindView::IndexedWrite {..}));
+        for (signs,valid) in [(1019,true),(1020,false)] {
+            let source:Arc<str>=Arc::from(format!("A(:)={}B","-".repeat(signs)));
+            let result=parse_session_core::<SessionExpressionErrorV1>(source,scanner,|_,_|Ok(()));assert_eq!(result.is_ok(),valid);
+        }
+        for count in [256,257] {
+            let source:Arc<str>=Arc::from(format!("A(:)={}",vec!["1";count].join("+")));
+            assert_eq!(parse_session_core::<SessionExpressionErrorV1>(source,scanner,|_,_|Ok(())).is_ok(),count==256);
+        }
+    }
+
 }

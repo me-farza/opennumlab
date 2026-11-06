@@ -1330,5 +1330,178 @@ fn qualified_frontend_graphics_v2_png_export_survives_stop_clear_and_restart() {
     actual_frontend_png_export_lifecycle(true);
 }
 
+fn actual_frontend_glyph_exports(graphics: bool) {
+    let started = Instant::now();
+    let selected = if graphics {
+        selected_graphics_config()
+    } else {
+        selected_config()
+    };
+    let profile = if graphics { "graphics6" } else { "core5" };
+    let retained = selected_path("MATHLAB_QUALIFIED_TEST_PNG_EVIDENCE_DIR", true);
+    assert_eq!(
+        fs::read_dir(&retained).unwrap().count(),
+        0,
+        "fresh PNG evidence root required"
+    );
+    let directory = tempfile::Builder::new()
+        .prefix("mathlab-qualified-glyph-")
+        .tempdir()
+        .unwrap();
+    let project = fs::canonicalize(directory.path()).unwrap();
+    let configured = export_startup_config(&selected, &project, graphics);
+    let startup_bytes = fs::read(project.join("selected-export-startup.json")).unwrap();
+    let retained_startup = retained.join(format!("selected-{profile}-startup.json"));
+    let mut startup_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&retained_startup)
+        .unwrap();
+    std::io::Write::write_all(&mut startup_file, &startup_bytes).unwrap();
+    startup_file.sync_all().unwrap();
+    let mut engine = configured
+        .start(project)
+        .expect("glyph fixture startup failed");
+    let budget = RuntimeBudget::new(&engine, started);
+    export_active(&mut engine, &selected, &configured, graphics);
+    let modules: Vec<_> = std::iter::once(&selected.provider)
+        .chain(selected.adapters.iter().map(|entry| &entry.file))
+        .map(|file| {
+            json!({"path":file.path,
+            "sha256":file.sha256.iter().map(|b|format!("{b:02x}")).collect::<String>()})
+        })
+        .collect();
+    eprintln!(
+        "QUALIFIED_GLYPH_PROFILE {}",
+        json!({"profile":profile,
+        "pid":engine.process_id(),"runtime":selected.executable.path,
+        "startup_config":retained_startup,"startup_sha256":format!("{:x}",Sha256::digest(&startup_bytes)),
+        "runtime_sha256":format!("{:x}",Sha256::digest(fs::read(&selected.executable.path).unwrap())),
+        "gnuplot":selected.gnuplot.path,"ghostscript":selected.ghostscript.path,"modules":modules})
+    );
+    let fixtures = [
+        (
+            "ascii-control",
+            r#"close all;
+figure('visible','off','position',[100,100,600,400]);
+plot([0 1 2],[0 1 0]);
+set(gca,'fontsize',12);
+title('angle = 45 deg','interpreter','none','fontsize',20);
+xlabel('temperature = 20 deg C','interpreter','none','fontsize',16);
+"#,
+            "angle = 45 deg",
+            "temperature = 20 deg C",
+            "none",
+        ),
+        (
+            "literal-degree",
+            r#"close all;
+figure('visible','off','position',[100,100,600,400]);
+plot([0 1 2],[0 1 0]);
+set(gca,'fontsize',12);
+title('angle = 45°','interpreter','none','fontsize',20);
+xlabel('temperature = 20°C','interpreter','none','fontsize',16);
+"#,
+            "angle = 45°",
+            "temperature = 20°C",
+            "none",
+        ),
+        (
+            "tex-degree",
+            r#"close all;
+figure('visible','off','position',[100,100,600,400]);
+plot([0 1 2],[0 1 0]);
+set(gca,'fontsize',12);
+title('angle = 45^{\circ}','interpreter','tex','fontsize',20);
+xlabel('temperature = 20^{\circ}C','interpreter','tex','fontsize',16);
+"#,
+            "angle = 45^{\\circ}",
+            "temperature = 20^{\\circ}C",
+            "tex",
+        ),
+    ];
+    let mut temporary_directory = None;
+    for (label, fixture, title, xlabel, interpreter) in fixtures {
+        let source = format!(
+            r#"{fixture}
+qualified_glyph_evidence=struct('profile','{profile}','stage','{label}', ...
+  'lc_all',getenv('LC_ALL'),'lang',getenv('LANG'),'lc_ctype',getenv('LC_CTYPE'), ...
+  'title_bytes',double(uint8(get(get(gca,'title'),'string'))), ...
+  'xlabel_bytes',double(uint8(get(get(gca,'xlabel'),'string'))), ...
+  'title_interpreter',get(get(gca,'title'),'interpreter'), ...
+  'xlabel_interpreter',get(get(gca,'xlabel'),'interpreter'), ...
+  'toolkit',graphics_toolkit(),'figure_toolkit',get(gcf,'__graphics_toolkit__'), ...
+  'gnuplot_binary',gnuplot_binary(),'gsc',getenv('GSC'),'tmpdir',getenv('TMPDIR'));
+fprintf(1,'QUALIFIED_GLYPH_EVIDENCE %s%c',jsonencode(qualified_glyph_evidence),10); fflush(1);
+"#
+        );
+        eprintln!(
+            "QUALIFIED_GLYPH_FIXTURE {}",
+            json!({"profile":profile,"stage":label,
+            "fixture_sha256":format!("{:x}",Sha256::digest(fixture.as_bytes())),
+            "source_sha256":format!("{:x}",Sha256::digest(source.as_bytes())),
+            "title_utf8":title.as_bytes(),"xlabel_utf8":xlabel.as_bytes(),"interpreter":interpreter})
+        );
+        let result = engine
+            .execute_with_timeout(&source, EXECUTION_BUDGET)
+            .unwrap();
+        assert_export_png(&result, &format!("{profile}-{label}"));
+        let evidence: Value = serde_json::from_str(
+            result
+                .output
+                .lines()
+                .find_map(|line| line.strip_prefix("QUALIFIED_GLYPH_EVIDENCE "))
+                .expect("missing glyph property/locale evidence"),
+        )
+        .unwrap();
+        assert_eq!(evidence["profile"], profile);
+        assert_eq!(evidence["stage"], label);
+        assert_eq!(evidence["title_bytes"], json!(title.as_bytes()));
+        assert_eq!(evidence["xlabel_bytes"], json!(xlabel.as_bytes()));
+        assert_eq!(evidence["title_interpreter"], interpreter);
+        assert_eq!(evidence["xlabel_interpreter"], interpreter);
+        assert_eq!(evidence["lc_all"], "C");
+        assert_eq!(evidence["toolkit"], "gnuplot");
+        assert_eq!(evidence["figure_toolkit"], "gnuplot");
+        assert_eq!(evidence["gnuplot_binary"], json!(selected.gnuplot.path));
+        assert_eq!(evidence["gsc"], json!(selected.ghostscript.path));
+        let observed_tmp = PathBuf::from(evidence["tmpdir"].as_str().unwrap());
+        if let Some(previous) = &temporary_directory {
+            assert_eq!(previous, &observed_tmp);
+        }
+        temporary_directory = Some(observed_tmp);
+        assert!(!budget.expired.load(Ordering::Acquire));
+        assert!(started.elapsed() < CASE_BUDGET);
+    }
+    let session = fs::canonicalize(engine.session.path()).unwrap();
+    engine.stop();
+    drop(engine);
+    assert!(
+        !session.exists(),
+        "glyph fixture session survived Engine drop"
+    );
+    let temporary_directory = temporary_directory.unwrap();
+    if temporary_directory != session {
+        assert!(
+            !temporary_directory.parent().unwrap().exists(),
+            "glyph temporary alias survived Engine drop"
+        );
+    }
+    assert!(!budget.expired.load(Ordering::Acquire));
+    assert!(started.elapsed() < CASE_BUDGET);
+}
+
+#[test]
+#[ignore = "requires explicit Core5 runtime/native/tool pins; three retained ASCII/literal-degree/TeX PNGs"]
+fn qualified_frontend_core_v2_degree_glyph_exports() {
+    actual_frontend_glyph_exports(false);
+}
+
+#[test]
+#[ignore = "requires explicit Graphics6 runtime/native/tool pins; three retained ASCII/literal-degree/TeX PNGs"]
+fn qualified_frontend_graphics_v2_degree_glyph_exports() {
+    actual_frontend_glyph_exports(true);
+}
+
 include!("trusted_graphics_runtime_tests.rs");
 include!("trusted_caller_lock_runtime_tests.rs");

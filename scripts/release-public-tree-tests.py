@@ -50,6 +50,31 @@ class PublicTreeTests(unittest.TestCase):
         self.commit = self.commit_all()
         self.source_manifest = source.create(self.repo, self.commit, self.source_set)
 
+    def test_headless_inputs_survive_sanitized_public_tree_and_missing_copy_refuses(self):
+        for name in source.policy.HEADLESS_TEST_SOURCE_FILES:
+            self.write(name, "original headless test source " + name + "\n")
+        contract = "docs/rust-least-squares.md"
+        self.write(contract, (SCRIPTS.parent / contract).read_text())
+        excluded = "docs/research/matlab-r2026b/probes/rust-class-call-source-reference/fixtures/K04/evidence.json"
+        self.write(excluded, "PRIVATE_RESULT_NEVER_EXPORT\n")
+        commit = self.commit_all()
+        selected = self.root / "headless-source-set"
+        source.create(self.repo, commit, selected)
+        self.create(source_set=selected)
+        public.verify(self.output)
+        for name in source.policy.HEADLESS_TEST_SOURCE_FILES | {contract}:
+            self.assertEqual((self.output / public.TREE / name).read_bytes(), (self.repo / name).read_bytes())
+        self.assertFalse((self.output / public.TREE / excluded).exists())
+        for name in (contract, "crates/mathlab-cli/tests/least_squares_oracle.py"):
+            with self.subTest(missing=name):
+                copied = self.output / public.TREE / name
+                original = copied.read_bytes()
+                copied.unlink()
+                with self.assertRaises((ValueError, FileNotFoundError)):
+                    public.verify(self.output)
+                copied.write_bytes(original)
+        public.verify(self.output)
+
     def tearDown(self):
         self.temporary.cleanup()
 

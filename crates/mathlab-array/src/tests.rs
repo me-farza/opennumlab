@@ -2354,3 +2354,106 @@ fn limit03_reverse() {
         true,
     );
 }
+
+
+#[test]
+fn zeros_checked_layout_and_positive_words() {
+    let limits = LimitsV1 { max_dimension: 16, max_elements: 256, max_bytes: 2048 };
+    for (construct, word) in [
+        (DenseDouble2d::try_zeros as fn([u64; 2], LimitsV1) -> Result<DenseDouble2d, ArrayErrorV1>, 0_u64),
+        (DenseDouble2d::try_ones, 0x3ff0000000000000_u64),
+    ] {
+        for shape in [[1, 1], [2, 3], [16, 16]] {
+            let value = construct(shape, limits).unwrap();
+            assert_eq!(value.shape(), shape);
+            assert_eq!(value.as_slice().len(), (shape[0] * shape[1]) as usize);
+            assert!(value.as_slice().iter().all(|v| v.to_bits() == word));
+        }
+        assert!(matches!(construct([17, 0], limits).unwrap_err().code,
+            ErrorCodeV1::DimensionLimitExceeded { axis: 0, actual: 17, limit: 16 }));
+        assert!(matches!(construct([2, 3], LimitsV1 { max_elements: 5, ..limits }).unwrap_err().code,
+            ErrorCodeV1::ElementLimitExceeded { actual: 6, limit: 5 }));
+        assert!(matches!(construct([2, 3], LimitsV1 { max_bytes: 47, ..limits }).unwrap_err().code,
+            ErrorCodeV1::ByteLimitExceeded { actual: 48, limit: 47 }));
+        let wide = LimitsV1 { max_dimension: u64::MAX, max_elements: u64::MAX, max_bytes: u64::MAX };
+        assert!(matches!(construct([u64::MAX, 2], wide).unwrap_err().code,
+            ErrorCodeV1::ShapeProductOverflow { .. }));
+        assert!(matches!(construct([u64::MAX, 1], wide).unwrap_err().code,
+            ErrorCodeV1::ByteSizeOverflow { .. }));
+    }
+}
+
+#[test]
+fn zeros_empty_axes_validate_without_reservation() {
+    let limits = LimitsV1 { max_dimension: 16, max_elements: 256, max_bytes: 2048 };
+    let attempts = Cell::new(0);
+    for construct in [
+        DenseDouble2d::try_zeros_rejecting_reservation as fn([u64; 2], LimitsV1, &Cell<usize>) -> Result<DenseDouble2d, ArrayErrorV1>,
+        DenseDouble2d::try_ones_rejecting_reservation,
+        DenseDouble2d::try_eye_rejecting_reservation,
+    ] {
+        for shape in [[0, 0], [0, 3], [5, 0], [16, 0], [0, 16]] {
+            let value = construct(shape, limits, &attempts).unwrap();
+            assert_eq!(value.shape(), shape);
+            assert!(value.as_slice().is_empty());
+        }
+        for shape in [[17, 0], [0, 17]] {
+            assert!(construct(shape, limits, &attempts).is_err());
+        }
+    }
+    let wide = LimitsV1 { max_dimension: u64::MAX, max_elements: u64::MAX, max_bytes: u64::MAX };
+    for shape in [[u64::MAX,0], [0,u64::MAX]] {
+        let value = DenseDouble2d::try_eye_rejecting_reservation(shape, wide, &attempts).unwrap();
+        assert_eq!(value.shape(), shape);
+        assert!(value.as_slice().is_empty());
+    }
+    assert_eq!(attempts.get(), 0);
+}
+
+#[test]
+fn zeros_reservation_failure_keeps_original_allocation_cause() {
+    let limits = LimitsV1 { max_dimension: 16, max_elements: 256, max_bytes: 2048 };
+    for construct in [
+        DenseDouble2d::try_zeros_rejecting_reservation as fn([u64; 2], LimitsV1, &Cell<usize>) -> Result<DenseDouble2d, ArrayErrorV1>,
+        DenseDouble2d::try_ones_rejecting_reservation,
+        DenseDouble2d::try_eye_rejecting_reservation,
+    ] {
+        let attempts = Cell::new(0);
+        let error = construct([16, 16], limits, &attempts).unwrap_err();
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(error, ArrayErrorV1 { context: ErrorContextV1::Construct,
+            code: ErrorCodeV1::AllocationFailure { requested_elements: 256, requested_bytes: 2048 } });
+    }
+}
+
+
+#[test]
+fn eye_column_major_geometry_caps_and_overflow() {
+    let limits = LimitsV1 { max_dimension: 16, max_elements: 256, max_bytes: 2048 };
+    let one = 0x3ff0000000000000_u64;
+    for (shape, expected) in [
+        ([1,1],vec![one]), ([2,2],vec![one,0,0,one]),
+        ([2,3],vec![one,0,0,one,0,0]), ([3,2],vec![one,0,0,0,one,0]),
+        ([1,3],vec![one,0,0]), ([3,1],vec![one,0,0]),
+    ] {
+        let value = DenseDouble2d::try_eye(shape, limits).unwrap();
+        assert_eq!(value.shape(), shape);
+        assert_eq!(bits(value.as_slice()), expected);
+    }
+    let maximum = DenseDouble2d::try_eye([16,16], limits).unwrap();
+    assert_eq!(maximum.as_slice().len(), 256);
+    assert!(maximum.as_slice().iter().all(|v| [0,one].contains(&v.to_bits())));
+    assert_eq!(maximum.as_slice().iter().enumerate().filter_map(|(i,v)| (v.to_bits()==one).then_some(i)).collect::<Vec<_>>(),
+        [0_usize,17,34,51,68,85,102,119,136,153,170,187,204,221,238,255]);
+    for (shape, axis) in [([17,0],0), ([0,17],1)] {
+        assert_eq!(DenseDouble2d::try_eye(shape,limits).unwrap_err(), ArrayErrorV1 {
+            context:ErrorContextV1::Construct, code:ErrorCodeV1::DimensionLimitExceeded {axis,actual:17,limit:16} });
+    }
+    assert!(matches!(DenseDouble2d::try_eye([2,3],LimitsV1 {max_elements:5,..limits}).unwrap_err().code,
+        ErrorCodeV1::ElementLimitExceeded {actual:6,limit:5}));
+    assert!(matches!(DenseDouble2d::try_eye([2,3],LimitsV1 {max_bytes:47,..limits}).unwrap_err().code,
+        ErrorCodeV1::ByteLimitExceeded {actual:48,limit:47}));
+    let wide = LimitsV1 {max_dimension:u64::MAX,max_elements:u64::MAX,max_bytes:u64::MAX};
+    assert_eq!(DenseDouble2d::try_eye([u64::MAX,2],wide).unwrap_err(),ArrayErrorV1 {
+        context:ErrorContextV1::Construct,code:ErrorCodeV1::ShapeProductOverflow {rows:u64::MAX,columns:2} });
+}

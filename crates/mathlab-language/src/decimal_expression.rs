@@ -82,7 +82,7 @@ fn decimal_node(node: &CoreNode) -> DecimalNodeV1<'_> {
     DecimalNodeV1 {
         span: &node.span,
         kind: match &node.kind {
-            CoreNodeKind::Identifier { .. } => {
+            CoreNodeKind::IndexedWrite { .. } | CoreNodeKind::Identifier { .. } | CoreNodeKind::Call { .. } | CoreNodeKind::Range { .. } => {
                 unreachable!("decimal-v1 rejects identifiers during lexing")
             }
             CoreNodeKind::Number { literal_span } => DecimalNodeKindV1::Number { literal_span },

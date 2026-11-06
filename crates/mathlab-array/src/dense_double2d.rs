@@ -192,6 +192,99 @@ struct CheckedLayout {
 }
 
 impl DenseDouble2d {
+    /// Independently owned positive zeros, using the ordinary layout and allocation policy.
+    pub fn try_zeros(shape: [u64; 2], limits: LimitsV1) -> Result<Self, ArrayErrorV1> {
+        Self::fill_with_reservation(shape, 0.0, limits, reserve_payload)
+    }
+
+    /// Independently owned ones, using the same checked layout and reservation.
+    pub fn try_ones(shape: [u64; 2], limits: LimitsV1) -> Result<Self, ArrayErrorV1> {
+        Self::fill_with_reservation(shape, 1.0, limits, reserve_payload)
+    }
+
+    /// Owned column-major identity, with the ordinary zero-fill allocation policy.
+    pub fn try_eye(shape: [u64; 2], limits: LimitsV1) -> Result<Self, ArrayErrorV1> {
+        Self::eye_with_reservation(shape, limits, reserve_payload)
+    }
+
+    fn eye_with_reservation<F>(
+        shape: [u64; 2],
+        limits: LimitsV1,
+        reserve: F,
+    ) -> Result<Self, ArrayErrorV1>
+    where
+        F: FnOnce(&mut Vec<f64>, CheckedLayout, ErrorContextV1) -> Result<(), ArrayErrorV1>,
+    {
+        let mut array = Self::fill_with_reservation(shape, 0.0, limits, reserve)?;
+        // Empty shapes may have custom-wide extents, including u64::MAX.
+        // Return before any dimension conversion, diagonal indexing or iteration.
+        if array.data.is_empty() {
+            return Ok(array);
+        }
+        // Checked nonempty payload geometry bounds both dimensions and every
+        // index below data.len(); no rows+1 stride or second payload is needed.
+        let rows = shape[0] as usize;
+        for i in 0..shape[0].min(shape[1]) as usize {
+            array.data[i * rows + i] = 1.0;
+        }
+        Ok(array)
+    }
+
+    fn fill_with_reservation<F>(
+        shape: [u64; 2],
+        fill: f64,
+        limits: LimitsV1,
+        reserve: F,
+    ) -> Result<Self, ArrayErrorV1>
+    where
+        F: FnOnce(&mut Vec<f64>, CheckedLayout, ErrorContextV1) -> Result<(), ArrayErrorV1>,
+    {
+        let context = ErrorContextV1::Construct;
+        let layout = checked_layout(shape, limits, context)?;
+        let mut data = Vec::new();
+        if layout.len != 0 {
+            reserve(&mut data, layout, context)?;
+            data.resize(layout.len, fill);
+        }
+        Ok(Self { shape, data })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_zeros_rejecting_reservation(
+        shape: [u64; 2],
+        limits: LimitsV1,
+        attempts: &std::cell::Cell<usize>,
+    ) -> Result<Self, ArrayErrorV1> {
+        Self::fill_with_reservation(shape, 0.0, limits, |_, layout, context| {
+            attempts.set(attempts.get() + 1);
+            Err(allocation_failure(layout, context))
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_ones_rejecting_reservation(
+        shape: [u64; 2],
+        limits: LimitsV1,
+        attempts: &std::cell::Cell<usize>,
+    ) -> Result<Self, ArrayErrorV1> {
+        Self::fill_with_reservation(shape, 1.0, limits, |_, layout, context| {
+            attempts.set(attempts.get() + 1);
+            Err(allocation_failure(layout, context))
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_eye_rejecting_reservation(
+        shape: [u64; 2],
+        limits: LimitsV1,
+        attempts: &std::cell::Cell<usize>,
+    ) -> Result<Self, ArrayErrorV1> {
+        Self::eye_with_reservation(shape, limits, |_, layout, context| {
+            attempts.set(attempts.get() + 1);
+            Err(allocation_failure(layout, context))
+        })
+    }
+
     pub fn try_from_col_major(
         shape: [u64; 2],
         source: &[f64],

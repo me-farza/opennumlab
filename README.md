@@ -4,13 +4,28 @@
 
 <img src="assets/opennumlab-logo.png" alt="OpenNumLab: a golden lamp releasing a blue mathematical surface" width="480">
 
-OpenNumLab is an open-source scientific desktop and CLI, preparing its first **v0.1.0-alpha development preview**. The application is written in Rust and uses a separately installed GNU Octave process for its main language and numerical execution. An experimental Rust arithmetic backend is available explicitly in the CLI.
+OpenNumLab is an independent open-source scientific computing project. Its **headless Rust contributor preview** runs an explicitly selected, bounded MATLAB-style program profile without starting GNU Octave, MATLAB or the desktop. It supports located functions and loops, value and handle classes, complex N-D dense arrays, CSC sparse construction/products, square linear solves and full-column-rank tall least squares. These are checked capabilities of a subset, not a complete MATLAB implementation.
 
-The long-term goal is a Rust-native scientific environment with MATLAB-compatible code, files and familiar workflows. This alpha delivers a tested subset; complete MATLAB/Simulink coverage, identical interface behavior and a performance advantage remain goals requiring separate evidence. See the [alpha notes and known gaps](docs/release/V0.1.0_ALPHA.md) before trying it on a project.
+The long-term goal remains a Rust-native scientific environment with MATLAB-compatible code, files and familiar workflows, broader numerics and later simulation integrations. Complete MATLAB/Simulink coverage, identical interface behavior and a performance advantage remain goals requiring separate evidence. The existing desktop and ordinary CLI defaults still use a separately installed GNU Octave process; they are a distinct legacy profile. See the [headless profile and limits](docs/release/HEADLESS_CLI.md) and [desktop alpha notes](docs/release/V0.1.0_ALPHA.md) before choosing a route.
 
 The project was previously called NumJinn and Open MathLab. Existing `mathlab` commands, `mathlab-*` crates and `MATHLAB_*` environment variables retain their current names. The project repository is [me-farza/opennumlab](https://github.com/me-farza/opennumlab). The recipes below build from source; they do not imply an available or qualified binary download.
 
-## Start it
+## Start with the headless Rust preview
+
+Use a current stable Rust toolchain compatible with the locked dependencies (workspace minimum: 1.88), Cargo and a platform compiler/linker. This CLI-only build does not require an Octave/MATLAB installation, graphics toolkit or desktop dependencies. From a source checkout, or the verified corresponding-source archive extracted to a writable directory:
+
+```sh
+cargo build --locked --release -j1 -p mathlab-cli --bin mathlab
+./target/release/mathlab --json run --rust-program --profile class-v1 --workspace examples/rust-least-squares.m
+```
+
+Cargo may download locked dependencies. If you set `CARGO_TARGET_DIR`, use the executable under that directory instead of `target/release`. The example performs a bounded 4096-by-32 complex, eight-right-hand-side noisy fit. Its assertions and the CLI exit/status must succeed; a bounded workspace preview alone is not a complete numerical check. The [headless guide](docs/release/HEADLESS_CLI.md) describes explicit class modules, lossless exports, cancellation, fixed budgets and the independent complete-export QA. For Git-free source handling, see [source archive builds](docs/release/SOURCE_ARCHIVE.md#ordinary-builds-after-extraction).
+
+Local evidence covers the normal Apple-silicon macOS (`aarch64-apple-darwin`) CLI candidate, an independent cold build from its sanitized source archive, and a real installed/relocated journey including classes, numerical exports, SIGINT, deadlines and failure preservation. These checks are local evidence for that exact candidate, not hosted CI, other platforms, signing or public distribution. Hosted headless CI and publication approval remain pending; no qualified public binary download is promised here.
+
+Use `--rust-program --profile class-v1` explicitly. Plain `run`, `eval`, `repl` and the desktop retain their existing defaults; the smaller `--backend rust` expression/REPL routes have different limits. There is no silent fallback to Octave. Classes require explicit `--module-file` inputs; object workspace views are metadata-only. Rank-deficient/underdetermined minimum-norm success, all extreme numerical ranges, full language/toolbox coverage, Rust debugger/input/graphics and complete UI behavior are not claimed. The [full roadmap](ROADMAP.md) remains in scope.
+
+## Desktop and legacy Octave profile: start it
 
 Start from a source checkout with its `Cargo.lock`. Use a Rust toolchain compatible with the locked dependencies (workspace minimum: 1.88), a platform compiler/linker, GNU Octave, and a graphics toolkit. The macOS app target currently being qualified is Apple silicon; Linux source builds need the system libraries listed by `scripts/setup.sh`. Native Windows engine startup remains unsupported.
 
@@ -33,7 +48,7 @@ To open a specific script in the desktop:
 cargo run -p mathlab-desktop -- --open examples/getting_started.m
 ```
 
-## Familiar workflow
+## Desktop/Octave familiar workflow
 
 The desktop uses familiar panel roles: Current Folder, Editor, Command Window, Workspace, Command History, and Figures. Write MATLAB/Octave source in the Editor, run it in one persistent Octave session, inspect and edit matrix pages in the Variable Editor, and use the Command Window to continue working with the same variables. Numeric and logical 2-D values, including sparse matrices, support class-preserving scalar edits. Other supported containers have bounded read-only previews. **Apps → Packages** opens the installed package list with versions, descriptions, and a Load button; packages loaded there become available in that desktop session.
 
@@ -67,7 +82,7 @@ Input must be enabled before the first user execution because previously capture
 
 Tabs, unsaved source, cursor positions, history, directory and preferences recover from the startup project's `.mathlab/session.json`. Recovery does not serialize the numerical workspace; save variables to MAT files for that. Screenshot runs skip recovery unless `--state FILE` is supplied. Dirty and unsaved script buffers execute without overwriting their saved files.
 
-## Use the command line
+## Legacy Octave command line
 
 ```sh
 cargo run -p mathlab-cli -- doctor
@@ -82,13 +97,13 @@ cargo run -p mathlab-cli -- doctor --json
 
 The CLI supports `--octave PATH`, `--directory DIRECTORY`, `--json`, and `--timeout SECONDS`. Compatibility checks have a 30 second deadline per fixture by default. `eval` and `run` each create a new session. `repl` keeps variables between commands and supports `:workspace`, `:clear`, `:restart`, `:cd PATH`, `:run FILE`, and `:quit`; execution deadlines also apply to REPL evaluations. With the input adapter enabled, one stdin reader routes lines to active input requests or REPL commands, preserving empty lines and whitespace. Terminal replies use terminal echo; piped replies use native echo. Human-readable commands stream raw console bytes; JSON execution returns the bounded aggregate with truncation and decoding-loss fields. JSON REPL emits records without prompts or a banner, and input replies still come from stdin. `packages --load NAME` verifies that an installed package can be loaded in that command's session; packages loaded there do not persist into a separate `eval` or `run` process. Figures from CLI execution are preserved in `.mathlab/figures/` inside the selected working directory.
 
-### Experimental Rust arithmetic
+### Smaller Rust arithmetic expression profile
 
 ```sh
 cargo run --locked -j1 -p mathlab-cli -- eval --backend rust '[1,2;3,4]*[1;2]' --json
 ```
 
-This explicit, bounded route evaluates real double arrays with literals, parentheses, unary signs, `+`, `-`, `*`, `.*`, `./` and `.'`. It returns typed shape and binary64 data in JSON and reports unsupported input without an Octave fallback. It is one-shot: assignments, persistent Rust CLI sessions, functions, scripts and general MATLAB syntax are not enabled by this release scope. The Rust session and discrete-accumulator simulation libraries are experimental APIs; they do not replace the default desktop/REPL engine or provide a Simulink environment.
+This separate expression route evaluates bounded real double arrays with literals, parentheses, unary signs, `+`, `-`, `*`, `.*`, `./` and `.'`. It returns typed shape and binary64 data in JSON and reports unsupported input without an Octave fallback. The one-shot expression syntax does not enable assignments, functions or scripts; use the explicit class program route above for its broader capabilities. Rust session and discrete-accumulator simulation APIs do not provide a complete Simulink environment or change the default desktop/REPL engine.
 
 ## Try the examples
 
@@ -147,7 +162,7 @@ Use `./scripts/package-macos.sh --with-debugger` to include all four native adap
 
 ## Architecture and next steps
 
-The Cargo workspace separates `mathlab-engine` (Octave process protocol and sessions, plus the opt-in Rust session API), `mathlab-language` (source preparation and bounded Rust expression parsing), `mathlab-array` (Rust array arithmetic), `mathlab-simulation` (experimental discrete accumulators), `mathlab-debugger` (typed debugger transport), `mathlab-cli` (batch/REPL/diagnostics/conformance commands), and `mathlab-desktop` (native Rust UI). `octave/mathlab_worker.m` runs user source in the Octave base workspace and returns output, errors, workspace metadata, and exported figures. The optional native debugger adapter uses Octave's public event and breakpoint APIs; it must be built for the selected runtime ABI. See [native debugger development](native/README.md).
+The Cargo workspace separates `mathlab-engine` (Octave process protocol/sessions and the opt-in shared Rust program executor), `mathlab-language` (source preparation, located Rust program AST and explicit class module graphs), `mathlab-array` (dense/CSC storage and bounded numerical kernels), `mathlab-simulation` (experimental discrete accumulators), `mathlab-debugger` (typed debugger transport), `mathlab-cli` (batch/REPL/diagnostics/conformance commands), and `mathlab-desktop` (native Rust UI). `octave/mathlab_worker.m` runs user source in the Octave base workspace and returns output, errors, workspace metadata, and exported figures. The optional native debugger adapter uses Octave's public event and breakpoint APIs; it must be built for the selected runtime ABI. See [native debugger development](native/README.md).
 
 The [kernel readiness audit](docs/KERNEL_READINESS.md) describes the checked session contract and the remaining compatibility, resource-accounting and performance work. The [console contract](docs/CONSOLE_PROTOCOL.md) explains output bounds, interruption fences, and frontend completion barriers.
 

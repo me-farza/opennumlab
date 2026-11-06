@@ -1438,5 +1438,191 @@ class PackageTests(unittest.TestCase):
         self.assertEqual((self.destination / "Contents/MacOS/mathlab").read_bytes(), self.executable.read_bytes())
 
 
+# Deliberately separate class: reuse only fixture helpers, not the54 inherited tests.
+class HeadlessPackageTests(unittest.TestCase):
+    git = PackageTests.git
+    write = PackageTests.write
+    tearDown = PackageTests.tearDown
+
+    def setUp(self):
+        PackageTests.setUp(self)
+        for name in ("release-package.py", "release-source.py"):
+            self.write("scripts/" + name, (SCRIPTS / name).read_text())
+        self.write(release.HEADLESS_DOC, (SCRIPTS.parent / release.HEADLESS_DOC).read_text())
+        self.write(release.HEADLESS_EXAMPLE, "A=[1;2];B=[2;4];X=A\\B;\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "Synthetic headless corresponding source")
+        self.destination = self.root / "distribution/CLI with spaces"
+        self.calls = []
+        self.target = "aarch64-apple-darwin" if sys.platform == "darwin" else "x86_64-unknown-linux-gnu"
+
+    def headless_builder(self, frozen, target, target_dir, cargo_home):
+        self.calls.append((frozen, target, target_dir, cargo_home))
+        return {"executables": {"mathlab": self.executable}, "executable_sha256": {"mathlab": release.sha(self.executable)},
+                "version": "0.1.0", "target": target, "host": target, "normal_cfg": True,
+                "configuration": {"RUSTFLAGS": "", "CARGO_ENCODED_RUSTFLAGS": "", "profile": "committed release", "jobs": 1, "offline": True},
+                "cargo_command": ["synthetic builder, not an actual Cargo pass"], "linked_libraries": "synthetic OS dependency inventory"}
+
+    def headless_notices(self, frozen, destination, target, cargo_home):
+        (destination / "synthetic").mkdir(parents=True)
+        (destination / "synthetic/LICENSE").write_text("Synthetic fixture notice; not an upstream provenance claim\n")
+        (destination / "index.json").write_text(json.dumps({"built_packages": ["mathlab-cli"], "target": target,
+            "missing_license_texts": [], "packages": [{"name": "synthetic", "version": "1", "license_texts": ["synthetic/LICENSE"]}]}))
+
+    def headless(self, destination=None, **kwargs):
+        return release.package_headless(self.repo, destination or self.destination, self.target,
+            builder=kwargs.pop("builder", self.headless_builder), notice_builder=kwargs.pop("notice_builder", self.headless_notices), **kwargs)
+
+    def reseal(self, bundle):
+        manifest = json.loads((bundle / "release.json").read_text())
+        manifest["payload"] = [row for row in release.inventory(bundle) if row["path"] not in {"release.json", "checksums.sha256"}]
+        (bundle / "release.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        (bundle / "checksums.sha256").write_text("".join(row["sha256"] + "  " + row["path"] + "\n" for row in release.inventory(bundle) if row["path"] != "checksums.sha256"))
+
+    def test_headless_fresh_normal_cli_only_payload_and_exact_source_notices(self):
+        result = self.headless()
+        self.assertEqual(result["profile"], "headless-cli-v1")
+        manifest = release.validate_headless(self.destination)
+        self.assertEqual(set(manifest["build"]["executable_sha256"]), {"mathlab"})
+        self.assertFalse((self.destination / "Contents").exists())
+        self.assertFalse((self.destination / "bin/mathlab-launcher").exists())
+        self.assertEqual((self.destination / "bin/mathlab").read_bytes(), self.executable.read_bytes())
+        self.assertEqual((self.destination / "share/doc/opennumlab-cli/README.md").read_bytes(), (self.repo / release.HEADLESS_DOC).read_bytes())
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(manifest["qualification"]["installed_tests"], "not_run")
+        self.assertFalse(manifest["distribution"]["external_interpreter_required_for_explicit_rust_route"])
+
+    def test_headless_clean_source_required_and_arbitrary_destination_preserved(self):
+        self.write("README.md", "dirty\n")
+        with self.assertRaisesRegex(RuntimeError, "clean committed"):
+            self.headless()
+        self.assertEqual(self.calls, [])
+        self.git("checkout", "--", "README.md")
+        self.destination.mkdir(parents=True)
+        (self.destination / "user-file").write_text("KEEP")
+        with self.assertRaisesRegex(RuntimeError, "metadata missing"):
+            self.headless()
+        self.assertEqual((self.destination / "user-file").read_text(), "KEEP")
+
+    def test_headless_build_or_notice_failure_keeps_prior_package_and_source(self):
+        self.headless()
+        before = release.inventory(self.destination)
+        def failure(*args):
+            raise RuntimeError("synthetic failure")
+        for kwargs in ({"builder": failure}, {"notice_builder": failure}):
+            with self.subTest(kwargs=list(kwargs)), self.assertRaisesRegex(RuntimeError, "synthetic failure"):
+                self.headless(**kwargs)
+            self.assertEqual(release.inventory(self.destination), before)
+        release.validate_headless(self.destination)
+
+    def test_headless_rejects_changed_frozen_source_and_mutating_binary(self):
+        def changed(frozen, *args):
+            result = self.headless_builder(frozen, *args)
+            (frozen / "README.md").write_text("changed build input")
+            return result
+        with self.assertRaisesRegex(RuntimeError, "Frozen headless source changed"):
+            self.headless(builder=changed)
+        def replaced(*args):
+            result = self.headless_builder(*args)
+            self.executable.write_text("not the hashed executable")
+            return result
+        with self.assertRaisesRegex(RuntimeError, "changed before copy"):
+            self.headless(builder=replaced)
+        self.assertFalse(self.destination.exists())
+
+    def test_headless_rejects_instrumented_identity_and_unclaimed_notice(self):
+        def wrong(*args):
+            result = self.headless_builder(*args)
+            result["normal_cfg"] = False
+            return result
+        with self.assertRaisesRegex(RuntimeError, "normal-cfg"):
+            self.headless(builder=wrong)
+        def extra(*args):
+            self.headless_notices(*args)
+            (args[1] / "private.log").write_text("must not ship")
+        with self.assertRaisesRegex(RuntimeError, "Unclaimed or missing notice"):
+            self.headless(notice_builder=extra)
+        self.assertFalse(self.destination.exists())
+
+    def test_headless_rehashed_gui_payload_and_symlink_are_rejected(self):
+        self.headless()
+        unexpected = self.destination / "Contents/MacOS/mathlab-desktop"
+        unexpected.parent.mkdir(parents=True)
+        unexpected.write_text("forbidden GUI payload")
+        self.reseal(self.destination)
+        with self.assertRaisesRegex(RuntimeError, "Unexpected headless member"):
+            release.validate_headless(self.destination)
+        unexpected.unlink()
+        unexpected.parent.rmdir()
+        unexpected.parent.parent.rmdir()
+        self.reseal(self.destination)
+        (self.destination / "unclaimed").symlink_to(self.root / "outside")
+        with self.assertRaisesRegex(RuntimeError, "Nonregular"):
+            release.validate_headless(self.destination)
+
+    def test_headless_build_environment_refuses_probe_and_profile_overrides(self):
+        for overrides in ({"RUSTFLAGS": "--cfg onl_qr_phase_probe"}, {"CARGO_PROFILE_RELEASE_DEBUG": "0"}, {"RUSTC_WRAPPER": "/some/tool"}, {"CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS": "--cfg onl_qr_phase_probe"}, {"CARGO_BUILD_RUSTC": "/some/compiler"}):
+            with self.subTest(overrides=overrides), patch.dict(os.environ, overrides, clear=True):
+                with self.assertRaises(RuntimeError):
+                    release.headless_environment(self.root / "target", self.root / "cargo")
+        with patch.dict(os.environ, {}, clear=True):
+            env = release.headless_environment(self.root / "target", self.root / "cargo")
+            self.assertEqual(env["CARGO_NET_OFFLINE"], "true")
+            self.assertEqual(env["CARGO_INCREMENTAL"], "0")
+
+    def test_headless_cli_route_does_not_invoke_desktop_or_native_producer(self):
+        with patch.object(sys, "argv", ["release-package.py", "--profile", "headless-cli-v1", "--target", self.target]), \
+                patch.object(release, "package_headless", return_value={"profile": "headless-cli-v1"}) as producer, \
+                patch.object(release, "package", side_effect=AssertionError("No desktop packaging")), \
+                patch.object(release, "native_preflight", side_effect=AssertionError("No external runtime")):
+            release.main()
+        self.assertEqual(producer.call_count, 1)
+
+    def test_headless_successful_atomic_replacement_retains_verified_previous(self):
+        self.headless()
+        old = release.inventory(self.destination)
+        result = self.headless()
+        backup = Path(result["previous_bundle"])
+        self.assertTrue(backup.is_dir())
+        self.assertEqual(release.inventory(backup), old)
+        release.validate_headless(backup)
+        release.validate_headless(self.destination)
+
+    def test_headless_real_builder_command_selects_only_cli_normal_target_and_notices(self):
+        calls = []
+        def command(argv, cwd, **kwargs):
+            words = [str(word) for word in argv]
+            calls.append((words, kwargs))
+            if words[:2] == ["rustc", "-vV"]:
+                return "rustc synthetic\nhost: " + self.target
+            if words[:2] == ["cargo", "build"]:
+                return json.dumps({"reason": "compiler-artifact", "target": {"name": "mathlab", "kind": ["bin"]},
+                    "profile": {"test": False}, "executable": str(self.executable)}) + "\n" + json.dumps({"reason": "build-finished", "success": True})
+            if words[:2] == ["cargo", "metadata"]:
+                return json.dumps({"packages": [{"name": "mathlab-cli", "version": "0.1.0"}]})
+            if words == [str(self.executable), "--version"]:
+                return "mathlab 0.1.0"
+            if words[:2] == ["cargo", "--version"]:
+                return "cargo synthetic"
+            if words[0] in ("otool", "readelf"):
+                return "synthetic system library list"
+            if words[:2] == [sys.executable, "scripts/generate-notices.py"]:
+                return "synthetic notice command"
+            raise AssertionError(words)
+        with patch.dict(os.environ, {}, clear=True), patch.object(release, "run", side_effect=command), \
+                patch.object(release, "native_preflight", side_effect=AssertionError("no external runtime")):
+            result = release.build_headless(self.repo, self.target, self.root / "target", self.root / "cargo-home")
+            release.notices_headless(self.repo, self.root / "notices", self.target, self.root / "cargo-home")
+        self.assertTrue(result["normal_cfg"])
+        build = next(words for words, _ in calls if words[:2] == ["cargo", "build"])
+        self.assertEqual(build[build.index("-p") + 1], "mathlab-cli")
+        self.assertIn("--offline", build)
+        self.assertIn("--locked", build)
+        self.assertNotIn("mathlab-desktop", build)
+        notice = next(words for words, _ in calls if "scripts/generate-notices.py" in words)
+        self.assertEqual(notice[notice.index("--package") + 1], "mathlab-cli")
+        self.assertEqual(notice[notice.index("--target") + 1], self.target)
+        self.assertIn("--require-complete", notice)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

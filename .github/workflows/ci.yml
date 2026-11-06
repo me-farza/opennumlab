@@ -13,7 +13,7 @@ jobs:
     name: Synthetic package contracts (${{ matrix.os }})
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-14]
+        os: [ubuntu-latest, macos-15-intel]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 5
     steps:
@@ -119,5 +119,169 @@ jobs:
           path: |
             ${{ runner.temp }}/native-gate-launch.log
             target/native-four-adapter-value-v1/
+          if-no-files-found: error
+          retention-days: 14
+
+  headless-rust:
+    name: Rust headless source, package and installed journey (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "1"
+      CARGO_TERM_COLOR: never
+      RUST_TEST_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      RUSTFLAGS: ""
+      CARGO_ENCODED_RUSTFLAGS: ""
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONNOUSERSITE: "1"
+      HEADLESS_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Create fresh canonical headless scratch and evidence
+        id: headless-paths
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']).resolve() / ('onl-headless-' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT'])
+          assert re.fullmatch(r'[A-Za-z0-9/_+.-]+', str(root)), 'Test endpoint paths require a space-free canonical scratch root'
+          root.mkdir()
+          for name in ('evidence', 'tmp', 'test-home', 'cargo-home', 'sentinels'):
+              (root / name).mkdir()
+          marker = root / 'evidence/external-interpreter-called'
+          for name in ('octave', 'octave-cli', 'matlab'):
+              stub = root / 'sentinels' / name
+              stub.write_text('#!/bin/sh\nprintf forbidden > "' + str(marker) + '"\nexit 91\n')
+              stub.chmod(0o755)
+          with Path(os.environ['GITHUB_ENV']).open('a') as env:
+              for key, value in {'HEADLESS_ROOT': root, 'HEADLESS_EVIDENCE': root / 'evidence', 'CARGO_HOME': root / 'cargo-home', 'CARGO_TARGET_DIR': root / 'test-target', 'TMPDIR': root / 'tmp', 'MATHLAB_OCTAVE': root / 'sentinels/octave-cli'}.items():
+                  env.write(str(key) + '=' + str(value) + '\n')
+          with Path(os.environ['GITHUB_PATH']).open('a') as path:
+              path.write(str(root / 'sentinels') + '\n')
+          (root / 'evidence/runner.json').write_text(json.dumps({key: os.environ.get(key) for key in ('RUNNER_OS', 'RUNNER_ARCH', 'ImageOS', 'ImageVersion', 'GITHUB_SHA')}, indent=2) + '\n')
+          PY
+      - name: Install normal stable Rust as in existing jobs
+        uses: dtolnay/rust-toolchain@stable
+        timeout-minutes: 5
+      - name: Record actual tools and verify target prerequisites
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          rustc -vV | tee "$HEADLESS_EVIDENCE/rustc.log"
+          cargo --version | tee "$HEADLESS_EVIDENCE/cargo.log"
+          test "$(rustc -vV | sed -n 's/^host: //p')" = "$HEADLESS_TARGET"
+          python3 --version 2>&1 | tee "$HEADLESS_EVIDENCE/python.log"
+          /usr/bin/python3 -I -c 'import sys; assert sys.version_info >= (3,9); print(sys.version)' | tee "$HEADLESS_EVIDENCE/system-python.log"
+          if [[ "$RUNNER_OS" == macOS ]]; then command -v otool; else command -v readelf; fi
+      - name: Export and verify only committed corresponding source
+        id: headless-source
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          python3 -B scripts/release-source.py create --ref "$GITHUB_SHA" --output "$HEADLESS_ROOT/source-set" 2>&1 | tee "$HEADLESS_EVIDENCE/source-create.log"
+          python3 -B scripts/release-source.py verify --directory "$HEADLESS_ROOT/source-set" 2>&1 | tee "$HEADLESS_EVIDENCE/source-verify.log"
+          python3 -B scripts/release-public-tree.py create --source-set "$HEADLESS_ROOT/source-set" --repo . --output "$HEADLESS_ROOT/public-set" 2>&1 | tee "$HEADLESS_EVIDENCE/public-tree-create.log"
+          python3 -B scripts/release-public-tree.py verify --directory "$HEADLESS_ROOT/public-set" 2>&1 | tee "$HEADLESS_EVIDENCE/public-tree-verify.log"
+          python3 - <<'PY'
+          import json, os, tarfile
+          from pathlib import Path
+          root = Path(os.environ['HEADLESS_ROOT'])
+          manifest = json.loads((root / 'source-set/source-manifest.json').read_text())
+          # The existing verifier already checked every archive path/type/hash.
+          with tarfile.open(root / 'source-set' / manifest['archive']['filename'], 'r:gz') as archive:
+              archive.extractall(root / 'extracted')
+          source = root / 'extracted' / manifest['archive']['root']
+          assert not (source / '.git').exists()
+          with Path(os.environ['GITHUB_ENV']).open('a') as env:
+              env.write('HEADLESS_CLEAN_SOURCE=' + str(source) + '\n')
+          (root / 'evidence/source-manifest.json').write_bytes((root / 'source-set/source-manifest.json').read_bytes())
+          (root / 'evidence/source-checksums.sha256').write_bytes((root / 'source-set/checksums.sha256').read_bytes())
+          PY
+      - name: Warm locked registry inputs once; no persistent target cache
+        working-directory: ${{ env.HEADLESS_CLEAN_SOURCE }}
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          cargo fetch --locked --target "$HEADLESS_TARGET" 2>&1 | tee "$HEADLESS_EVIDENCE/cargo-fetch.log"
+      - name: Synthetic producer, source and bounded QA contracts
+        working-directory: ${{ env.HEADLESS_CLEAN_SOURCE }}
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          for suite in release-package-tests qa-headless-tests qa-installed-tests release-source-tests release-public-tree-tests; do
+            HOME="$HEADLESS_ROOT/test-home" python3 -B "scripts/$suite.py" 2>&1 | tee "$HEADLESS_EVIDENCE/$suite.log"
+          done
+          test ! -e "$HEADLESS_EVIDENCE/external-interpreter-called"
+      - name: Clean-source array and located language tests
+        working-directory: ${{ env.HEADLESS_CLEAN_SOURCE }}
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline -j1 -p mathlab-array --lib --test scientific_v1 --test sparse_v1 --test least_squares -- --test-threads=1 2>&1 | tee "$HEADLESS_EVIDENCE/array.log"
+          cargo test --locked --offline -j1 -p mathlab-language --lib --test program_parse_v1 --test class_graph_v1 -- --test-threads=1 2>&1 | tee "$HEADLESS_EVIDENCE/language.log"
+      - name: Shared Rust executor, classes, faults and cancellation
+        working-directory: ${{ env.HEADLESS_CLEAN_SOURCE }}
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline -j1 -p mathlab-engine --lib 'rust_program::' -- --test-threads=1 2>&1 | tee "$HEADLESS_EVIDENCE/engine-units.log"
+          cargo test --locked --offline -j1 -p mathlab-engine --test rust_program_v1 --test scientific_program_v1 --test sparse_program_v2 --test class_program_v1 -- --test-threads=1 2>&1 | tee "$HEADLESS_EVIDENCE/engine-programs.log"
+      - name: Normal Rust CLI, full numerical exports and independent oracles
+        working-directory: ${{ env.HEADLESS_CLEAN_SOURCE }}
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline -j1 -p mathlab-cli --bin mathlab 'rust_program::' -- --test-threads=1 2>&1 | tee "$HEADLESS_EVIDENCE/cli-codecs.log"
+          cargo test --locked --offline -j1 -p mathlab-cli --bin mathlab 'tests::' -- --skip '::tests::' --skip 'rust_program::' --test-threads=1 2>&1 | tee "$HEADLESS_EVIDENCE/cli-routing.log"
+          cargo test --locked --offline -j1 -p mathlab-cli --test rust_program --test rust_eval --test rust_repl --test scientific_program --test sparse_program_cli_v2 --test class_program_cli_v1 -- --test-threads=1 2>&1 | tee "$HEADLESS_EVIDENCE/cli-programs.log"
+          test ! -e "$HEADLESS_EVIDENCE/external-interpreter-called"
+      - name: Build fresh normal release CLI package from the same clean commit
+        id: headless-package
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain --untracked-files=normal)"
+          python3 -B scripts/release-package.py --profile headless-cli-v1 --target "$HEADLESS_TARGET" --output "$HEADLESS_ROOT/package" 2>&1 | tee "$HEADLESS_EVIDENCE/producer.log"
+      - name: Installed read-only relocation, signals and complete fit oracle
+        id: headless-installed
+        working-directory: ${{ env.HEADLESS_CLEAN_SOURCE }}
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          python3 -B scripts/qa-headless.py --bundle "$HEADLESS_ROOT/package" --output "$HEADLESS_ROOT/installed-qa" --timeout 120 2>&1 | tee "$HEADLESS_EVIDENCE/installed-qa.log"
+          test ! -e "$HEADLESS_EVIDENCE/external-interpreter-called"
+      - name: Preserve candidate permissions and failed owned journey evidence
+        if: always() && steps.headless-paths.outcome == 'success'
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          if [[ -d "$HEADLESS_ROOT/package" ]]; then tar -czf "$HEADLESS_EVIDENCE/headless-candidate.tar.gz" -C "$HEADLESS_ROOT" package; fi
+          if [[ -d "$HEADLESS_ROOT/installed-qa" ]]; then tar -czf "$HEADLESS_EVIDENCE/installed-qa-evidence.tar.gz" -C "$HEADLESS_ROOT" installed-qa; fi
+      - name: Retain headless evidence without publishing a release
+        if: always() && steps.headless-paths.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: headless-rust-${{ matrix.os }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ env.HEADLESS_EVIDENCE }}/
           if-no-files-found: error
           retention-days: 14

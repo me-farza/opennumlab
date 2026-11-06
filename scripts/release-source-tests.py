@@ -129,6 +129,107 @@ class SourceArchiveTests(unittest.TestCase):
         self.assertNotIn("assets/numjinn-logo.png", names)
         self.assertEqual(source.verify(self.output), manifest)
 
+    def test_headless_exact_inputs_ship_without_neighbor_research_or_python(self):
+        admitted = source.policy.HEADLESS_TEST_SOURCE_FILES
+        expected_names = {
+            'crates/mathlab-array/tests/scientific_oracle.py',
+            'crates/mathlab-cli/tests/least_squares_oracle.py',
+            'crates/mathlab-cli/tests/poisson_fraction_core.py',
+            'crates/mathlab-cli/tests/sparse_oracle.py',
+            'docs/research/matlab-r2026b/probes/rust-class-call-source-reference/fixtures/K01/K01.m',
+            'docs/research/matlab-r2026b/probes/rust-class-call-source-reference/fixtures/K01/Kc01.m',
+            'docs/research/matlab-r2026b/probes/rust-class-call-source-reference/fixtures/K02/K02.m',
+            'docs/research/matlab-r2026b/probes/rust-class-call-source-reference/fixtures/K02/Km02.m',
+            'docs/research/matlab-r2026b/probes/rust-class-call-source-reference/fixtures/K03/K03.m',
+            'docs/research/matlab-r2026b/probes/rust-class-call-source-reference/fixtures/K03/Ks03.m',
+            'docs/research/matlab-r2026b/probes/rust-class-call-source-reference/fixtures/K04/K04.m',
+            'docs/research/matlab-r2026b/probes/rust-class-call-source-reference/fixtures/K04/Kg04.m',
+            'docs/research/matlab-r2026b/probes/rust-class-call-source-reference/fixtures/K04/Kw04.m',
+            'docs/research/matlab-r2026b/probes/rust-class-foundation-source-reference/fixtures/J01/J01.m',
+            'docs/research/matlab-r2026b/probes/rust-class-foundation-source-reference/fixtures/J01/Jv01.m',
+            'docs/research/matlab-r2026b/probes/rust-class-foundation-source-reference/fixtures/J02/J02.m',
+            'docs/research/matlab-r2026b/probes/rust-class-foundation-source-reference/fixtures/J02/Jh02.m',
+            'docs/research/matlab-r2026b/probes/rust-class-foundation-source-reference/fixtures/J03/J03.m',
+            'docs/research/matlab-r2026b/probes/rust-class-foundation-source-reference/fixtures/J03/Jg03.m',
+            'docs/research/matlab-r2026b/probes/rust-class-foundation-source-reference/fixtures/J03/Jw03.m',
+            'docs/research/matlab-r2026b/probes/rust-class-foundation-source-reference/fixtures/J04/J04.m',
+            'docs/research/matlab-r2026b/probes/rust-class-foundation-source-reference/fixtures/J04/Jh04.m',
+            'docs/research/matlab-r2026b/probes/rust-class-foundation-source-reference/fixtures/J05/J05.m',
+            'docs/research/matlab-r2026b/probes/rust-class-foundation-source-reference/fixtures/J05/Jv05.m',
+            'docs/research/matlab-r2026b/probes/rust-class-foundation-source-reference/fixtures/J06/J06.m',
+            'docs/research/matlab-r2026b/probes/rust-class-foundation-source-reference/fixtures/J06/Jb06.m',
+            'docs/research/matlab-r2026b/probes/rust-class-foundation-source-reference/fixtures/J06/Jd06.m',
+        }
+        self.assertEqual(admitted, expected_names)
+        self.assertEqual(len(admitted), 27)
+        self.assertEqual(sum(name.endswith(".py") for name in admitted), 4)
+        self.assertEqual(sum(name.endswith(".m") for name in admitted), 23)
+        expected = {}
+        for name in sorted(admitted):
+            expected[name] = ("# project-owned oracle\n" if name.endswith(".py") else "% project-owned fixture\n") + name + "\n"
+            self.write(name, expected[name])
+        contract = "docs/rust-least-squares.md"
+        expected[contract] = (SCRIPTS.parent / contract).read_text()
+        self.write(contract, expected[contract])
+        denied = ("crates/mathlab-cli/tests/private_oracle.py",
+                  "docs/research/matlab-r2026b/probes/rust-class-call-source-reference/fixtures/K04/private.m",
+                  "docs/research/matlab-r2026b/probes/rust-class-call-source-reference/fixtures/K04/record.json",
+                  "docs/research/matlab-r2026b/probes/rust-class-foundation-source-reference/fixtures/J01/J01.m.mat",
+                  "artifacts/secret.py", "outputs/secret.m",
+                  "docs/rust-least-squares-results.md", "docs/research/rust-least-squares.md")
+        for name in denied:
+            self.write(name, "PRIVATE_SENTINEL_NEVER_EXPORT\n")
+            self.assertFalse(source.policy.allowed_source(name), name)
+        for name in admitted:
+            for bad in ("./" + name, "artifacts/" + name, name + ".pyc", name.replace("fixtures/", "fixtures/private/")):
+                if bad != name:
+                    self.assertFalse(source.policy.allowed_source(bad), bad)
+        commit = self.commit_all()
+        manifest = self.create(commit)
+        self.assertEqual(source.verify(self.output), manifest)
+        _, contents = self.archive_contents()
+        prefix = manifest["archive"]["root"] + "/"
+        names = {record["path"] for record in manifest["files"]}
+        self.assertTrue(admitted.issubset(names))
+        self.assertIn(contract, names)
+        self.assertTrue(names.isdisjoint(denied))
+        for name, text in expected.items():
+            self.assertEqual(contents[prefix + name][1], text.encode())
+        self.assertNotIn(b"PRIVATE_SENTINEL_NEVER_EXPORT", b"".join(data for _, data in contents.values()))
+
+    def test_headless_exceptions_cannot_override_other_local_or_binary_denials(self):
+        forbidden = ("artifacts/secret.py", "crates/vendor/secret.py", "target/secret.py",
+                     "docs/research/.private/secret.m", "docs/research/secret.mat",
+                     "docs/research/../secret.m")
+        with patch.object(source.policy, "HEADLESS_TEST_SOURCE_FILES",
+                          source.policy.HEADLESS_TEST_SOURCE_FILES | set(forbidden)):
+            for name in forbidden:
+                self.assertFalse(source.policy.allowed_source(name), name)
+
+    def test_headless_input_missing_from_archive_refuses_even_after_rehash(self):
+        for name in source.policy.HEADLESS_TEST_SOURCE_FILES:
+            self.write(name, "original input\n")
+        manifest = self.create(self.commit_all())
+        removed = "crates/mathlab-cli/tests/least_squares_oracle.py"
+        selected = [record for record in manifest["files"] if record["path"] != removed]
+        _, observed = self.archive_contents()
+        prefix = manifest["archive"]["root"] + "/"
+        payloads = {record["path"]: observed[prefix + record["path"]][1] for record in selected}
+        source.write_archive(self.output / manifest["archive"]["filename"], manifest["archive"]["root"], selected, payloads)
+        self.refresh_manifest(manifest)
+        with self.assertRaisesRegex(ValueError, "Unexpected archive path/type|Missing archive member"):
+            source.verify(self.output)
+
+    def test_headless_approved_name_does_not_admit_a_committed_symlink(self):
+        name = "crates/mathlab-cli/tests/least_squares_oracle.py"
+        path = self.repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.symlink_to("../../../../private-input")
+        commit = self.commit_all()
+        with self.assertRaisesRegex(ValueError, "not a regular Git file"):
+            self.create(commit)
+        self.assertFalse(self.output.exists())
+
     def test_legacy_schema_one_and_legacy_logo_remain_verifiable(self):
         manifest = self.legacy_fixture(self.create(), add_legacy_asset=True)
         with patch.object(source, "git", side_effect=AssertionError("Legacy verify must not use Git")):

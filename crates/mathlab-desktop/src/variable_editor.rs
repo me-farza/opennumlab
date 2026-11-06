@@ -12,6 +12,8 @@ pub const PAGE_ROWS: usize = 30;
 pub const PAGE_COLUMNS: usize = 12;
 
 pub struct VariableEditor {
+    pub native_readonly:bool,
+    native_note:Option<String>,
     pub variable: Variable,
     pub row_start: usize,
     pub column_start: usize,
@@ -255,6 +257,7 @@ impl VariableEditor {
     pub fn new(variable: Variable) -> Self {
         let higher_indices = vec![1; variable.dimensions.len().saturating_sub(2)];
         Self {
+            native_readonly:false,native_note:None,
             variable,
             row_start: 1,
             column_start: 1,
@@ -484,7 +487,7 @@ impl VariableEditor {
     }
 
     fn can_edit(&self) -> bool {
-        !self.writes_blocked
+        !self.native_readonly && !self.writes_blocked
             && !self.pending
             && !self.stale
             && self.token.is_some()
@@ -545,7 +548,7 @@ impl VariableEditor {
                         }
                     }
                 });
-                if self.typed_page.is_some() && self.variable.dimensions.len() > 2 {
+                if self.has_higher_axis_controls() {
                     ui.horizontal_wrapped(|ui| {
                         for (offset, &extent) in self.variable.dimensions.iter().skip(2).enumerate() {
                             ui.label(format!("Axis {}", offset + 3));
@@ -626,6 +629,7 @@ impl VariableEditor {
                         } else { ui.label(RichText::new(&self.literal).monospace()); }
                     });
                 }
+                if let Some(note)=&self.native_note {ui.label(RichText::new(note).small().color(MUTED));}
                 if let Some(slice) = &self.slice {
                     if slice.rows > 0 && slice.columns > 0 {
                         let total_rows = if self.variable.dimensions_known { self.row_count().to_string() } else { "—".into() };
@@ -636,7 +640,7 @@ impl VariableEditor {
                 if self.variable.dimensions.len() > 2 {
                     let message = if self.variable.dimensions.iter().skip(2).any(|&extent| extent == 0) {
                         "This array has an empty higher axis; no positive plane can be selected."
-                    } else if self.typed_page.is_some() {
+                    } else if self.typed_page.is_some() || self.native_readonly {
                         "The selected N-dimensional plane is read-only."
                     } else {
                         "The first 2D plane is shown. Typed N-D inspection is unavailable for this view."
@@ -645,8 +649,8 @@ impl VariableEditor {
                 }
                 egui::Frame::NONE.fill(PALE).inner_margin(6).show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new(if editable { "Select a cell, enter a literal, then Apply. Changes update the shared workspace." } else { "Read-only value. Use the Command Window for advanced indexing and assignment." }).small().color(MUTED));
-                        if ui.add_enabled(enabled, egui::Button::new("Display in Command Window")).clicked() { action = Some(Action::Display(self.variable.name.clone())); }
+                        ui.label(RichText::new(if self.native_readonly { "Read-only native preview. Edit the script and Run to change values." } else if editable { "Select a cell, enter a literal, then Apply. Changes update the shared workspace." } else { "Read-only value. Use the Command Window for advanced indexing and assignment." }).small().color(MUTED));
+                        if ui.add_enabled(enabled && !self.native_readonly, egui::Button::new("Display in Command Window")).clicked() { action = Some(Action::Display(self.variable.name.clone())); }
                     });
                 });
             });
@@ -1269,5 +1273,48 @@ mod tests {
         );
         editor.writes_blocked = false;
         assert!(editor.write_action(31, 13).is_some());
+    }
+    #[test]
+    fn native_plane_widgets_reject_wrong_response_coordinates_and_empty_axes_stay_readonly(){
+        let mut editor=VariableEditor::new(variable());editor.variable.dimensions=vec![2,2,2];editor.higher_indices=vec![1];
+        assert!(!editor.has_higher_axis_controls());editor.native_readonly=true;assert!(editor.has_higher_axis_controls());
+        let mut page=crate::rust_worker::Page{token:crate::rust_worker::PageToken{key:crate::rust_worker::JobKey{generation:1,job:1},revision:1,binding:editor.variable.name.clone()},dimensions:vec![2,2,2],row:0,column:0,higher:vec![0],rows:2,columns:2,class_name:editor.variable.class_name.clone(),storage:"dense",complex:false,cells:vec![vec![crate::rust_worker::Cell{text:"1".into(),stored:true},crate::rust_worker::Cell{text:"3".into(),stored:true}],vec![crate::rust_worker::Cell{text:"2".into(),stored:true},crate::rust_worker::Cell{text:"4".into(),stored:true}]],object:None};
+        editor.begin_read(1,None);assert!(editor.accept_native(1,&page));assert!(editor.native_note.as_ref().unwrap().contains("axis 3 = 1"));assert!(!editor.can_edit());
+        editor.higher_indices[0]=2;editor.begin_read(2,None);
+        assert!(!editor.accept_native(1,&page));assert!(!editor.accept_native(2,&page));assert!(editor.pending);assert_eq!(editor.higher_indices,[2]);
+        page.higher[0]=1;page.cells[0][0].text="5".into();assert!(editor.accept_native(2,&page));assert_eq!(editor.slice.as_ref().unwrap().cells[0][0],"5");assert!(editor.native_note.as_ref().unwrap().contains("axis 3 = 2"));assert!(!editor.can_edit());assert!(editor.token.is_none());
+        editor.variable.dimensions=vec![2,3,0];editor.higher_indices=vec![1];assert!(editor.show_native_empty_plane());assert!(editor.has_higher_axis_controls());assert!(editor.slice.is_none());assert!(!editor.pending);assert!(!editor.can_edit());assert!(editor.native_note.as_ref().unwrap().contains("no selectable plane"));
+        editor.native_readonly=false;assert!(!editor.has_higher_axis_controls());assert!(!editor.show_native_empty_plane());
+        editor.typed_page=Some(typed_page(&[1,1,2],&[1],NumericClass::Double,NumericComponents::Double(vec![3.])));editor.variable.dimensions=vec![1,1,2];assert!(editor.has_higher_axis_controls(),"existing Octave typed selector remains enabled");
+    }
+
+}
+
+impl VariableEditor {
+    pub fn clear_native_page(&mut self){self.slice=None;self.typed_page=None;self.native_note=None;self.token=None;}
+    pub(crate) fn has_higher_axis_controls(&self)->bool{
+        (self.typed_page.is_some() || (self.native_readonly && self.variable.dimensions_known)) && self.variable.dimensions.len()>2
+    }
+    pub(crate) fn show_native_empty_plane(&mut self)->bool{
+        if !self.native_readonly || !self.variable.dimensions_known || !self.variable.dimensions.iter().skip(2).any(|&n|n==0){return false}
+        self.clear_native_page();self.pending=false;self.pending_read=None;self.stale=false;self.error=None;self.writes_blocked=true;
+        self.native_note=Some("Empty higher axis: no selectable plane; read-only shape metadata, no numeric cells.".into());true
+    }
+    pub fn accept_native(&mut self,request_id:u64,page:&crate::rust_worker::Page)->bool{
+        if self.request_id!=request_id || self.variable.name!=page.token.binding{return false}
+        if page.rows>crate::rust_worker::MAX_PAGE_CELLS || page.columns>crate::rust_worker::MAX_PAGE_CELLS || page.rows.checked_mul(page.columns).is_none_or(|n|n>crate::rust_worker::MAX_PAGE_CELLS) || page.higher.len()>6{return false}
+        let Some(expected)=self.pending_read.as_ref()else{return false};
+        // Compare the exact sent plane, not the token alone: one binding/revision has many planes.
+        if expected.token.is_some() || page.row.checked_add(1)!=Some(expected.row_start) || page.column.checked_add(1)!=Some(expected.column_start) || page.higher.len()!=expected.higher_indices.len() || !page.higher.iter().zip(&expected.higher_indices).all(|(&zero,&one)|zero.checked_add(1)==Some(one)){return false}
+        if page.object.is_none() && (page.dimensions!=self.variable.dimensions || page.class_name!=self.variable.class_name){return false}
+        self.pending=false;self.pending_read=None;self.stale=false;self.token=None;self.typed_page=None;self.native_readonly=true;self.writes_blocked=true;self.error=None;
+        self.higher_indices=page.higher.iter().map(|x|x+1).collect();
+        if let Some(object)=&page.object{self.slice=None;self.native_note=Some(object.clone());self.variable.dimensions_known=false;return true}
+        self.variable.dimensions=page.dimensions.clone();self.variable.dimensions_known=true;self.variable.class_name=page.class_name.clone();
+        self.row_start=page.row+1;self.column_start=page.column+1;
+        let plane=page.higher.iter().enumerate().map(|(axis,index)|format!("axis {} = {}",axis+3,index+1)).collect::<Vec<_>>().join(", ");
+        self.native_note=Some(format!("{}{}; read-only exact selected plane{}. CSC '0 (implicit)' marks absence of a stored entry.",page.storage,if page.complex{" complex"}else{""},if plane.is_empty(){String::new()}else{format!(": {plane}")}));
+        self.slice=Some(VariableSlice{name:page.token.binding.clone(),class_name:page.class_name.clone(),dimensions:page.dimensions.clone(),row_start:self.row_start,column_start:self.column_start,rows:page.rows,columns:page.columns,cells:page.cells.iter().map(|r|r.iter().map(|c|if page.storage=="csc" && !c.stored{"0 (implicit)".into()}else{c.text.clone()}).collect()).collect(),editable:false});
+        true
     }
 }

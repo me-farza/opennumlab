@@ -16,7 +16,9 @@ mod session;
 mod source_navigation;
 mod syntax;
 mod variable_editor;
-mod worker;
+pub mod worker;
+pub mod rust_worker;
+use rust_worker::{Backend,NativeEvent,JobKey,PageToken};
 
 use eframe::egui::{self, Align, Color32, FontId, Key, Layout, RichText, Sense, Stroke, Vec2};
 use mathlab_engine::{CancellationHandle, Figure, Package, Variable};
@@ -44,6 +46,8 @@ pub const RUN_SECTION_SHORTCUT: &str = if cfg!(target_os = "macos") {
 
 #[derive(Clone, Debug)]
 pub struct DesktopOptions {
+    pub backend: Backend,
+    pub rust_modules: Vec<PathBuf>,
     pub directory: PathBuf,
     pub executable: Option<PathBuf>,
     /// Explicit pinned qualified startup configuration; never selected by recovery or environment.
@@ -70,6 +74,8 @@ impl Default for DesktopOptions {
     fn default() -> Self {
         Self {
             directory: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            backend: Backend::Octave,
+            rust_modules: Vec::new(),
             executable: None,
             startup_config: None,
             packaged_startup: false,
@@ -118,6 +124,7 @@ impl Document {
 }
 
 struct ConsoleEntry {
+    native_credit: Option<rust_worker::DisplayLease>,
     text: String,
     kind: ConsoleKind,
     sources: Vec<source_navigation::SourceTarget>,
@@ -127,6 +134,7 @@ struct ConsoleEntry {
 impl ConsoleEntry {
     fn new(text: impl Into<String>, kind: ConsoleKind) -> Self {
         Self {
+            native_credit:None,
             text: text.into(),
             kind,
             sources: Vec::new(),
@@ -138,6 +146,7 @@ impl ConsoleEntry {
 enum ConsoleKind {
     Command,
     Output,
+    NativeOutput,
     Error,
     Notice,
 }
@@ -149,6 +158,17 @@ struct FigureView {
 }
 
 pub struct MathLabApp {
+    backend: Backend,
+    rust_modules: Vec<PathBuf>,
+    native_generation: u64,
+    native_job: u64,
+    native_gate: rust_worker::NativeGate,
+    native_stop: Option<rust_worker::AdmissionStop>,
+    native_cancel: Option<mathlab_engine::rust_program::ProgramCancelHandleV1>,
+    native_snapshot: Option<rust_worker::Finished>,
+    native_page: Option<(rust_worker::Page, Option<rust_worker::Lease>)>,
+    native_source_target:Option<(u64,usize)>,
+
     requests: Sender<Request>,
     events: Receiver<Event>,
     cancellation: Option<CancellationHandle>,
@@ -274,13 +294,22 @@ impl MathLabApp {
                 executable = session.executable.clone();
             }
         }
-        let _ = requests.send(Request::Start {
-            executable: executable.clone(),
-            startup_config: options.startup_config.clone(),
-            packaged_startup: options.packaged_startup,
-            directory: directory.clone(),
-        });
+        let native_gate=rust_worker::NativeGate::default();
+        if options.backend.is_rust() {
+            let lease=native_gate.start().expect("fresh native gate");
+            let _=requests.send(Request::NativeStart{generation:1,lease});
+        } else {
+            let _ = requests.send(Request::Start {
+                executable: executable.clone(), startup_config: options.startup_config.clone(),
+                packaged_startup: options.packaged_startup, directory: directory.clone(),
+            });
+        }
+        if options.rust_modules.is_empty(){if let Ok(Some(saved))=&restored {if saved.rust_modules.len()<rust_worker::MAX_SOURCES && saved.rust_modules.iter().all(|p|p.as_os_str().len()<=rust_worker::MAX_PATH_BYTES){options.rust_modules=saved.rust_modules.clone();}}}
+        options.rust_modules=options.rust_modules.into_iter().map(|p|if p.is_relative(){directory.join(p)}else{p}).collect();
         let mut app = Self {
+            backend:options.backend,
+            rust_modules:options.rust_modules.clone(),
+            native_generation:1,native_job:0,native_gate,native_stop:None,native_cancel:None,native_snapshot:None,native_page:None,native_source_target:None,
             requests,
             events,
             cancellation: None,
@@ -307,7 +336,7 @@ impl MathLabApp {
             active_document: 0,
             next_document_id: 2,
             console: console::ConsoleBuffer::new([ConsoleEntry::new(
-                "OpenNumLab\nA native Rust desktop powered by GNU Octave.\nOpen a .m file or run the getting started script with F5.",
+                if options.backend.is_rust(){"OpenNumLab\nRust-native class-v1 preview.\nOpen an entry script, choose explicit class modules in Engine Settings, then F5 Run."}else{"OpenNumLab\nA native Rust desktop powered by GNU Octave.\nOpen a .m file or run the getting started script with F5."},
                 ConsoleKind::Notice,
             )]),
             console_subscription: None,
@@ -341,7 +370,7 @@ impl MathLabApp {
             busy: true,
             restarting: false,
             connected: false,
-            status: "Starting GNU Octave…".into(),
+            status: if options.backend.is_rust(){"Starting Rust class-v1…"}else{"Starting GNU Octave…"}.into(),
             duration: None,
             pending_auto_run: options.run_on_start,
             focus_command: false,
@@ -461,6 +490,7 @@ impl MathLabApp {
         };
         let session = session::Session {
             version: 1,
+            rust_modules:self.rust_modules.clone(),
             directory: self.directory.clone(),
             executable: self.executable.clone(),
             documents: self
@@ -508,12 +538,14 @@ impl MathLabApp {
     }
 
     fn notice(&mut self, text: impl Into<String>) {
+        if self.backend.is_rust(){let text=text.into();self.native_console(&text,ConsoleKind::Notice,Vec::new());return}
         self.console
             .push(ConsoleEntry::new(text, ConsoleKind::Notice));
         self.console_follow = true;
     }
 
     fn error(&mut self, text: impl Into<String>) {
+        if self.backend.is_rust(){let text=text.into();self.status=text.chars().take(1024).collect();self.native_console(&text,ConsoleKind::Error,Vec::new());return}
         let text = text.into();
         self.status = text.clone();
         if !self
@@ -548,6 +580,7 @@ impl MathLabApp {
         };
         self.status = text.lines().last().unwrap_or("Execution failed").into();
         self.console.push(ConsoleEntry {
+            native_credit:None,
             text,
             kind: ConsoleKind::Error,
             sources,
@@ -557,6 +590,15 @@ impl MathLabApp {
     }
 
     fn navigate_source(&mut self, target: source_navigation::SourceTarget) {
+        if self.backend.is_rust() {
+            if let Some(source)=self.native_snapshot.as_ref().and_then(|s|s.sources.iter().find(|s|s.path==target.file)) {
+                let source=source.clone();
+                if let Some(i)=self.documents.iter().position(|d| d.source.as_str()==source.text.as_ref() && (Some(d.id)==source.document_id || d.path.as_ref()==Some(&source.path))){self.active_document=i;}
+                else {self.native_source_target=Some((source.source_id,target.line));self.status=format!("Executed snapshot {}:{}",source.path.display(),target.line);return}
+                let (start,end)=source_navigation::line_span(&self.documents[self.active_document].source,target.line);self.select_source_span(start,end);self.focus_command=false;self.status=format!("Executed source {}:{}",source.path.display(),target.line);return
+            }
+            self.notice("Executed source snapshot is no longer available.");return
+        }
         if let Some(index) =
             source_navigation::existing_document(&self.documents, &target, &self.directory)
         {
@@ -691,6 +733,7 @@ impl MathLabApp {
             }
             let (event, _) = self.pending_worker_event.take().unwrap();
             match event {
+                Event::Native(event) => self.native_event(event),
                 Event::ConsoleConnected {
                     subscription,
                     generation,
@@ -1123,6 +1166,7 @@ impl MathLabApp {
     }
 
     fn execute(&mut self, code: String, label: String) {
+        if self.backend.is_rust(){self.notice("Native class-v1 runs whole editor scripts. Command/selection execution is not enabled.");return}
         if self.input.active() || self.busy || !self.connected || code.trim().is_empty() {
             return;
         }
@@ -1131,6 +1175,7 @@ impl MathLabApp {
     }
 
     fn dispatch(&mut self, request: Request, label: String) {
+        if self.backend.is_rust(){self.notice("This action is unavailable in the read-only native class-v1 desktop profile.");return}
         if !self.connected || self.busy || self.input.active() || self.range_transactions.pending()
         {
             return;
@@ -1211,6 +1256,7 @@ impl MathLabApp {
     }
 
     fn run_prepared_document(&mut self) {
+        if self.backend.is_rust(){self.run_native_document();return}
         if !self.connected || self.busy || self.input.active() {
             return;
         }
@@ -1245,6 +1291,7 @@ impl MathLabApp {
     }
 
     fn run_section(&mut self) {
+        if self.backend.is_rust(){self.notice("This action is not supported by native class-v1. Use whole-script Run.");return}
         let doc = &self.documents[self.active_document];
         let code = syntax::section_at(&doc.source, doc.cursor).to_owned();
         let label = format!("run section — {}", doc.name);
@@ -1252,6 +1299,7 @@ impl MathLabApp {
     }
 
     fn run_selection(&mut self) {
+        if self.backend.is_rust(){self.notice("This action is not supported by native class-v1. Use whole-script Run.");return}
         let doc = &self.documents[self.active_document];
         if let Some((start, end)) = doc.selection {
             let code: String = doc.source.chars().skip(start).take(end - start).collect();
@@ -1260,6 +1308,10 @@ impl MathLabApp {
     }
 
     fn stop(&mut self) {
+        if self.backend.is_rust(){
+            if self.busy {if let Some(stop)=&self.native_stop{stop.request();}if let Some(cancel)=&self.native_cancel{cancel.request_stop();}self.status="Stopping native execution…".into();}
+            return
+        }
         if !self.busy || !self.connected || self.restarting {
             return;
         }
@@ -1316,6 +1368,7 @@ impl MathLabApp {
     }
 
     fn force_restart(&mut self) {
+        if self.backend.is_rust(){if !self.busy{self.connect_native();}else{self.notice("Native reset waits for Run to finish; use Stop first.");}return}
         self.clear_source_links();
         if let Some(cancel) = &self.cancellation {
             if let Err(error) = cancel.terminate() {
@@ -1350,16 +1403,19 @@ impl MathLabApp {
         &mut self,
         paste: range_paste::ParsedRangePaste,
     ) -> Result<(), String> {
+        if self.backend.is_rust(){return Err("Native workspace inspection is read-only.".into())}
         let request_id = self.range_request_id()?;
         let envelope = self.range_transactions.begin_paste(request_id, paste)?;
         self.queue_range_transaction(envelope)
     }
 
     pub fn undo_range_edit(&mut self) -> Result<(), String> {
+        if self.backend.is_rust(){return Err("Native workspace inspection is read-only.".into())}
         self.submit_range_history(mathlab_engine::value_edit::EditOperation::Undo)
     }
 
     pub fn redo_range_edit(&mut self) -> Result<(), String> {
+        if self.backend.is_rust(){return Err("Native workspace inspection is read-only.".into())}
         self.submit_range_history(mathlab_engine::value_edit::EditOperation::Redo)
     }
 
@@ -1587,6 +1643,7 @@ impl MathLabApp {
     }
 
     fn read_variable_with_token(&mut self, token: Option<mathlab_engine::BindingToken>) {
+        if self.backend.is_rust(){self.read_native_variable();return}
         if self.busy || !self.connected || self.range_transactions.pending() {
             return;
         }
@@ -1638,7 +1695,7 @@ impl MathLabApp {
 
     fn invalidate_inspector(&mut self) {
         self.range_transactions.clear_page();
-        self.inspector_request = self.inspector_request.wrapping_add(1);
+        if self.backend.is_rust(){let Some(next)=self.inspector_request.checked_add(1)else{self.error("Inspector identity exhausted.");return};self.inspector_request=next;}else{self.inspector_request = self.inspector_request.wrapping_add(1);}
         if let Some(editor) = &mut self.inspected {
             editor.request_id = self.inspector_request;
             editor.invalidate(Some(editor.variable.clone()));
@@ -1649,11 +1706,13 @@ impl MathLabApp {
         let Some(editor) = &mut self.inspected else {
             return;
         };
-        editor.writes_blocked = self.range_transactions.writes_blocked();
+        editor.native_readonly=self.backend.is_rust();
+        editor.writes_blocked = self.backend.is_rust() || self.range_transactions.writes_blocked();
         let (open, action) = editor.show(ctx, self.connected && !self.busy);
         if !open {
             self.range_transactions.clear_page();
             self.inspected = None;
+            self.native_page=None;
             return;
         }
         match action {
@@ -1668,7 +1727,7 @@ impl MathLabApp {
                 column,
                 literal,
             }) => {
-                if self.range_transactions.writes_blocked() {
+                if self.backend.is_rust() || self.range_transactions.writes_blocked() {
                     return;
                 }
                 self.range_transactions.invalidate_context();
@@ -1697,6 +1756,7 @@ impl MathLabApp {
     }
 
     fn restart(&mut self) {
+        if self.backend.is_rust(){if !self.busy{self.connect_native();}return}
         if self.busy {
             return;
         }
@@ -1712,6 +1772,8 @@ impl MathLabApp {
     }
 
     fn connect_engine(&mut self) {
+        if self.backend.is_rust(){self.connect_native();return}
+        self.native_snapshot=None;self.native_page=None;self.native_stop=None;self.native_cancel=None;
         self.debugger = None;
         self.qualified_profile = None;
         self.pending_breakpoint_id = None;
@@ -1733,6 +1795,7 @@ impl MathLabApp {
     }
 
     fn enable_debugger(&mut self) {
+        if self.backend.is_rust(){self.notice("This action is not supported by native class-v1. Use whole-script Run.");return}
         if (self.startup_config.is_some() || self.packaged_startup) || !self.connected || self.busy
         {
             return;
@@ -1827,6 +1890,7 @@ impl MathLabApp {
     }
 
     fn toggle_editor_breakpoint(&mut self, line: usize) {
+        if self.backend.is_rust(){self.notice("Native debugging is not implemented; located runtime errors remain available.");return}
         if self.busy || !self.connected {
             return;
         }
@@ -2046,6 +2110,7 @@ impl MathLabApp {
     }
 
     fn set_directory(&mut self, directory: PathBuf) {
+        if self.backend.is_rust(){if !self.busy{match directory.canonicalize(){Ok(path) if path.is_dir()=>{self.directory=path;self.directory_input=self.directory.display().to_string();},_=>self.error("The selected path is not a directory.")}}return}
         if self.busy {
             return;
         }
@@ -2510,7 +2575,7 @@ impl MathLabApp {
                         ui.separator();
                         if ui
                             .add_enabled(
-                                self.connected && !self.busy,
+                                self.connected && !self.busy && !self.backend.is_rust(),
                                 egui::Button::new("Load MAT File…"),
                             )
                             .clicked()
@@ -2520,7 +2585,7 @@ impl MathLabApp {
                         }
                         if ui
                             .add_enabled(
-                                self.connected && !self.busy,
+                                self.connected && !self.busy && !self.backend.is_rust(),
                                 egui::Button::new("Save Workspace…"),
                             )
                             .clicked()
@@ -2557,7 +2622,7 @@ impl MathLabApp {
                         }
                         if ui
                             .add_enabled(
-                                enabled,
+                                enabled && !self.backend.is_rust(),
                                 egui::Button::new("Run Section")
                                     .shortcut_text(RUN_SECTION_SHORTCUT),
                             )
@@ -2568,7 +2633,7 @@ impl MathLabApp {
                         }
                         if ui
                             .add_enabled(
-                                enabled,
+                                enabled && !self.backend.is_rust(),
                                 egui::Button::new("Evaluate Selection               F9"),
                             )
                             .clicked()
@@ -2669,7 +2734,7 @@ impl MathLabApp {
                                 "Figures",
                                 "Show rendered figures",
                                 Icon::Plot,
-                                true,
+                                !self.backend.is_rust(),
                             ) {
                                 self.show_figures = true;
                             }
@@ -2685,7 +2750,7 @@ impl MathLabApp {
                                     name,
                                     "Open function help in the Command Window",
                                     Icon::Plot,
-                                    ready,
+                                    ready && !self.backend.is_rust(),
                                 ) {
                                     self.execute(
                                         format!("help {command}"),
@@ -2705,7 +2770,7 @@ impl MathLabApp {
                                 "Packages",
                                 "List installed Octave packages",
                                 Icon::Data,
-                                ready,
+                                ready && !self.backend.is_rust(),
                             ) {
                                 self.show_packages = true;
                                 self.dispatch(Request::Packages, "pkg list".into());
@@ -3084,13 +3149,13 @@ impl MathLabApp {
                         for entry in &self.console {
                             let (prefix, color) = match entry.kind {
                                 ConsoleKind::Command => (">> ", BLUE),
-                                ConsoleKind::Output => ("", INK),
+                                ConsoleKind::Output | ConsoleKind::NativeOutput => ("", INK),
                                 ConsoleKind::Error => ("", RED),
                                 ConsoleKind::Notice => ("", MUTED),
                             };
                             ui.add(
                                 egui::Label::new(
-                                    RichText::new(format!("{prefix}{}", if matches!(entry.kind, ConsoleKind::Output) {
+                                    RichText::new(format!("{prefix}{}", if matches!(entry.kind, ConsoleKind::Output | ConsoleKind::NativeOutput) {
                                         entry.text.as_str()
                                     } else {
                                         entry.text.trim_end()
@@ -3101,7 +3166,7 @@ impl MathLabApp {
                                 )
                                 .wrap(),
                             );
-                            if !matches!(entry.kind, ConsoleKind::Output) {
+                            if !matches!(entry.kind, ConsoleKind::Output | ConsoleKind::NativeOutput) {
                                 ui.add_space(3.0);
                             }
                             for target in &entry.sources {
@@ -3207,12 +3272,12 @@ impl MathLabApp {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(">>").monospace().strong().color(BLUE));
                     let response = ui.add_enabled(
-                        !self.busy && self.connected,
+                        !self.busy && self.connected && !self.backend.is_rust(),
                         egui::TextEdit::singleline(&mut self.command)
                             .id(egui::Id::new("command_input"))
                             .font(egui::TextStyle::Monospace)
                             .desired_width(ui.available_width() - 55.0)
-                            .hint_text(if self.connected {
+                            .hint_text(if self.backend.is_rust(){"Native profile: edit a script, then press F5"}else if self.connected {
                                 "Enter a command…"
                             } else {
                                 "Connect GNU Octave in Engine Settings to begin"
@@ -3236,7 +3301,7 @@ impl MathLabApp {
                         self.focus_command = true;
                     }
                     if ui
-                        .add_enabled(!self.busy && self.connected, egui::Button::new("Enter"))
+                        .add_enabled(!self.busy && self.connected && !self.backend.is_rust(), egui::Button::new("Enter"))
                         .clicked()
                     {
                         self.submit_command();
@@ -3494,7 +3559,7 @@ impl MathLabApp {
                         );
                         ui.label(
                             RichText::new(if self.connected {
-                                "GNU Octave"
+                                self.backend.label()
                             } else {
                                 "Engine disconnected"
                             })
@@ -3507,6 +3572,16 @@ impl MathLabApp {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
+        if let Some((source_id,line))=self.native_source_target {
+            let mut open=true;
+            if let Some(source)=self.native_snapshot.as_ref().and_then(|s|s.sources.iter().find(|s|s.source_id==source_id)){
+                egui::Window::new("Executed source snapshot (read-only)").open(&mut open).default_width(700.0).show(ctx,|ui|{
+                    ui.label(format!("{}:{} — immutable executed bytes",source.path.display(),line));
+                    let mut text=source.text.as_ref();egui::ScrollArea::both().show(ui,|ui|{ui.add(egui::TextEdit::multiline(&mut text).font(egui::TextStyle::Monospace).desired_rows(24));});
+                });
+            }else{open=false}
+            if !open{self.native_source_target=None;}
+        }
         self.search_dialogs(ctx);
         self.variable_editor(ctx);
         if self.force_restart_confirmation {
@@ -3561,6 +3636,22 @@ impl MathLabApp {
         if self.show_settings {
             let mut open = true;
             egui::Window::new("Engine Settings").open(&mut open).resizable(false).default_width(550.0).show(ctx, |ui| {
+                let previous_backend=self.backend;
+                ui.add_enabled_ui(!self.busy && self.startup_config.is_none() && !self.packaged_startup,|ui|{
+                    egui::ComboBox::from_id_salt("execution_backend").selected_text(if self.backend.is_rust(){"Rust class-v1 (read-only preview)"}else{"GNU Octave"}).show_ui(ui,|ui|{
+                        ui.selectable_value(&mut self.backend,Backend::Octave,"GNU Octave");
+                        ui.selectable_value(&mut self.backend,Backend::RustClassV1,"Rust class-v1");
+                    });
+                });
+                if previous_backend!=self.backend{self.workspace.clear();self.inspected=None;self.native_page=None;self.native_snapshot=None;self.figures.clear();self.packages.clear();self.connect_engine();}
+                if self.backend.is_rust(){
+                    ui.heading("Rust-native class-v1");ui.label("Whole-script Run and cooperative Stop; numeric/object inspection is read-only. Debugger, partial Run, input, packages and graphics are not enabled.");
+                    ui.add_enabled_ui(!self.busy,|ui|{if ui.button("Choose explicit class modules…").clicked(){if let Some(paths)=rfd::FileDialog::new().add_filter("MATLAB source", &["m"]).pick_files(){if paths.len()<rust_worker::MAX_SOURCES && paths.iter().all(|p|p.as_os_str().len()<=rust_worker::MAX_PATH_BYTES){self.rust_modules=paths;}else{self.error("Choose at most8 bounded module paths.");}}}
+                    if ui.button("Clear module selection").clicked(){self.rust_modules.clear();}
+                    if ui.button("Reset native workspace / definitions").clicked(){self.connect_native();}});
+                    for path in &self.rust_modules{ui.label(path.display().to_string());}
+                    ui.label("Source limits: 9 files, 64KiB/file, 256KiB total. Module definition changes need reset. No Octave fallback.");return
+                }
                 ui.heading("GNU Octave runtime");
                 ui.label("OpenNumLab uses an installed GNU Octave executable to run your MATLAB-style code.");
                 if self.packaged_startup {
@@ -3623,7 +3714,7 @@ impl MathLabApp {
                 ui.label("Scripts and commands share one Octave workspace. Load Data and Save Data read and write MAT files. Figures render in a viewer with zoom and PNG export.");
                 ui.label("Double-click a workspace variable to open its paged Variable Editor. Numeric and logical 2D arrays support cell edits; other values show a read-only preview. Whole-script Run supports forward local functions; section and selection execution evaluate only the selected source.");
                 ui.add_space(8.0);
-                ui.label(RichText::new("Compatibility is provided by GNU Octave. MATLAB toolboxes, Simulink models, .mlx documents, and .mlapp applications are not implemented by this initial release.").color(MUTED));
+                ui.label(RichText::new(if self.backend.is_rust(){"Rust class-v1 is an explicit bounded preview; debugger/editing/graphics and broader MATLAB/Simulink compatibility remain required work."}else{"Compatibility is provided by GNU Octave. MATLAB toolboxes, Simulink models, .mlx documents, and .mlapp applications are not implemented by this initial release."}).color(MUTED));
                 ui.add_space(8.0);
                 ui.hyperlink_to("Octave language and function reference", "https://docs.octave.org/latest/");
                 ui.hyperlink_to("Octave package catalog", "https://packages.octave.org/");
@@ -4808,5 +4899,169 @@ mod lifecycle_tests {
             text.find("recovery diagnostic").unwrap()
                 < text.find("Execution interrupted.").unwrap()
         );
+    }
+}
+
+impl MathLabApp {
+    fn connect_native(&mut self){
+        if self.busy{return}
+        // Clear owned UI/cache payloads before acquiring a new native Run/start credit.
+        self.native_source_target=None;self.native_snapshot=None;self.native_page=None;self.native_cancel=None;self.native_stop=None;
+        self.workspace.clear();self.inspected=None;self.clear_source_links();self.range_transactions.restarted();
+        let Some(generation)=self.native_generation.checked_add(1) else {self.error("Native generation exhausted.");return};
+        let lease=match self.native_gate.start(){Ok(x)=>x,Err(e)=>{self.error(e);return}};
+        self.native_generation=generation;self.native_job=0;
+        self.input.disconnect();self.streaming_console=false;self.console_subscription=None;
+        self.debugger=None;self.pending_prepared_breakpoint=None;self.pending_breakpoint_id=None;
+        self.cancellation=None;self.internal_worker=None;self.connected=false;self.busy=true;
+        self.restarting=false;self.status="Starting Rust class-v1…".into();
+        if self.requests.send(Request::NativeStart{generation,lease}).is_err(){self.busy=false;self.error("The desktop worker stopped.");}
+    }
+    fn run_native_document(&mut self){
+        if self.busy || !self.connected{return}
+        // Cached DTO credit follows its bytes until this explicit replacement point.
+        self.native_source_target=None;self.native_snapshot=None;self.native_page=None;self.workspace.clear();self.inspected=None;
+        self.native_cancel=None;self.native_stop=None;self.clear_source_links();
+        let Some(job)=self.native_job.checked_add(1)else{self.error("Native job identity exhausted.");return};
+        let doc=&self.documents[self.active_document];
+        let path=doc.path.clone().unwrap_or_else(||self.directory.join(&doc.name));
+        let request=match rust_worker::RunRequest::new(&self.native_gate,JobKey{generation:self.native_generation,job},doc.id,&path,&doc.source,&self.rust_modules){Ok(r)=>r,Err(e)=>{self.error(e);return}};
+        self.native_stop=Some(request.stop.clone());self.native_job=job;self.executed_document=Some(doc.id);
+        let label=format!("run {} [Rust class-v1]",doc.name.chars().take(128).collect::<String>());
+        self.native_console(&label,ConsoleKind::Command,Vec::new());
+        self.range_transactions.invalidate_context();self.busy=true;self.status="Running Rust class-v1…".into();
+        if self.requests.send(Request::NativeRun(request)).is_err(){self.busy=false;self.connected=false;self.native_stop=None;self.error("The desktop worker stopped.");}
+    }
+    fn native_current(&self,key:JobKey)->bool{self.backend.is_rust() && key.generation==self.native_generation && key.job==self.native_job}
+    fn native_event(&mut self,event:NativeEvent){
+        match event {
+            NativeEvent::Ready{generation,lease}=>{
+                drop(lease);
+                if !self.backend.is_rust() || generation!=self.native_generation{return}
+                self.connected=true;self.busy=false;self.restarting=false;self.qualified_profile=Some("rust-class-v1".into());self.cancellation=None;
+                self.streaming_console=false;self.console_subscription=None;self.status="Ready — Rust class-v1".into();
+                self.notice("Rust-native workspace ready. Whole-script F5 Run; Ctrl+C Stop. Inspector is read-only; debugger/section/selection/input/packages/graphics are not enabled.");
+                if self.pending_auto_run{self.pending_auto_run=false;self.run_document();}else{self.screenshot_ready=true;self.screenshot_ready_at=Some(std::time::Instant::now());}
+            }
+            NativeEvent::StartupFailed{generation,message,lease:_}=>{if self.backend.is_rust() && generation==self.native_generation{self.busy=false;self.connected=false;self.error(message);}}
+            NativeEvent::Prepared{key,cancel}=>{if self.native_current(key) && self.busy{if self.native_stop.as_ref().is_some_and(|s|s.requested()){cancel.request_stop();}self.native_cancel=Some(cancel);}}
+            NativeEvent::Finished(result)=>{
+                if !self.native_current(result.key){return}
+                self.busy=false;self.native_stop=None;self.native_cancel=None;self.duration=Some(result.duration_ms as f64);
+                self.workspace=result.workspace.iter().cloned().collect();
+                if !result.output.is_empty(){self.native_console(&result.output,ConsoleKind::NativeOutput,Vec::new());}
+                if result.preview_omitted || !result.events_complete || !result.workspace_complete{self.notice("Native preview omitted data to stay within display limits. Execution status and completed effects are unchanged.");}
+                self.status=match result.status{rust_worker::Status::Success=>"Ready — Rust class-v1",rust_worker::Status::Cancelled=>"Stopped — completed workspace preserved",rust_worker::Status::Error=>"Native execution error — completed workspace preserved",rust_worker::Status::Resource=>"Native resource limit — completed workspace preserved"}.into();
+                if let Some(error)=&result.error{
+                    let target=source_navigation::native_target(&result.sources,error.source_id,error.line);
+                    self.native_console(&error.message,ConsoleKind::Error,target.into_iter().collect());
+                }
+                self.native_snapshot=Some(result); // Holds Run credit for all copied display data until replacement.
+                self.console_follow=true;self.refresh_inspector();
+                self.screenshot_ready=true;self.screenshot_ready_at=Some(std::time::Instant::now());
+                self.navigate_initial_error();
+                if let Some(name)=self.initial_variable.take(){if let Some(v)=self.workspace.iter().find(|v|v.name==name).cloned(){self.selected_variable=Some(name);self.open_variable(v);self.screenshot_ready=false;}else{self.notice("Requested variable was not created.");}}
+            }
+            NativeEvent::Page{request_id,token,result,lease}=>{
+                if !self.native_current(token.key) || self.native_snapshot.as_ref().is_none_or(|s|s.revision!=token.revision) {return}
+                let Some(editor)=self.inspected.as_mut()else{return};
+                if editor.request_id!=request_id || editor.variable.name!=token.binding{return}
+                match result{
+                    Ok(page)=>{
+                        if page.token!=token{return}
+                        if !editor.accept_native(request_id,&page){return}
+                        self.native_page=Some((page,lease)); // Credit covers DTO plus the bounded copied grid.
+                    }
+                    Err(message)=>{editor.accept(request_id,Err(message));self.native_page=None;}
+                }
+                self.screenshot_ready=true;self.screenshot_ready_at=Some(std::time::Instant::now());
+            }
+        }
+    }
+    fn read_native_variable(&mut self){
+        if self.busy || !self.connected{return}
+        let Some(editor)=self.inspected.as_mut()else{return};
+        if editor.pending{return}
+        let Some(snapshot)=self.native_snapshot.as_ref()else{return};
+        if !snapshot.workspace.iter().any(|v|v.name==editor.variable.name){return}
+        editor.native_readonly=true;
+        if editor.show_native_empty_plane(){self.native_page=None;return}
+        let Some(id)=self.inspector_request.checked_add(1)else{self.error("Inspector identity exhausted.");return};
+        // No old copied grid survives release of its read credit.
+        self.native_page=None;editor.clear_native_page();
+        let token=PageToken{key:snapshot.key,revision:snapshot.revision,binding:editor.variable.name.clone()};
+        let Some(higher)=editor.higher_indices.iter().map(|x|x.checked_sub(1)).collect::<Option<Vec<u64>>>()else{editor.error=Some("Native higher coordinates are one-based positive integers.".into());return};
+        let request=match rust_worker::PageRequest::new(&self.native_gate,id,&token,editor.row_start.saturating_sub(1),editor.column_start.saturating_sub(1),&higher,variable_editor::PAGE_ROWS,variable_editor::PAGE_COLUMNS){Ok(r)=>r,Err(e)=>{editor.error=Some(e);return}};
+        self.inspector_request=id;editor.native_readonly=true;editor.begin_read(id,None);
+        if self.requests.send(Request::NativeRead(request)).is_err(){editor.pending=false;editor.error=Some("The desktop worker stopped.".into());}
+    }
+}
+
+impl MathLabApp {
+    fn native_console(&mut self,text:&str,kind:ConsoleKind,sources:Vec<source_navigation::SourceTarget>){
+        // Reserve before copying response text. Extra source targets are bounded <=one4KiB path.
+        let extra=sources.capacity()*std::mem::size_of::<source_navigation::SourceTarget>()+sources.iter().map(|s|s.file.capacity()+s.function_name.capacity()).sum::<usize>();
+        let Some(bound)=text.len().checked_add(extra+std::mem::size_of::<ConsoleEntry>())else{return};
+        let credit=match self.native_gate.reserve_display(bound){Ok(c)=>c,Err(_)=>{self.status="Native display history budget full; new preview omitted. Execution status is unchanged.".into();return}};
+        let copied=text.to_owned();
+        if copied.capacity()+extra+std::mem::size_of::<ConsoleEntry>()>bound{return}
+        self.console.push(ConsoleEntry{native_credit:Some(credit),text:copied,kind,sources_active:!sources.is_empty(),sources});
+        self.console_follow=true;
+    }
+}
+
+#[cfg(test)]
+mod native_desktop_tests {
+    use super::*;
+    #[test]
+    fn native_stale_finish_start_and_page_failures_cannot_mutate_new_context(){
+        let mut t=lifecycle_tests::harness();t.app.backend=Backend::RustClassV1;t.app.native_generation=7;t.app.native_job=2;t.app.busy=true;
+        let r=rust_worker::RunRequest::new(&t.app.native_gate,JobKey{generation:6,job:1},1,Path::new("/private/tmp/stale.m"),"x=1;",&[]).unwrap();
+        t.app.native_event(NativeEvent::Finished(r.rejected("old request")));assert!(t.app.busy);assert!(t.app.native_snapshot.is_none());assert_eq!(t.app.native_gate.reserved_bytes(),0);
+        t.app.native_event(NativeEvent::StartupFailed{generation:6,message:"old start".into(),lease:None});assert!(t.app.busy);assert!(t.app.connected);
+        t.app.native_event(NativeEvent::Page{request_id:1,token:PageToken{key:JobKey{generation:7,job:1},revision:0,binding:"x".into()},result:Err("old page".into()),lease:None});assert!(t.app.busy);
+        t.app.busy=false;t.app.execute("x=12;".into(),"unsupported".into());t.app.run_section();t.app.run_selection();assert!(t.requests.try_recv().is_err());
+    }
+    #[test]
+    fn native_history_credit_survives_backend_changes_and_releases_with_existing_clear(){
+        assert_eq!(Backend::Octave.label(),"GNU Octave");assert_eq!(Backend::RustClassV1.label(),"Rust class-v1");
+        let mut t=lifecycle_tests::harness();t.app.backend=Backend::RustClassV1;
+        t.app.native_console("retained scientific output",ConsoleKind::NativeOutput,Vec::new());let bytes=t.app.native_gate.reserved_bytes();assert!(bytes>0);
+        t.app.native_snapshot=None;t.app.native_page=None;t.app.backend=Backend::Octave;assert_eq!(t.app.native_gate.reserved_bytes(),bytes);
+        t.app.backend=Backend::RustClassV1;assert_eq!(t.app.native_gate.reserved_bytes(),bytes);t.app.console.clear();assert_eq!(t.app.native_gate.reserved_bytes(),0);
+    }
+    #[test]
+    fn native_error_navigation_keeps_edited_buffer_and_opens_immutable_snapshot(){
+        let mut t=lifecycle_tests::harness();t.app.backend=Backend::RustClassV1;t.app.native_job=1;
+        let path=t.app.directory.join("entry.m");let request=rust_worker::RunRequest::new(&t.app.native_gate,JobKey{generation:t.app.native_generation,job:1},t.app.documents[0].id,&path,"x=;",&[]).unwrap();
+        let mut actor=rust_worker::NativeSession::new(t.app.native_generation).unwrap();let result=actor.run(request,|_|{});assert_eq!(result.status,rust_worker::Status::Error);let target=source_navigation::native_target(&result.sources,1,1).unwrap();
+        t.app.documents[0].source="edited=42;".into();t.app.native_event(NativeEvent::Finished(result));t.app.navigate_source(target);
+        assert_eq!(t.app.documents[0].source,"edited=42;");assert_eq!(t.app.native_source_target,Some((1,1)));assert_eq!(&*t.app.native_snapshot.as_ref().unwrap().sources[0].text,"x=;");
+    }
+}
+
+#[cfg(test)]
+mod native_nd_selector_tests {
+    use super::*;
+    #[test]
+    fn native_plane_two_routing_rejects_late_id_and_wrong_plane_before_accepting_real_page(){
+        let mut t=lifecycle_tests::harness();t.app.backend=Backend::RustClassV1;t.app.native_job=1;
+        let request=rust_worker::RunRequest::new(&t.app.native_gate,JobKey{generation:t.app.native_generation,job:1},t.app.documents[0].id,&t.app.directory.join("cube.m"),"cube=reshape(1:8,[2,2,2]);",&[]).unwrap();
+        let mut actor=rust_worker::NativeSession::new(t.app.native_generation).unwrap();let result=actor.run(request,|_|{});assert_eq!(result.status,rust_worker::Status::Success);t.app.native_event(NativeEvent::Finished(result));
+        let variable=t.app.workspace.iter().find(|v|v.name=="cube").unwrap().clone();t.app.open_variable(variable);
+        let first=match t.requests.recv().unwrap(){Request::NativeRead(r)=>r,_=>panic!("native page request")};
+        let old_id=t.app.inspected.as_ref().unwrap().request_id;let old_page=actor.page(&first).unwrap();t.app.native_event(actor.page_event(first));
+        let editor=t.app.inspected.as_ref().unwrap();assert!(editor.has_higher_axis_controls());assert_eq!(editor.higher_indices,[1]);assert_eq!(editor.slice.as_ref().unwrap().cells[0][0].parse::<f64>().unwrap(),1.);
+        t.app.inspected.as_mut().unwrap().higher_indices[0]=2;t.app.read_native_variable();
+        let second=match t.requests.recv().unwrap(){Request::NativeRead(r)=>r,_=>panic!("native second-plane request")};let id=t.app.inspected.as_ref().unwrap().request_id;
+        t.app.native_event(NativeEvent::Page{request_id:old_id,token:old_page.token.clone(),result:Ok(old_page),lease:None});assert!(t.app.inspected.as_ref().unwrap().pending);assert!(t.app.native_page.is_none());
+        let mut wrong=actor.page(&second).unwrap();wrong.higher[0]=0;t.app.native_event(NativeEvent::Page{request_id:id,token:wrong.token.clone(),result:Ok(wrong),lease:None});assert!(t.app.inspected.as_ref().unwrap().pending);assert!(t.app.native_page.is_none());
+        t.app.native_event(actor.page_event(second));let editor=t.app.inspected.as_ref().unwrap();assert!(!editor.pending);assert!(!editor.stale);assert_eq!(editor.higher_indices,[2]);assert_eq!(editor.slice.as_ref().unwrap().cells[0][0].parse::<f64>().unwrap(),5.);assert!(!editor.slice.as_ref().unwrap().editable);assert!(editor.native_readonly);assert!(editor.token.is_none());assert_eq!(t.app.native_page.as_ref().unwrap().0.higher,[1]);
+    }
+    #[test]
+    fn native_empty_higher_axis_shows_metadata_without_enqueueing_impossible_plane(){
+        let mut t=lifecycle_tests::harness();t.app.backend=Backend::RustClassV1;t.app.native_job=1;
+        let request=rust_worker::RunRequest::new(&t.app.native_gate,JobKey{generation:t.app.native_generation,job:1},t.app.documents[0].id,&t.app.directory.join("empty.m"),"empty=reshape(zeros(0,1),[2,3,0]);",&[]).unwrap();let mut actor=rust_worker::NativeSession::new(t.app.native_generation).unwrap();let result=actor.run(request,|_|{});assert_eq!(result.status,rust_worker::Status::Success,"{:?}",result.error);t.app.native_event(NativeEvent::Finished(result));
+        let variable=t.app.workspace.iter().find(|v|v.name=="empty").unwrap().clone();t.app.open_variable(variable);assert!(t.requests.try_recv().is_err());let editor=t.app.inspected.as_ref().unwrap();assert_eq!(editor.variable.dimensions,[2,3,0]);assert!(editor.has_higher_axis_controls());assert!(!editor.pending);assert!(editor.slice.is_none());assert!(editor.native_readonly);assert!(editor.token.is_none());assert!(t.app.native_page.is_none());
     }
 }

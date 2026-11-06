@@ -1806,11 +1806,14 @@ dependencies = [
  "clap",
  "eframe",
  "image",
+ "libc",
  "mathlab-debugger",
  "mathlab-engine",
+ "mathlab-language",
  "rfd",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 

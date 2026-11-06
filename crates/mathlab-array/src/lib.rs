@@ -13,3 +13,6 @@ pub use dense_double2d::{MtimesErrorV1, MtimesWorkBudgetV1};
 
 #[cfg(test)]
 mod tests;
+
+/// Versioned dense scientific storage and resumable kernels; v1 arrays unchanged.
+pub mod scientific;

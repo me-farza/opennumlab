@@ -786,7 +786,7 @@ class Runner:
         self.timeout, self.output_limit = timeout, output_limit
         self.commands = []
 
-    def run(self, label, argv, stdin=None):
+    def run(self, label, argv, stdin=None, on_stdout=None):
         require(os.name == "posix", "Process-group qualification currently requires a POSIX host")
         data = stdin.encode("utf-8") if stdin is not None else b""
         require(len(data) <= 4096, "QA stdin exceeds the bounded fixture size")
@@ -853,6 +853,8 @@ class Runner:
                             continue
                         remaining = max(0, self.output_limit - total)
                         key.data.write(block[:remaining])
+                        if on_stdout is not None and key.data is out:
+                            on_stdout(process, block[:remaining])
                         total += len(block)
                         if total > self.output_limit and not entry["output_limit_exceeded"]:
                             entry["output_limit_exceeded"] = True

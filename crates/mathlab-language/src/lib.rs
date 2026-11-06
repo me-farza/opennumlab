@@ -14,6 +14,7 @@ pub mod expression;
 mod expression_core;
 mod lexer;
 pub mod literal_evaluation;
+pub mod program;
 pub mod session_expression;
 
 use lexer::{Statement, TokenKind, statements};

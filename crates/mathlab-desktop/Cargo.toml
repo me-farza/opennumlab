@@ -7,6 +7,8 @@ description = "A native Rust scientific desktop for the Open MathLab engine"
 
 [dependencies]
 mathlab-engine = { path = "../mathlab-engine" }
+mathlab-language = { path = "../mathlab-language" }
+sha2 = "0.10.9"
 mathlab-debugger = { path = "../mathlab-debugger" }
 eframe.workspace = true
 rfd.workspace = true
@@ -14,6 +16,9 @@ image.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -10,6 +10,7 @@ mod input;
 mod protocol;
 mod qualified_ready;
 pub mod rust_session;
+pub mod rust_program;
 pub mod startup_config;
 mod trusted_startup;
 mod trusted_worker;

@@ -1,0 +1,11 @@
+pf_done=false;
+seed=Kg04;
+pf_seed_serial=seed.Serial;
+a=Kw04; b=Kw04;
+pf_serials=[a.DefaultGauge.Serial a.BuiltGauge.Serial b.DefaultGauge.Serial b.BuiltGauge.Serial];
+pf_before=[a.DefaultGauge.Reading b.DefaultGauge.Reading a.BuiltGauge.Reading b.BuiltGauge.Reading];
+a.DefaultGauge.Reading=9;
+a.BuiltGauge.Reading=12;
+pf_after=[a.DefaultGauge.Reading b.DefaultGauge.Reading a.BuiltGauge.Reading b.BuiltGauge.Reading];
+pf_shared=[a.DefaultGauge==b.DefaultGauge a.BuiltGauge==b.BuiltGauge];
+pf_done=true;

@@ -102,7 +102,7 @@ fn node_view(node: &CoreNode) -> ArithmeticNodeV1<'_> {
     ArithmeticNodeV1 {
         span: &node.span,
         kind: match &node.kind {
-            CoreNodeKind::Identifier { .. } => {
+            CoreNodeKind::IndexedWrite { .. } | CoreNodeKind::Identifier { .. } | CoreNodeKind::Call { .. } | CoreNodeKind::Range { .. } => {
                 unreachable!("arithmetic-v1 rejects identifiers during lexing")
             }
             CoreNodeKind::Number { literal_span } => ArithmeticNodeKindV1::Number { literal_span },
@@ -285,7 +285,7 @@ impl From<CoreParseError> for ArithmeticExpressionErrorV1 {
                 span,
                 expected,
                 found: found.map(|kind| match kind {
-                    CoreTokenKind::Identifier | CoreTokenKind::Assign => {
+                    CoreTokenKind::Identifier | CoreTokenKind::Assign | CoreTokenKind::Colon => {
                         unreachable!("arithmetic-v1 rejects session tokens during lexing")
                     }
                     CoreTokenKind::Number => ArithmeticTokenKindV1::Number,

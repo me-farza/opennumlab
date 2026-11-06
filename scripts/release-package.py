@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build an identified macOS Development alpha with external Octave prerequisites.
+"""Build an identified desktop alpha or explicit normal headless CLI candidate.
 
 No prebuilt/skip-build mode: provenance describes this invocation's builds.
 Tests use synthetic repositories and injected builders.
@@ -30,13 +30,45 @@ ROOT_FILES = {"Cargo.toml", "Cargo.lock", "LICENSE", "README.md", "THIRD_PARTY.m
 SCRIPT_FILES = {"build-debugger.sh", "build-value-bridge.sh", "verify-value-provisioning-test.sh",
                 "fetch-upstream-licenses.py", "generate-notices.py",
                 "license_support.py", "package-macos.sh", "setup.sh", "setup-runtime.sh", "verify.sh",
-                "qa-installed.py", "qa-installed-tests.py"}
-DOC_FILES = {"docs/CONSOLE_PROTOCOL.md", "docs/KERNEL_READINESS.md", "docs/qa/INSTALLED_ACCEPTANCE.md",
+                "qa-installed.py", "qa-installed-tests.py", "qa-headless.py", "qa-headless-tests.py"}
+DOC_FILES = {"docs/rust-least-squares.md", "docs/CONSOLE_PROTOCOL.md", "docs/KERNEL_READINESS.md", "docs/qa/INSTALLED_ACCEPTANCE.md",
              "docs/WORKSPACE_PROTOCOL.md", "docs/VALUE_PAGE_PROTOCOL.md", "docs/VALUE_EDIT_PROTOCOL.md",
              "ROADMAP.md", "roadmap.json",
              "DEVELOPMENT_PLAN.md", "FUNCTIONALITY_CATALOG.md", "INTEGRATION_STRATEGY.md",
              "CONTRIBUTING.md"}
 SOURCE_DATA_FILES = {"crates/mathlab-language/tests/fixtures/operator_native_reference_v1.provenance.json"}
+# Exact project-owned test inputs needed by sanitized Rust headless tests.
+# These names alone may cross the research-path denial; no results, provenance,
+# entire fixture directory or generic Python source is admitted.
+HEADLESS_TEST_SOURCE_FILES = {
+    'crates/mathlab-array/tests/scientific_oracle.py',
+    'crates/mathlab-cli/tests/least_squares_oracle.py',
+    'crates/mathlab-cli/tests/poisson_fraction_core.py',
+    'crates/mathlab-cli/tests/sparse_oracle.py',
+    'docs/research/matlab-r2026b/probes/rust-class-call-source-reference/fixtures/K01/K01.m',
+    'docs/research/matlab-r2026b/probes/rust-class-call-source-reference/fixtures/K01/Kc01.m',
+    'docs/research/matlab-r2026b/probes/rust-class-call-source-reference/fixtures/K02/K02.m',
+    'docs/research/matlab-r2026b/probes/rust-class-call-source-reference/fixtures/K02/Km02.m',
+    'docs/research/matlab-r2026b/probes/rust-class-call-source-reference/fixtures/K03/K03.m',
+    'docs/research/matlab-r2026b/probes/rust-class-call-source-reference/fixtures/K03/Ks03.m',
+    'docs/research/matlab-r2026b/probes/rust-class-call-source-reference/fixtures/K04/K04.m',
+    'docs/research/matlab-r2026b/probes/rust-class-call-source-reference/fixtures/K04/Kg04.m',
+    'docs/research/matlab-r2026b/probes/rust-class-call-source-reference/fixtures/K04/Kw04.m',
+    'docs/research/matlab-r2026b/probes/rust-class-foundation-source-reference/fixtures/J01/J01.m',
+    'docs/research/matlab-r2026b/probes/rust-class-foundation-source-reference/fixtures/J01/Jv01.m',
+    'docs/research/matlab-r2026b/probes/rust-class-foundation-source-reference/fixtures/J02/J02.m',
+    'docs/research/matlab-r2026b/probes/rust-class-foundation-source-reference/fixtures/J02/Jh02.m',
+    'docs/research/matlab-r2026b/probes/rust-class-foundation-source-reference/fixtures/J03/J03.m',
+    'docs/research/matlab-r2026b/probes/rust-class-foundation-source-reference/fixtures/J03/Jg03.m',
+    'docs/research/matlab-r2026b/probes/rust-class-foundation-source-reference/fixtures/J03/Jw03.m',
+    'docs/research/matlab-r2026b/probes/rust-class-foundation-source-reference/fixtures/J04/J04.m',
+    'docs/research/matlab-r2026b/probes/rust-class-foundation-source-reference/fixtures/J04/Jh04.m',
+    'docs/research/matlab-r2026b/probes/rust-class-foundation-source-reference/fixtures/J05/J05.m',
+    'docs/research/matlab-r2026b/probes/rust-class-foundation-source-reference/fixtures/J05/Jv05.m',
+    'docs/research/matlab-r2026b/probes/rust-class-foundation-source-reference/fixtures/J06/J06.m',
+    'docs/research/matlab-r2026b/probes/rust-class-foundation-source-reference/fixtures/J06/Jb06.m',
+    'docs/research/matlab-r2026b/probes/rust-class-foundation-source-reference/fixtures/J06/Jd06.m',
+}
 BRAND_FILES = {"assets/opennumlab-logo.png"}
 # Legacy format-1 verification only; new source selection never admits these.
 LEGACY_BRAND_FILES = {"assets/numjinn-logo.png"}
@@ -324,14 +356,23 @@ def installed_launcher_bytes(source, qualified=False):
 
 
 def allowed_source(name):
-    """Tracked-source allowlist with overriding binary/local-evidence denial."""
+    """Tracked sources; exact headless test inputs excepted from research denial.
+
+    Binary, hidden, traversal and non-regular committed-file defenses still apply.
+    """
     p = PurePosixPath(name)
     if any(ord(character) < 32 or ord(character) == 127 for character in name):
         return False
-    if not p.parts or p.is_absolute() or ".." in p.parts or any(x.lower() in FORBIDDEN_PARTS for x in p.parts):
+    if not p.parts or p.is_absolute() or ".." in p.parts:
+        return False
+    if any(x.lower() in FORBIDDEN_PARTS - {"research"} for x in p.parts):
+        return False
+    if any(x.lower() == "research" for x in p.parts) and name not in HEADLESS_TEST_SOURCE_FILES:
         return False
     if p.suffix.lower() in BINARY_SUFFIXES or any(x.startswith(".") for x in p.parts):
         return False
+    if name in HEADLESS_TEST_SOURCE_FILES:
+        return True
     if name in ROOT_FILES or name in DOC_FILES or name in SOURCE_DATA_FILES or name in BRAND_FILES:
         return True
     if p.parts[0] == "crates":
@@ -994,17 +1035,236 @@ def package(repo, destination, with_debugger=False, builder=build, notice_builde
             **({"startup_config": str(destination / STARTUP_CONFIG_PATH)} if qualified else {})}
 
 
+# Explicit headless profile; legacy desktop producer above remains unchanged.
+HEADLESS_PROFILE = "headless-cli-v1"
+HEADLESS_SOURCE = "share/opennumlab-cli/source"
+HEADLESS_LICENSES = "share/doc/opennumlab-cli/licenses"
+HEADLESS_DOC = "docs/release/HEADLESS_CLI.md"
+HEADLESS_EXAMPLE = "examples/rust-least-squares.m"
+
+
+def headless_source_tools():
+    import importlib.util
+    path = Path(__file__).with_name("release-source.py")
+    spec = importlib.util.spec_from_file_location("headless_corresponding_source", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def headless_environment(target_dir, cargo_home):
+    env = dict(os.environ)
+    for name in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "RUSTC"):
+        require(not env.get(name), "Headless normal build refuses override: " + name)
+    require(not any(name.startswith("CARGO_PROFILE_RELEASE_") for name in env),
+            "Headless release uses the committed release profile without overrides")
+    require(not any(name.startswith("CARGO_") and ("RUSTFLAGS" in name or "RUSTC" in name) and value for name, value in env.items()),
+            "Headless normal build refuses Cargo Rust compiler/flag overrides")
+    env.update(CARGO_TARGET_DIR=str(target_dir), CARGO_HOME=str(cargo_home),
+               CARGO_NET_OFFLINE="true", CARGO_INCREMENTAL="0", CARGO_BUILD_JOBS="1")
+    return env
+
+
+def build_headless(repo, target, target_dir, cargo_home):
+    require(sys.platform == "darwin" or sys.platform.startswith("linux"), "Headless producer currently supports POSIX macOS/Linux hosts")
+    env = headless_environment(target_dir, cargo_home)
+    rustc = run(["rustc", "-vV"], repo, env=env)
+    host = next((line[6:] for line in rustc.splitlines() if line.startswith("host: ")), None)
+    require(target == host, "Initial headless packages must be built for the runnable Rust host target")
+    command = ["cargo", "build", "--locked", "--offline", "-j1", "--release", "-p", "mathlab-cli", "--bin", "mathlab",
+               "--target", target, "--message-format=json-render-diagnostics"]
+    output = run(command, repo, timeout=1800, env=env)
+    print(output, flush=True)  # Retain raw Cargo evidence in the supervising bounded log.
+    matches = []
+    finished = False
+    for line in output.splitlines():
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if item.get("reason") == "build-finished":
+            finished = item.get("success") is True
+        if (item.get("reason") == "compiler-artifact" and item.get("executable")
+                and item.get("target", {}).get("name") == "mathlab"
+                and "bin" in item["target"].get("kind", []) and item.get("profile", {}).get("test") is False):
+            matches.append(item["executable"])
+    require(finished and len(set(matches)) == 1, "Cargo did not report successful fresh normal CLI build")
+    cli = Path(matches[0])
+    require(cli.is_file() and not cli.is_symlink(), "Built headless executable must be a regular file")
+    metadata = json.loads(run(["cargo", "metadata", "--locked", "--offline", "--no-deps", "--format-version", "1"], repo, env=env))
+    versions = [item["version"] for item in metadata["packages"] if item["name"] == "mathlab-cli"]
+    require(len(versions) == 1 and run([cli, "--version"], repo, env=env) == "mathlab " + versions[0], "Built CLI version mismatch")
+    linked_command = ["otool", "-L", cli] if sys.platform == "darwin" else ["readelf", "-d", cli]
+    linked = run(linked_command, repo, env=env)
+    linked = linked.replace(str(cli), "bin/mathlab")
+    require(not re.search(r"(?:liboctave|liboctinterp|libmatlab|libmx\.|libmwmclmcrrt)", linked, re.I),
+            "Explicit headless package unexpectedly links an external interpreter library")
+    return {"executables": {"mathlab": cli}, "executable_sha256": {"mathlab": sha(cli)},
+            "version": versions[0], "target": target, "host": host, "normal_cfg": True,
+            "rustc": rustc, "cargo": run(["cargo", "--version"], repo, env=env),
+            "cargo_command": [str(x) for x in command], "cargo_output_sha256": hashlib.sha256(output.encode()).hexdigest(), "linked_libraries": linked,
+            "configuration": {"RUSTFLAGS": "", "CARGO_ENCODED_RUSTFLAGS": "", "profile": "committed release", "jobs": 1, "offline": True}}
+
+
+def notices_headless(repo, destination, target, cargo_home):
+    env = dict(os.environ, CARGO_HOME=str(cargo_home), CARGO_NET_OFFLINE="true")
+    run([sys.executable, "scripts/generate-notices.py", destination, "--package", "mathlab-cli",
+         "--target", target, "--require-complete"], repo, timeout=300, env=env)
+
+
+def headless_notice_members(directory, target):
+    report = json.loads((directory / "index.json").read_text(), object_pairs_hook=unique_object)
+    require(report.get("built_packages") == ["mathlab-cli"] and report.get("target") == target
+            and report.get("missing_license_texts") == [], "Headless notices must describe complete exact-target CLI closure")
+    expected = {"index.json"}
+    require(isinstance(report.get("packages"), list) and report["packages"], "Headless dependency notice inventory is empty")
+    for package in report["packages"]:
+        texts = package.get("license_texts")
+        require(isinstance(texts, list) and texts, "Selected dependency lacks original license text")
+        for name in texts:
+            require(isinstance(name, str), "Notice path is not text")
+            path = PurePosixPath(name)
+            require(path.as_posix() == name and not path.is_absolute()
+                    and ".." not in path.parts and not any(p.startswith(".") for p in path.parts), "Unsafe notice member")
+            expected.add(name)
+    actual = {row["path"] for row in inventory(directory)}
+    require(actual == expected, "Unclaimed or missing notice files")
+    return expected
+
+
+def validate_headless(bundle):
+    bundle = Path(bundle)
+    require(bundle.is_dir() and not bundle.is_symlink(), "Headless package must be a real directory")
+    release = bundle / "release.json"
+    require(release.is_file() and release.stat().st_size <= 4 * 1024 * 1024, "Headless release metadata missing/oversized")
+    manifest = json.loads(release.read_text(), object_pairs_hook=unique_object)
+    require(set(manifest) == {"schema_version", "product", "profile", "version", "created_utc", "source", "build", "qualification", "distribution", "payload"}
+            and manifest["schema_version"] == 1 and manifest["product"] == "OpenNumLab"
+            and manifest["profile"] == HEADLESS_PROFILE, "Wrong headless package identity")
+    build_identity = manifest["build"]
+    require(build_identity.get("normal_cfg") is True and build_identity.get("target") == build_identity.get("host")
+            and re.fullmatch(r"[a-zA-Z0-9_]+(?:-[a-zA-Z0-9_]+)+", build_identity.get("target", ""))
+            and build_identity.get("configuration") == {"RUSTFLAGS": "", "CARGO_ENCODED_RUSTFLAGS": "", "profile": "committed release", "jobs": 1, "offline": True},
+            "Headless package requires explicit normal-cfg native host build")
+    for path in bundle.rglob("*"):
+        require(not path.is_symlink() and (path.is_dir() or stat.S_ISREG(path.stat().st_mode)), "Nonregular headless payload member")
+        require(not path.stat().st_mode & 0o022, "Group/world writable headless member")
+    actual = inventory(bundle)
+    payload = [row for row in actual if row["path"] not in {"release.json", "checksums.sha256"}]
+    require(payload == manifest["payload"], "Headless payload differs from manifest")
+    cli = bundle / "bin/mathlab"
+    require(cli.is_file() and cli.stat().st_mode & 0o111 and sha(cli) == build_identity.get("executable_sha256", {}).get("mathlab"), "CLI bytes/mode mismatch")
+    source = headless_source_tools()
+    source_manifest = source.verify(bundle / HEADLESS_SOURCE)
+    require(source_manifest["source"]["commit"] == manifest["source"]["commit"], "Headless corresponding source commit differs")
+    expected_source = [{"path": row["path"], "sha256": row["sha256"], "size": row["size"], "executable": row["executable"]} for row in source_manifest["files"]]
+    require(expected_source == manifest["source"]["files"], "Headless source inventory differs")
+    source_by_name = {row["path"]: row for row in source_manifest["files"]}
+    copies = {"share/doc/opennumlab-cli/README.md": HEADLESS_DOC,
+              "share/doc/opennumlab-cli/LICENSE": "LICENSE", "share/doc/opennumlab-cli/THIRD_PARTY.md": "THIRD_PARTY.md",
+              "share/examples/opennumlab-cli/rust-least-squares.m": HEADLESS_EXAMPLE}
+    for destination, original in copies.items():
+        require(original in source_by_name and sha(bundle / destination) == source_by_name[original]["sha256"], "Headless supported documentation/example differs from source")
+    notice_members = headless_notice_members(bundle / HEADLESS_LICENSES, build_identity["target"])
+    expected = {"bin/mathlab", *copies}
+    expected.update(HEADLESS_LICENSES + "/" + name for name in notice_members)
+    expected.update(HEADLESS_SOURCE + "/" + name for name in (source.MANIFEST, source.CHECKSUMS, source_manifest["archive"]["filename"]))
+    require({row["path"] for row in payload} == expected, "Unexpected headless member (GUI/runtime/debug/cache payload forbidden)")
+    expected_dirs = {parent.as_posix() for name in expected for parent in PurePosixPath(name).parents if parent.as_posix() != "."}
+    require({path.relative_to(bundle).as_posix() for path in bundle.rglob("*") if path.is_dir()} == expected_dirs, "Unclaimed headless directory")
+    require(manifest["qualification"] == {"status": "not_qualified", "installed_tests": "not_run", "public_source_review": "not_run"},
+            "Producer cannot self-issue installed/public acceptance")
+    require(manifest["distribution"] == {"signed": False, "notarized": False, "self_contained": False,
+            "external_interpreter_required_for_explicit_rust_route": False, "default_routes": "legacy unchanged; may require external Octave",
+            "claims": "Bounded explicit Rust headless profile only; exact target needs installed acceptance; no general MATLAB parity"}, "Invalid headless scope claims")
+    checksums = "".join(row["sha256"] + "  " + row["path"] + "\n" for row in actual if row["path"] != "checksums.sha256")
+    require((bundle / "checksums.sha256").read_text() == checksums, "Headless checksums disagree")
+    return manifest
+
+
+def package_headless(repo, destination, target, builder=build_headless, notice_builder=notices_headless):
+    repo, destination = Path(repo).resolve(), Path(destination).absolute()
+    require(re.fullmatch(r"[a-zA-Z0-9_]+(?:-[a-zA-Z0-9_]+)+", target or ""), "Explicit --target is required")
+    require(destination.suffix != ".app" and not destination.is_symlink() and not destination.parent.is_symlink(),
+            "Headless destination must be a real non-app directory")
+    if destination.exists():
+        validate_headless(destination)  # Never replace an arbitrary existing user directory.
+    before = source_snapshot(repo)
+    require(not before["dirty"], "Headless candidates require clean committed source; no allow-dirty mode")
+    names = {row["path"] for row in before["files"]}
+    require({HEADLESS_DOC, HEADLESS_EXAMPLE, "scripts/release-source.py", "scripts/release-package.py"}.issubset(names), "Missing supported headless source inputs")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".opennumlab-cli-stage-", dir=destination.parent) as work, tempfile.TemporaryDirectory(prefix="opennumlab-cli-build-") as build_work:
+        frozen = Path(build_work) / "source"
+        copy_source(repo, frozen, before, from_commit=True)
+        frozen_git_identity(repo, frozen, before["commit"])
+        cargo_home = Path(build_work) / "cargo-home"
+        cargo_home.mkdir()
+        original_cargo = Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo"))
+        for name in ("registry", "git"):
+            if (original_cargo / name).exists():
+                (cargo_home / name).symlink_to((original_cargo / name).resolve(), target_is_directory=True)
+        identity = builder(frozen, target, Path(build_work) / "cargo-target", cargo_home)
+        require(set(identity.get("executables", {})) == {"mathlab"} and identity.get("target") == target,
+                "Headless builder must produce only the requested CLI")
+        for row in before["files"]:
+            require(sha(frozen / row["path"]) == row["sha256"], "Frozen headless source changed during build: " + row["path"])
+        bundle = Path(work) / "opennumlab-cli"
+        (bundle / "bin").mkdir(parents=True)
+        executable = identity["executables"]["mathlab"]
+        require(executable.is_file() and not executable.is_symlink(), "Headless builder returned symlink/nonfile")
+        shutil.copy2(executable, bundle / "bin/mathlab")
+        (bundle / "bin/mathlab").chmod(0o755)
+        require(sha(bundle / "bin/mathlab") == identity["executable_sha256"]["mathlab"], "Built CLI changed before copy")
+        for original, relative in ((HEADLESS_DOC, "share/doc/opennumlab-cli/README.md"), ("LICENSE", "share/doc/opennumlab-cli/LICENSE"),
+                                   ("THIRD_PARTY.md", "share/doc/opennumlab-cli/THIRD_PARTY.md"), (HEADLESS_EXAMPLE, "share/examples/opennumlab-cli/rust-least-squares.m")):
+            output = bundle / relative
+            output.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(frozen / original, output)
+        notice_builder(frozen, bundle / HEADLESS_LICENSES, target, cargo_home)
+        source = headless_source_tools()
+        source_manifest = source.create(repo, before["commit"], bundle / HEADLESS_SOURCE)
+        after = source_snapshot(repo)
+        require(after == before, "Live source changed during headless production")
+        manifest = {"schema_version": 1, "product": "OpenNumLab", "profile": HEADLESS_PROFILE, "version": identity["version"],
+                    "created_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "source": {"commit": before["commit"], "files": before["files"]},
+                    "build": {key: value for key, value in identity.items() if key not in {"executables", "version"}},
+                    "qualification": {"status": "not_qualified", "installed_tests": "not_run", "public_source_review": "not_run"},
+                    "distribution": {"signed": False, "notarized": False, "self_contained": False,
+                        "external_interpreter_required_for_explicit_rust_route": False, "default_routes": "legacy unchanged; may require external Octave",
+                        "claims": "Bounded explicit Rust headless profile only; exact target needs installed acceptance; no general MATLAB parity"},
+                    "payload": inventory(bundle)}
+        (bundle / "release.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        (bundle / "checksums.sha256").write_text("".join(row["sha256"] + "  " + row["path"] + "\n" for row in inventory(bundle)))
+        validate_headless(bundle)
+        backup = publish(bundle, destination)
+    return {"bundle": str(destination), "previous_bundle": str(backup) if backup else None, "source_commit": before["commit"],
+            "checksums_sha256": sha(destination / "checksums.sha256"), "profile": HEADLESS_PROFILE, "qualification": "not_qualified"}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--profile", choices=("desktop-alpha", HEADLESS_PROFILE), default="desktop-alpha", help="Explicit headless CLI producer; desktop behavior remains default")
+    parser.add_argument("--target", help="Required runnable Rust host target for headless-cli-v1")
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--with-debugger", action="store_true", help="Build/probe all four adapters against matching Octave/SDK and require observed worker value capability")
     selection.add_argument("--startup-config", type=Path, help="Qualified runtime configuration seed; build the explicitly selected five or six native modules and generate fresh build/installed native pins")
     parser.add_argument("--allow-dirty", action="store_true", help="Unqualified local build from a hashed frozen export; accepted candidates require clean source")
-    parser.add_argument("--output", type=Path, help="App destination (default dist/OpenNumLab.app); previous app retained after replacement")
+    parser.add_argument("--output", type=Path, help="Destination for selected profile; verified previous package retained after replacement")
     args = parser.parse_args()
+    repo = Path(__file__).resolve().parent.parent
+    if args.profile == HEADLESS_PROFILE:
+        if args.with_debugger or args.startup_config is not None or args.allow_dirty or not args.target:
+            parser.error("headless-cli-v1 requires --target and clean source; no native/debugger/allow-dirty options")
+        result = package_headless(repo, args.output or repo / ("dist/opennumlab-cli-" + args.target), args.target)
+        print(json.dumps(result, indent=2))
+        print("Unsigned headless candidate; explicit Rust route needs no Octave/MATLAB. Installed/platform acceptance is not run.")
+        return
+    if args.target is not None:
+        parser.error("--target is currently a headless-cli-v1 option")
     if sys.platform != "darwin":
         parser.error("This application packaging lane requires macOS")
-    repo = Path(__file__).resolve().parent.parent
     result = package(repo, args.output or repo / "dist/OpenNumLab.app", args.with_debugger, allow_dirty=args.allow_dirty,
                      **({"startup_config": args.startup_config} if args.startup_config is not None else {}))
     print(json.dumps(result, indent=2))
@@ -1015,4 +1275,4 @@ if __name__ == "__main__":
     try:
         main()
     except (RuntimeError, subprocess.SubprocessError, OSError) as error:
-        sys.exit("Packaging failed; existing app retained: " + str(error))
+        sys.exit("Packaging failed; existing app/package destination retained: " + str(error))

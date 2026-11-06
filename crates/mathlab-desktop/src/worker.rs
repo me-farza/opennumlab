@@ -12,6 +12,9 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 pub enum Request {
+    NativeStart { generation:u64, lease:crate::rust_worker::Lease },
+    NativeRun(crate::rust_worker::RunRequest),
+    NativeRead(crate::rust_worker::PageRequest),
     RangeTransaction(Box<TransactionEnvelope>),
     Start {
         executable: Option<PathBuf>,
@@ -54,6 +57,7 @@ pub enum Request {
 }
 
 pub enum Event {
+    Native(crate::rust_worker::NativeEvent),
     RangeTransactionFinished {
         envelope: Box<TransactionEnvelope>,
         outcome: Box<TransactionOutcome>,
@@ -127,10 +131,28 @@ fn spawn_with_executable(
         .name("mathlab-engine".into())
         .spawn(move || {
             let mut engine: Option<Engine> = None;
+            let mut native: Option<crate::rust_worker::NativeSession> = None;
             let mut qualified_selection = false;
             let mut selected_config: Option<QualifiedStartupConfig> = None;
             while let Ok(request) = requests_rx.recv() {
                 let event = match request {
+                    Request::NativeStart { generation, lease } => {
+                        engine = None;
+                        match crate::rust_worker::NativeSession::new(generation) {
+                            Ok(session) => { native=Some(session); Event::Native(crate::rust_worker::NativeEvent::Ready{generation,lease}) }
+                            Err(message) => { native=None; Event::Native(crate::rust_worker::NativeEvent::StartupFailed{generation,message,lease:Some(lease)}) }
+                        }
+                    }
+                    Request::NativeRun(request) => {
+                        if let Some(session)=native.as_mut() {
+                            let finished=session.run(request,|event| { let _=events_tx.send(Event::Native(event)); ctx.request_repaint(); });
+                            Event::Native(crate::rust_worker::NativeEvent::Finished(finished))
+                        } else { Event::Native(crate::rust_worker::NativeEvent::Finished(request.rejected("Native session is not connected."))) }
+                    }
+                    Request::NativeRead(request) => {
+                        if let Some(session)=native.as_ref() { Event::Native(session.page_event(request)) }
+                        else { Event::Native(request.rejected("Native session is not connected.")) }
+                    }
                     Request::RangeTransaction(envelope) => {
                         let outcome = match engine.as_mut() {
                             Some(engine) => run_range_transaction(engine, &envelope),
@@ -143,6 +165,7 @@ fn spawn_with_executable(
                         Event::RangeTransactionFinished { envelope, outcome: Box::new(outcome) }
                     }
                     Request::Start { executable, startup_config, packaged_startup, directory } => {
+                        native=None;
                         engine = None;
                         selected_config = None;
                         qualified_selection = startup_config.is_some() || packaged_startup;

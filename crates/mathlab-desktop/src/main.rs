@@ -9,6 +9,10 @@ use std::path::PathBuf;
     after_help = format!("Project recovery defaults to .mathlab/session.json in the startup directory. Screenshot runs skip recovery unless --state is supplied.\n\nF5: run/continue · F12: toggle breakpoint · F10: step · F11: step in · Shift+F11: step out · Shift+F5: quit debugging\n{RUN_SECTION_SHORTCUT}: run section · F9: selection · Ctrl+S: save · Ctrl+O: open · Ctrl+C: interrupt · Ctrl+F: find · Ctrl+G: go to line")
 )]
 struct Arguments {
+    #[arg(long,value_enum,default_value="octave")]
+    engine: mathlab_desktop::rust_worker::Backend,
+    #[arg(long="class-module",value_name="FILE.m",action=clap::ArgAction::Append)]
+    class_modules: Vec<PathBuf>,
     #[arg(long = "cwd", value_name = "DIRECTORY")]
     directory: Option<PathBuf>,
     #[arg(long, value_name = "EXECUTABLE", conflicts_with = "startup_config")]
@@ -73,7 +77,13 @@ fn positive_line(value: &str) -> Result<usize, String> {
 
 fn main() -> eframe::Result<()> {
     let args = Arguments::parse();
+    if (args.engine.is_rust() && (args.octave.is_some() || args.startup_config.is_some() || args.packaged_startup || args.debugger.is_some() || args.break_at.is_some())) || (!args.engine.is_rust() && !args.class_modules.is_empty()) || args.class_modules.len()>=9 {
+        use clap::CommandFactory;
+        Arguments::command().error(clap::error::ErrorKind::ArgumentConflict,"Rust class-v1 requires explicit --engine rust-class-v1, at most8 --class-module paths, and no Octave/debugger options.").exit();
+    }
     launch(DesktopOptions {
+        backend:args.engine,
+        rust_modules:args.class_modules,
         directory: args
             .directory
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
@@ -185,5 +195,17 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(recovered.break_at, Some(4));
+    }
+}
+
+#[cfg(test)]
+mod native_options_tests {
+    use super::*;
+    #[test]
+    fn native_backend_is_explicit_and_module_options_do_not_change_octave_default(){
+        let default=Arguments::try_parse_from(["mathlab-desktop"]).unwrap();
+        assert!(!default.engine.is_rust());assert!(default.class_modules.is_empty());
+        let native=Arguments::try_parse_from(["mathlab-desktop","--engine","rust-class-v1","--class-module","Example.m","--open","entry.m","--run"]).unwrap();
+        assert!(native.engine.is_rust());assert_eq!(native.class_modules,[PathBuf::from("Example.m")]);assert!(native.run);
     }
 }

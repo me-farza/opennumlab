@@ -233,3 +233,8 @@ mod tests {
         assert_eq!(documents[1].source, "different running buffer");
     }
 }
+
+/// Native locations refer to immutable captured bytes, never a fresh filesystem read.
+pub(crate) fn native_target(sources:&[crate::rust_worker::SourceSnapshot],source_id:u64,line:usize)->Option<SourceTarget>{
+    sources.iter().find(|s|s.source_id==source_id).map(|s|SourceTarget{file:s.path.clone(),line:line.max(1),function_name:String::new(),document_id:s.document_id})
+}

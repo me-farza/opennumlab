@@ -44,12 +44,12 @@ fn snapshot(session: &RustSessionV1) -> Vec<(String, [u64; 2], Vec<u64>)> {
         .collect()
 }
 fn assert_error_unchanged(session: &mut RustSessionV1, source: &str) -> RustSessionErrorV1 {
-    let before = (session.context(), snapshot(session));
+    let before = (session.context(), snapshot(session), session.retained_bytes);
     let error = match run(session, source) {
         RustEvalOutcomeV1::Error { error, .. } => error,
         other => panic!("expected error for {source}: {other:?}"),
     };
-    assert_eq!((session.context(), snapshot(session)), before);
+    assert_eq!((session.context(), snapshot(session), session.retained_bytes), before);
     error
 }
 
@@ -119,7 +119,7 @@ fn rs04_semicolon_suppresses_display_without_suppressing_commit() {
             .display_name
             .is_none()
     );
-    for source in ["A=1; B=2", "A=B=1", "A=1\nB=2", "A(1)=5", "A=1,", "A=1;;"] {
+    for source in ["A=1; B=2", "A=B=1", "A=1\nB=2", "A(1)=", "A=1,", "A=1;;"] {
         assert_error_unchanged(&mut session, source);
     }
 }
@@ -497,4 +497,664 @@ fn rs12_owner_epoch_preparation_and_counter_lifetimes() {
         Err(RustSessionErrorV1::CounterExhausted)
     ));
     assert_eq!(a.context(), before);
+}
+
+
+#[test]
+fn rs13_zeros_assignment_ans_and_owned_snapshots() {
+    let mut session = RustSessionV1::new().unwrap();
+    success(run(&mut session, "n=2;"));
+    let assigned = success(run(&mut session, "A=zeros(n,3);"));
+    assert_eq!(assigned.value.shape(), [2,3]);
+    assert!(assigned.value.as_slice().iter().all(|v| v.to_bits()==0));
+    assert!(assigned.display_name.is_none());
+    assert!(session.read("ans").unwrap().is_none());
+    let snapshot = session.read("A").unwrap().unwrap();
+    let sum = success(run(&mut session, "A+1"));
+    assert_eq!(sum.value.as_slice(), &[1.0;6]);
+    assert_eq!(values(&session, "ans"), [1.0;6]);
+    success(run(&mut session, "A=zeros(0,3);"));
+    assert_eq!(snapshot.value.shape(), [2,3]);
+    assert!(snapshot.value.as_slice().iter().all(|v| v.to_bits()==0));
+    assert_eq!(snapshot.context.workspace_revision, 2);
+    assert_eq!(session.read("A").unwrap().unwrap().value.shape(), [0,3]);
+    let empty = success(run(&mut session, "zeros(3,0)"));
+    assert_eq!(empty.value.shape(), [3,0]);
+    assert!(empty.value.as_slice().is_empty());
+    success(run(&mut session, "A"));
+    assert_eq!(session.read("ans").unwrap().unwrap().value.shape(), [3,0]);
+    assert_eq!(session.context().workspace_revision, 5);
+}
+
+#[test]
+fn rs14_zeros_failed_transactions_workspace_limit_and_recovery() {
+    let mut session = RustSessionV1::new().unwrap();
+    success(run(&mut session, "A=7;"));
+    success(run(&mut session, "9"));
+    for source in ["A=zeros(17,0);", "B=zeros([1,2],missing);", "B=zeros();", "B=rand(2);"] {
+        assert_error_unchanged(&mut session, source);
+    }
+    session.fail_reservation = Some(ReservationSite::Response);
+    assert!(matches!(assert_error_unchanged(&mut session, "B=zeros(2,3);"),
+        RustSessionErrorV1::Allocation {..}));
+    assert_eq!(success(run(&mut session, "zeros(1)")).value.as_slice(), &[0.0]);
+    success(run(&mut session, "zeros=9;"));
+    assert!(matches!(assert_error_unchanged(&mut session, "A=zeros(missing);"),
+        RustSessionErrorV1::Language(SessionExpressionErrorV1::UnknownBinding {..})));
+    assert_eq!(success(run(&mut session, "zeros")).value.as_slice(), &[9.0]);
+    session.reset().unwrap();
+    for i in 0..64 { success(run(&mut session, &format!("v{i}=zeros(16);"))); }
+    assert_eq!(session.workspace().count(), MAX_WORKSPACE_BINDINGS_V1);
+    assert_eq!(session.retained_bytes, MAX_WORKSPACE_PAYLOAD_BYTES_V1);
+    assert!(matches!(assert_error_unchanged(&mut session, "extra=zeros(0,3);"), RustSessionErrorV1::WorkspaceLimit));
+    success(run(&mut session, "v0=zeros(0,3);"));
+    assert_eq!(session.retained_bytes, MAX_WORKSPACE_PAYLOAD_BYTES_V1 - 2048);
+    assert_eq!(session.read("v0").unwrap().unwrap().value.shape(), [0,3]);
+}
+
+#[test]
+fn rs15_zeros_stop_deadline_and_prepublication_recovery() {
+    for checkpoint in [Checkpoint::Task, Checkpoint::BeforeCommit] {
+        let mut session = RustSessionV1::new().unwrap();
+        success(run(&mut session, "A=7;"));
+        success(run(&mut session, "9"));
+        let before = (session.context(), snapshot(&session));
+        let mut tasks = 0;
+        session.hook = Some(Box::new(move |at, handle| {
+            if at == Checkpoint::Task {tasks+=1;}
+            if at==checkpoint && (at!=Checkpoint::Task || tasks==7) {handle.request_stop();}
+        }));
+        assert!(matches!(run(&mut session, "A=zeros(2,3);"),
+            RustEvalOutcomeV1::Cancelled { reason: RustCancelReasonV1::UserStop, .. }));
+        session.hook = None;
+        assert_eq!((session.context(), snapshot(&session)), before);
+        assert_eq!(success(run(&mut session, "zeros(1)")).value.as_slice(), &[0.0]);
+    }
+    let mut session = RustSessionV1::new().unwrap();
+    success(run(&mut session, "A=7;"));
+    let before = (session.context(), snapshot(&session));
+    let request = session.prepare(Arc::from("A=zeros(16);"), Some(Instant::now())).unwrap();
+    assert!(matches!(request.execute(), RustEvalOutcomeV1::Cancelled {reason:RustCancelReasonV1::Deadline, ..}));
+    assert_eq!((session.context(), snapshot(&session)), before);
+    assert_eq!(success(run(&mut session, "zeros(0,3)")).value.shape(), [0,3]);
+}
+
+
+#[test]
+fn integer_ranges_session_transactions_cancellation_and_recovery() {
+    let mut session = RustSessionV1::new().unwrap();
+    success(run(&mut session,"x=7;"));
+    success(run(&mut session,"9"));
+    assert!(matches!(assert_error_unchanged(&mut session,"x=1:17;"),
+        RustSessionErrorV1::Language(SessionExpressionErrorV1::RangeLength {actual:17,limit:16,..})));
+    assert_error_unchanged(&mut session,"x=[1,2]:missing:3;");
+    assert_eq!(values(&session,"x"),[7.0]);
+    assert_eq!(values(&session,"ans"),[9.0]);
+    for (checkpoint,stop_at) in [(Checkpoint::Task,7),(Checkpoint::Task,8),(Checkpoint::BeforeCommit,0)] {
+        let mut session = RustSessionV1::new().unwrap();
+        success(run(&mut session,"x=7;"));
+        success(run(&mut session,"9"));
+        let before = (session.context(),snapshot(&session));
+        let mut tasks = 0;
+        session.hook = Some(Box::new(move |at,handle| {
+            if at==Checkpoint::Task {tasks+=1;}
+            if at==checkpoint && (at!=Checkpoint::Task || tasks==stop_at) {handle.request_stop();}
+        }));
+        assert!(matches!(run(&mut session,"x=1:16;"),RustEvalOutcomeV1::Cancelled {reason:RustCancelReasonV1::UserStop,..}));
+        session.hook = None;
+        assert_eq!((session.context(),snapshot(&session)),before);
+        let value = success(run(&mut session,"x=1:16;")).value;
+        assert_eq!(value.shape(),[1,16]);
+        assert_eq!(value.as_slice(),(1..=16).map(f64::from).collect::<Vec<_>>());
+        assert_eq!(success(run(&mut session,"numel(x)")).value.as_slice(),&[16.0]);
+    }
+    let before = (session.context(),snapshot(&session));
+    let request = session.prepare(Arc::from("x=1:16;"),Some(Instant::now())).unwrap();
+    assert!(matches!(request.execute(),RustEvalOutcomeV1::Cancelled {reason:RustCancelReasonV1::Deadline,..}));
+    assert_eq!((session.context(),snapshot(&session)),before);
+    assert_eq!(success(run(&mut session,"1:2")).value.as_slice(),&[1.0,2.0]);
+}
+
+
+#[test]
+fn reshape_session_snapshots_failed_transactions_cancellation_and_recovery() {
+    let mut session=RustSessionV1::new().unwrap();
+    success(run(&mut session,"A=[1,2,3;4,5,6];"));
+    success(run(&mut session,"B=7;"));
+    success(run(&mut session,"9"));
+    let old=session.read("A").unwrap().unwrap();
+    let reshaped=success(run(&mut session,"B=reshape(A,3,2);"));
+    assert_eq!(reshaped.value.shape(),[3,2]);
+    assert_eq!(reshaped.value.as_slice(),&[1.,4.,2.,5.,3.,6.]);
+    assert_eq!(values(&session,"ans"),[9.]);
+    for source in ["B=reshape(A,1,1);","B=reshape([], -1, 0);","C=reshape(A,1,missing);"] {
+        assert_error_unchanged(&mut session,source);
+    }
+    session.fail_reservation=Some(ReservationSite::Response);
+    assert!(matches!(assert_error_unchanged(&mut session,"B=reshape(A,3,2);"),RustSessionErrorV1::Allocation {..}));
+    for (checkpoint,stop_at) in [(Checkpoint::Task,9),(Checkpoint::Task,10),(Checkpoint::BeforeCommit,0)] {
+        let before=(session.context(),snapshot(&session));
+        let mut tasks=0;
+        session.hook=Some(Box::new(move |at,handle|{
+            if at==Checkpoint::Task{tasks+=1;}
+            if at==checkpoint && (at!=Checkpoint::Task || tasks==stop_at){handle.request_stop();}
+        }));
+        assert!(matches!(run(&mut session,"B=reshape(A,3,2);"),RustEvalOutcomeV1::Cancelled {reason:RustCancelReasonV1::UserStop,..}));
+        session.hook=None;
+        assert_eq!((session.context(),snapshot(&session)),before);
+        assert_eq!(success(run(&mut session,"reshape(A,1,6)")).value.shape(),[1,6]);
+    }
+    let before=(session.context(),snapshot(&session));
+    let request=session.prepare(Arc::from("B=reshape(A,3,2);"),Some(Instant::now())).unwrap();
+    assert!(matches!(request.execute(),RustEvalOutcomeV1::Cancelled {reason:RustCancelReasonV1::Deadline,..}));
+    assert_eq!((session.context(),snapshot(&session)),before);
+    success(run(&mut session,"A=reshape(A,6,1);"));
+    assert_eq!(old.value.shape(),[2,3]);
+    assert_eq!(old.value.as_slice(),&[1.,4.,2.,5.,3.,6.]);
+    assert_eq!(session.read("A").unwrap().unwrap().value.shape(),[6,1]);
+    session.reset().unwrap();
+    for i in 0..64 {success(run(&mut session,&format!("v{i}=ones(16);")));}
+    assert!(matches!(assert_error_unchanged(&mut session,"extra=reshape(v0,16,16);"),RustSessionErrorV1::WorkspaceLimit));
+    assert_eq!(success(run(&mut session,"v0=reshape(v0,16,16);")).value.shape(),[16,16]);
+}
+
+#[test]
+fn scalar_index_session_bits_ans_suppression_snapshots_and_atomic_errors() {
+    let mut session=RustSessionV1::new().unwrap();
+    success(run(&mut session,"A=[1,2,3;4,5,6];"));
+    success(run(&mut session,"91"));
+    let old=session.read("A").unwrap().unwrap();
+    let result=success(run(&mut session,"A(2)"));
+    assert_eq!(result.value.as_slice(),&[4.]);
+    assert_eq!(result.display_name.as_deref(),Some("ans"));
+    assert_eq!(result.after.workspace_revision,result.before.workspace_revision+1);
+    assert_eq!(values(&session,"ans"),[4.]);
+    let suppressed=success(run(&mut session,"A(1,2);"));
+    assert!(suppressed.display_name.is_none());
+    assert_eq!(values(&session,"ans"),[2.]);
+    for source in ["A()","A([],4)","A([1,2;1,2])","A(1,1,1)","A(7)","A(3,1)","A(1,4)","A(-0)","A(1.5)","A(0,missing)"] {
+        let retained=session.retained_bytes;
+        assert_error_unchanged(&mut session,source);
+        assert_eq!(session.retained_bytes,retained);
+        assert_eq!(success(run(&mut session,"A(2)")).value.as_slice(),&[4.]);
+    }
+    let words=[0x8000000000000000,0x7ff8000000000042];
+    session.bindings.push(Binding {name:"P".into(),value:SessionValueV1::try_from_col_major([2,1],&words.map(f64::from_bits)).unwrap()});
+    session.retained_bytes+=16;
+    for (source,word) in [("P(1)",words[0]),("P(2,1)",words[1])] {
+        assert_eq!(success(run(&mut session,source)).value.as_slice()[0].to_bits(),word);
+        assert_eq!(session.read("ans").unwrap().unwrap().value.as_slice()[0].to_bits(),word);
+    }
+    success(run(&mut session,"A=0;"));
+    assert_eq!(old.value.shape(),[2,3]);
+    assert_eq!(old.value.as_slice(),&[1.,4.,2.,5.,3.,6.]);
+    assert_eq!(session.read("P").unwrap().unwrap().value.as_slice().iter().map(|v|v.to_bits()).collect::<Vec<_>>(),words);
+}
+
+#[test]
+fn scalar_index_session_reservations_quotas_revision_cancel_deadline_recovery() {
+    for site in [ReservationSite::Name,ReservationSite::Slot,ReservationSite::Response] {
+        let mut session=RustSessionV1::new().unwrap();
+        success(run(&mut session,"A=[1;4];"));
+        success(run(&mut session,"91"));
+        let retained=session.retained_bytes;
+        session.fail_reservation=Some(site);
+        assert!(matches!(assert_error_unchanged(&mut session,"B=A(2);"),RustSessionErrorV1::Allocation {..}));
+        assert_eq!(session.retained_bytes,retained);
+        let revision=session.revision;
+        assert_eq!(success(run(&mut session,"A(2)")).value.as_slice(),&[4.]);
+        assert_eq!(session.revision,revision+1);
+    }
+    for checkpoint in [Checkpoint::Task,Checkpoint::AfterEvaluation,Checkpoint::BeforeCommit] {
+        let mut session=RustSessionV1::new().unwrap();
+        success(run(&mut session,"A=[1;4];"));
+        success(run(&mut session,"91"));
+        let before=(session.context(),snapshot(&session),session.retained_bytes);
+        session.hook=Some(Box::new(move|at,handle|if at==checkpoint{handle.request_stop();}));
+        assert!(matches!(run(&mut session,"A(2)"),RustEvalOutcomeV1::Cancelled {reason:RustCancelReasonV1::UserStop,..}));
+        session.hook=None;
+        assert_eq!((session.context(),snapshot(&session),session.retained_bytes),before);
+        assert_eq!(success(run(&mut session,"A(2)")).value.as_slice(),&[4.]);
+        let before=(session.context(),snapshot(&session),session.retained_bytes);
+        let request=session.prepare(Arc::from("A(2)"),Some(Instant::now())).unwrap();
+        assert!(matches!(request.execute(),RustEvalOutcomeV1::Cancelled {reason:RustCancelReasonV1::Deadline,..}));
+        assert_eq!((session.context(),snapshot(&session),session.retained_bytes),before);
+        assert_eq!(success(run(&mut session,"A(2)")).value.as_slice(),&[4.]);
+        let revision=session.revision;
+        session.revision=u64::MAX;
+        assert!(matches!(assert_error_unchanged(&mut session,"A(2)"),RustSessionErrorV1::CounterExhausted));
+        session.revision=revision;
+        assert_eq!(success(run(&mut session,"A(2)")).value.as_slice(),&[4.]);
+    }
+    let mut session=RustSessionV1::new().unwrap();
+    for i in 0..64 {success(run(&mut session,&format!("v{i}=ones(16);")));}
+    assert!(matches!(assert_error_unchanged(&mut session,"v0(1)"),RustSessionErrorV1::WorkspaceLimit));
+    assert!(matches!(assert_error_unchanged(&mut session,"extra=v0(1);"),RustSessionErrorV1::WorkspaceLimit));
+    assert_eq!(success(run(&mut session,"v0=v0(256);")).value.as_slice(),&[1.]);
+    assert_eq!(session.retained_bytes,MAX_WORKSPACE_PAYLOAD_BYTES_V1-2048+8);
+}
+
+#[test]
+fn vector_index_session_ans_assignment_snapshots_payloads_and_error_atomicity() {
+    let mut session=RustSessionV1::new().unwrap();
+    success(run(&mut session,"A=[1,2,3;4,5,6];"));success(run(&mut session,"91"));
+    let old=session.read("A").unwrap().unwrap();
+    let result=success(run(&mut session,"A([2,1])"));
+    assert_eq!(result.value.shape(),[1,2]);assert_eq!(result.value.as_slice(),&[4.,1.]);
+    assert_eq!(result.display_name.as_deref(),Some("ans"));assert_eq!(result.after.workspace_revision,result.before.workspace_revision+1);
+    let suppressed=success(run(&mut session,"A([2;1]);"));
+    assert_eq!(suppressed.value.shape(),[2,1]);assert!(suppressed.display_name.is_none());
+    assert_eq!(session.read("ans").unwrap().unwrap().value.shape(),[2,1]);
+    let assigned=success(run(&mut session,"B=A([2,1]);"));
+    assert_eq!(assigned.value.as_slice(),&[4.,1.]);assert_eq!(values(&session,"ans"),[4.,1.]);
+    let assigned=success(run(&mut session,"B=A([2,1],[3,1]);"));
+    assert_eq!(assigned.value.as_slice(),&[6.,3.,4.,1.]);assert_eq!(values(&session,"ans"),[4.,1.]);
+    for source in ["B=A([1,0]);","B=A([2,1],[4,1e309]);","B=A([],4);","B=A([1,2;1,2]);","B=A([0,1],missing);"] {
+        assert_error_unchanged(&mut session,source);
+        assert_eq!(success(run(&mut session,"A(2)")).value.as_slice(),&[4.]);
+    }
+    success(run(&mut session,"A=A([2,1]);"));
+    assert_eq!(session.read("A").unwrap().unwrap().value.shape(),[1,2]);assert_eq!(values(&session,"A"),[4.,1.]);
+    assert_eq!(old.value.shape(),[2,3]);assert_eq!(old.value.as_slice(),&[1.,4.,2.,5.,3.,6.]);
+    let words=[0x8000000000000000,0x7ff8000000000042,0x7ff0000000000000,0xfff0000000000000];
+    session.bindings.push(Binding {name:"H".into(),value:SessionValueV1::try_from_col_major([2,2],&words.map(f64::from_bits)).unwrap()});session.retained_bytes+=32;
+    let old=session.read("H").unwrap().unwrap();
+    let expected=[words[1],words[0],words[1],words[3],words[2]];
+    let result=success(run(&mut session,"H([2,1,2,4,3])"));
+    assert_eq!(result.value.as_slice().iter().map(|v|v.to_bits()).collect::<Vec<_>>(),expected);
+    assert_eq!(session.read("ans").unwrap().unwrap().value.as_slice().iter().map(|v|v.to_bits()).collect::<Vec<_>>(),expected);
+    success(run(&mut session,"H=H([2,1,2,4,3]);"));
+    assert_eq!(session.read("H").unwrap().unwrap().value.shape(),[1,5]);
+    assert_eq!(old.value.as_slice().iter().map(|v|v.to_bits()).collect::<Vec<_>>(),words);
+    assert_eq!(session.retained_bytes,session.bindings.iter().map(|b|b.value.payload_bytes()).sum::<usize>());
+}
+
+#[test]
+fn vector_index_session_reservations_cancellation_quotas_revision_and_recovery() {
+    for site in [ReservationSite::Name,ReservationSite::Slot,ReservationSite::Response] {
+        let mut session=RustSessionV1::new().unwrap();
+        success(run(&mut session,"A=[1;4];"));success(run(&mut session,"91"));
+        session.fail_reservation=Some(site);
+        assert!(matches!(assert_error_unchanged(&mut session,"B=A([2,1]);"),RustSessionErrorV1::Allocation {..}));
+        assert_eq!(success(run(&mut session,"A([2,1])")).value.as_slice(),&[4.,1.]);
+    }
+    for checkpoint in [Checkpoint::Task,Checkpoint::AfterEvaluation,Checkpoint::BeforeCommit] {
+        let mut session=RustSessionV1::new().unwrap();
+        success(run(&mut session,"A=[1,2,3;4,5,6];"));success(run(&mut session,"91"));
+        let before=(session.context(),snapshot(&session),session.retained_bytes);
+        session.hook=Some(Box::new(move|at,handle|if at==checkpoint{handle.request_stop();}));
+        assert!(matches!(run(&mut session,"A([2,1],[3;1;2])"),RustEvalOutcomeV1::Cancelled {reason:RustCancelReasonV1::UserStop,..}));
+        session.hook=None;assert_eq!((session.context(),snapshot(&session),session.retained_bytes),before);
+        assert_eq!(success(run(&mut session,"A(2)")).value.as_slice(),&[4.]);
+        let before=(session.context(),snapshot(&session),session.retained_bytes);
+        let request=session.prepare(Arc::from("A([2,1],[3;1;2])"),Some(Instant::now())).unwrap();
+        assert!(matches!(request.execute(),RustEvalOutcomeV1::Cancelled {reason:RustCancelReasonV1::Deadline,..}));
+        assert_eq!((session.context(),snapshot(&session),session.retained_bytes),before);
+        let revision=session.revision;session.revision=u64::MAX;
+        assert!(matches!(assert_error_unchanged(&mut session,"A([2,1])"),RustSessionErrorV1::CounterExhausted));
+        session.revision=revision;
+        assert_eq!(success(run(&mut session,"A([2,1],[3;1;2])")).value.as_slice(),&[6.,3.,4.,1.,5.,2.]);
+    }
+    let mut session=RustSessionV1::new().unwrap();
+    for i in 0..64 {success(run(&mut session,&format!("v{i}=ones(16);")));}
+    assert_eq!(session.retained_bytes,MAX_WORKSPACE_PAYLOAD_BYTES_V1);
+    assert!(matches!(assert_error_unchanged(&mut session,"v0([1,1])"),RustSessionErrorV1::WorkspaceLimit));
+    assert!(matches!(assert_error_unchanged(&mut session,"extra=v0([1,1]);"),RustSessionErrorV1::WorkspaceLimit));
+    assert_eq!(success(run(&mut session,"v0=v0([256,1]);")).value.as_slice(),&[1.,1.]);
+    assert_eq!(session.retained_bytes,MAX_WORKSPACE_PAYLOAD_BYTES_V1-2048+16);
+}
+
+#[test]
+fn matrix_whitespace_session_assignment_bits_indexing_transactions_and_recovery() {
+    let mut session=RustSessionV1::new().unwrap();
+    let assigned=success(run(&mut session,"A=[1 2 3;4 5 6];"));
+    assert_eq!(assigned.value.shape(),[2,3]);assert_eq!(assigned.value.as_slice(),&[1.,4.,2.,5.,3.,6.]);assert!(assigned.display_name.is_none());
+    success(run(&mut session,"B=7;"));success(run(&mut session,"91"));
+    let old=session.read("A").unwrap().unwrap();
+    for source in ["B=[1 +];","B=[1 2;3];","B=[1e -2];","B=[1;];","B=[1 2+];"] {
+        assert_error_unchanged(&mut session,source);
+        assert_eq!(success(run(&mut session,"A([2 1])")).value.as_slice(),&[4.,1.]);
+    }
+    session.fail_reservation=Some(ReservationSite::Response);
+    assert!(matches!(assert_error_unchanged(&mut session,"B=[1 2;3 4];"),RustSessionErrorV1::Allocation {..}));
+    let before=(session.context(),snapshot(&session),session.retained_bytes);
+    session.hook=Some(Box::new(|at,handle|if at==Checkpoint::BeforeCommit{handle.request_stop();}));
+    assert!(matches!(run(&mut session,"B=[1 2;3 4];"),RustEvalOutcomeV1::Cancelled {reason:RustCancelReasonV1::UserStop,..}));
+    session.hook=None;assert_eq!((session.context(),snapshot(&session),session.retained_bytes),before);
+    assert_eq!(success(run(&mut session,"A([2 1],[3;1;2])")).value.as_slice(),&[6.,3.,4.,1.,5.,2.]);
+    let zeros=success(run(&mut session,"[-0 +0]"));assert_eq!(zeros.value.as_slice().iter().map(|v|v.to_bits()).collect::<Vec<_>>(),[0x8000000000000000,0]);
+    assert_eq!(session.read("ans").unwrap().unwrap().value.as_slice()[0].to_bits(),0x8000000000000000);
+    success(run(&mut session,"A=A([2 1]);"));assert_eq!(values(&session,"A"),[4.,1.]);assert_eq!(old.value.as_slice(),&[1.,4.,2.,5.,3.,6.]);
+}
+
+#[test]
+fn empty_index_session_ans_assignment_suppression_retained_bytes_and_snapshots() {
+    let mut session=RustSessionV1::new().unwrap();
+    success(run(&mut session,"A=[1 2 3;4 5 6];"));success(run(&mut session,"B=7;"));success(run(&mut session,"91"));
+    let old=session.read("A").unwrap().unwrap();let retained=session.retained_bytes;
+    let result=success(run(&mut session,"A([])"));
+    assert_eq!(result.value.shape(),[0,0]);assert_eq!(result.value.payload_bytes(),0);assert_eq!(result.display_name.as_deref(),Some("ans"));
+    assert_eq!(result.after.workspace_revision,result.before.workspace_revision+1);assert_eq!(session.retained_bytes,retained-8);
+    let result=success(run(&mut session,"A([],ones(1,16));"));
+    assert_eq!(result.value.shape(),[0,16]);assert!(result.display_name.is_none());assert_eq!(session.read("ans").unwrap().unwrap().value.shape(),[0,16]);
+    let result=success(run(&mut session,"B=A(ones(16,1),[]);"));
+    assert_eq!(result.value.shape(),[16,0]);assert!(result.display_name.is_none());assert_eq!(session.read("B").unwrap().unwrap().value.shape(),[16,0]);
+    assert_eq!(session.read("ans").unwrap().unwrap().value.shape(),[0,16]);assert_eq!(session.retained_bytes,48);
+    for source in ["B=A([],0);","B=A([],[4,1e309]);","B=A([],missing);","B=A([3,1],[]);","B=A([],ones(1,17));"] {
+        assert_error_unchanged(&mut session,source);
+        assert_eq!(success(run(&mut session,"A([],[])" )).value.shape(),[0,0]);
+    }
+    success(run(&mut session,"A=A([]);"));assert_eq!(session.retained_bytes,0);
+    assert_eq!(old.value.shape(),[2,3]);assert_eq!(old.value.as_slice(),&[1.,4.,2.,5.,3.,6.]);
+    assert!(session.workspace().all(|m|m.shape[0]==0 || m.shape[1]==0));
+    success(run(&mut session,"A=[-0,1];"));
+    assert_eq!(success(run(&mut session,"A(1)" )).value.as_slice()[0].to_bits(),0x8000000000000000);
+    assert_eq!(session.retained_bytes,session.bindings.iter().map(|b|b.value.payload_bytes()).sum::<usize>());
+}
+
+#[test]
+fn empty_index_session_metadata_reservations_stops_deadline_revision_and_quota_recovery() {
+    for site in [ReservationSite::Name,ReservationSite::Slot,ReservationSite::Response] {
+        let mut session=RustSessionV1::new().unwrap();success(run(&mut session,"A=[1;4];"));success(run(&mut session,"91"));
+        session.fail_reservation=Some(site);
+        assert!(matches!(assert_error_unchanged(&mut session,"B=A([]);"),RustSessionErrorV1::Allocation {..}));
+        let revision=session.revision;
+        assert_eq!(success(run(&mut session,"B=A([]);" )).value.shape(),[0,0]);assert_eq!(session.revision,revision+1);
+        assert_eq!(values(&session,"ans"),[91.]);assert_eq!(session.read("B").unwrap().unwrap().value.payload_bytes(),0);
+    }
+    for checkpoint in [Checkpoint::Task,Checkpoint::AfterEvaluation,Checkpoint::BeforeCommit] {
+        let mut session=RustSessionV1::new().unwrap();success(run(&mut session,"A=[1 2 3;4 5 6];"));success(run(&mut session,"91"));
+        let before=(session.context(),snapshot(&session),session.retained_bytes);
+        session.hook=Some(Box::new(move|at,handle|if at==checkpoint{handle.request_stop();}));
+        assert!(matches!(run(&mut session,"B=A([],ones(1,16));"),RustEvalOutcomeV1::Cancelled {reason:RustCancelReasonV1::UserStop,..}));
+        session.hook=None;assert_eq!((session.context(),snapshot(&session),session.retained_bytes),before);
+        let request=session.prepare(Arc::from("B=A([],ones(1,16));"),Some(Instant::now())).unwrap();
+        assert!(matches!(request.execute(),RustEvalOutcomeV1::Cancelled {reason:RustCancelReasonV1::Deadline,..}));
+        assert_eq!((session.context(),snapshot(&session),session.retained_bytes),before);
+        let revision=session.revision;session.revision=u64::MAX;
+        assert!(matches!(assert_error_unchanged(&mut session,"A([])"),RustSessionErrorV1::CounterExhausted));session.revision=revision;
+        assert_eq!(success(run(&mut session,"A([],ones(1,16))")).value.shape(),[0,16]);assert_eq!(session.revision,revision+1);
+    }
+    let mut session=RustSessionV1::new().unwrap();
+    for i in 0..63 {success(run(&mut session,&format!("v{i}=ones(16);")));}
+    success(run(&mut session,"ones(16)"));assert_eq!(session.retained_bytes,MAX_WORKSPACE_PAYLOAD_BYTES_V1);
+    assert!(matches!(assert_error_unchanged(&mut session,"extra=v0([]);"),RustSessionErrorV1::WorkspaceLimit));
+    assert_eq!(success(run(&mut session,"v0([])")).value.payload_bytes(),0);assert_eq!(session.retained_bytes,MAX_WORKSPACE_PAYLOAD_BYTES_V1-2048);
+    success(run(&mut session,"v0=v0([]);"));assert_eq!(session.retained_bytes,MAX_WORKSPACE_PAYLOAD_BYTES_V1-4096);
+}
+
+#[test]
+fn colon_index_session_values_metadata_assignment_ans_errors_and_recovery() {
+    let mut session=RustSessionV1::new().unwrap();success(run(&mut session,"A=[1 2 3;4 5 6];"));success(run(&mut session,"91"));
+    let old=session.read("A").unwrap().unwrap();
+    let result=success(run(&mut session,"A(:)"));assert_eq!(result.value.shape(),[6,1]);assert_eq!(result.value.as_slice(),&[1.,4.,2.,5.,3.,6.]);
+    assert_eq!(result.display_name.as_deref(),Some("ans"));assert_eq!(result.after.workspace_revision,result.before.workspace_revision+1);
+    let result=success(run(&mut session,"B=A(:,[3,1]);"));assert!(result.display_name.is_none());assert_eq!(result.value.as_slice(),&[3.,6.,1.,4.]);
+    assert_eq!(session.read("ans").unwrap().unwrap().value.shape(),[6,1]);
+    for source in ["B=A(:,4);","B=A([0,1],:);","B=A(:,missing);","B=zeros(:,missing);","B=zeros(:);","B=A(:,:,:);"] {
+        assert_error_unchanged(&mut session,source);assert_eq!(success(run(&mut session,"A(:,:)" )).value.shape(),[2,3]);
+    }
+    success(run(&mut session,"M=ones(16);"));assert_error_unchanged(&mut session,"B=M(:);");
+    assert_eq!(success(run(&mut session,"M(:,:)" )).value.payload_bytes(),2048);
+    let result=success(run(&mut session,"A=A(:);"));assert_eq!(result.value.shape(),[6,1]);
+    assert_eq!(old.value.shape(),[2,3]);assert_eq!(old.value.as_slice(),&[1.,4.,2.,5.,3.,6.]);
+    success(run(&mut session,"E=zeros(1,0);"));assert_eq!(success(run(&mut session,"E(:)" )).value.shape(),[0,1]);
+    assert_eq!(session.read("ans").unwrap().unwrap().value.payload_bytes(),0);
+    let words=[0x8000000000000000,0x7ff8000000000042];
+    session.bindings.push(Binding {name:"H".into(),value:SessionValueV1::try_from_col_major([1,2],&words.map(f64::from_bits)).unwrap()});session.retained_bytes+=16;
+    assert_eq!(success(run(&mut session,"H(:)" )).value.as_slice().iter().map(|w|w.to_bits()).collect::<Vec<_>>(),words);
+    assert_eq!(session.read("ans").unwrap().unwrap().value.shape(),[2,1]);
+    assert_eq!(session.retained_bytes,session.bindings.iter().map(|b|b.value.payload_bytes()).sum::<usize>());
+}
+
+#[test]
+fn colon_index_session_metadata_reservations_cancellation_revision_quotas_and_recovery() {
+    for site in [ReservationSite::Name,ReservationSite::Slot,ReservationSite::Response] {
+        let mut session=RustSessionV1::new().unwrap();success(run(&mut session,"A=[1;4];"));success(run(&mut session,"91"));
+        session.fail_reservation=Some(site);
+        assert!(matches!(assert_error_unchanged(&mut session,"B=A(:);"),RustSessionErrorV1::Allocation {..}));
+        assert_eq!(success(run(&mut session,"B=A(:);" )).value.as_slice(),&[1.,4.]);
+    }
+    for checkpoint in [Checkpoint::Task,Checkpoint::AfterEvaluation,Checkpoint::BeforeCommit] {
+        let mut session=RustSessionV1::new().unwrap();success(run(&mut session,"A=[1 2 3;4 5 6];"));success(run(&mut session,"91"));
+        let before=(session.context(),snapshot(&session),session.retained_bytes);
+        session.hook=Some(Box::new(move|at,handle|if at==checkpoint{handle.request_stop();}));
+        assert!(matches!(run(&mut session,"B=A(:,[3,1]);"),RustEvalOutcomeV1::Cancelled {reason:RustCancelReasonV1::UserStop,..}));
+        session.hook=None;assert_eq!((session.context(),snapshot(&session),session.retained_bytes),before);
+        let request=session.prepare(Arc::from("A(:,: )"),Some(Instant::now())).unwrap();
+        assert!(matches!(request.execute(),RustEvalOutcomeV1::Cancelled {reason:RustCancelReasonV1::Deadline,..}));
+        assert_eq!((session.context(),snapshot(&session),session.retained_bytes),before);
+        let revision=session.revision;session.revision=u64::MAX;
+        assert!(matches!(assert_error_unchanged(&mut session,"A(:)"),RustSessionErrorV1::CounterExhausted));session.revision=revision;
+        assert_eq!(success(run(&mut session,"A(:)" )).value.shape(),[6,1]);
+    }
+    let mut session=RustSessionV1::new().unwrap();for i in 0..64 {success(run(&mut session,&format!("v{i}=ones(16);")));}
+    assert!(matches!(assert_error_unchanged(&mut session,"extra=v0(:,:);"),RustSessionErrorV1::WorkspaceLimit));
+    assert_error_unchanged(&mut session,"v0(:)");assert_eq!(session.retained_bytes,MAX_WORKSPACE_PAYLOAD_BYTES_V1);
+    success(run(&mut session,"v0=v0(1,:);"));assert_eq!(session.retained_bytes,MAX_WORKSPACE_PAYLOAD_BYTES_V1-2048+128);
+}
+
+#[test]
+fn contextual_end_session_assignment_ans_words_independence_and_error_atomicity() {
+    let mut session=RustSessionV1::new().unwrap();
+    success(run(&mut session,"A=[1 2 3;4 5 6];"));success(run(&mut session,"91"));
+    let old=session.read("A").unwrap().unwrap();
+    let result=success(run(&mut session,"A(end,end)"));assert_eq!(result.value.as_slice(),&[6.]);assert_eq!(result.display_name.as_deref(),Some("ans"));assert_eq!(result.after.workspace_revision,result.before.workspace_revision+1);
+    let assigned=success(run(&mut session,"B=A(:,end);"));assert!(assigned.display_name.is_none());assert_eq!(assigned.value.as_slice(),&[3.,6.]);
+    assert_eq!(values(&session,"ans"),[6.]);
+    for source in ["B=A(end+1);","B=A(end,missing);","B=A(end,missing,1);","B=numel(end);","B=[end];","B=A(end-end);"] {
+        let retained=session.retained_bytes;assert_error_unchanged(&mut session,source);assert_eq!(session.retained_bytes,retained);
+        assert_eq!(success(run(&mut session,"A(reshape(end,1,1))")).value.as_slice(),&[6.]);
+    }
+    let words=[0x8000000000000000,0x7ff8000000000042];
+    session.bindings.push(Binding {name:"H".into(),value:SessionValueV1::try_from_col_major([1,2],&words.map(f64::from_bits)).unwrap()});session.retained_bytes+=16;
+    let selected=success(run(&mut session,"H(end:-1:1)"));assert_eq!(selected.value.as_slice().iter().map(|w|w.to_bits()).collect::<Vec<_>>(),[words[1],words[0]]);
+    success(run(&mut session,"A=A(end);"));assert_eq!(values(&session,"A"),[6.]);assert_eq!(old.value.as_slice(),&[1.,4.,2.,5.,3.,6.]);
+    assert_eq!(selected.value.as_slice()[0].to_bits(),words[1]);
+}
+
+#[test]
+fn contextual_end_session_reservations_cancel_deadline_revision_and_quotas() {
+    for site in [ReservationSite::Name,ReservationSite::Slot,ReservationSite::Response] {
+        let mut session=RustSessionV1::new().unwrap();success(run(&mut session,"A=[1 2 3;4 5 6];"));success(run(&mut session,"91"));session.fail_reservation=Some(site);
+        assert!(matches!(assert_error_unchanged(&mut session,"B=A(:,end);"),RustSessionErrorV1::Allocation {..}));
+        assert_eq!(success(run(&mut session,"B=A(:,end);")).value.as_slice(),&[3.,6.]);
+    }
+    for checkpoint in [Checkpoint::Task,Checkpoint::AfterEvaluation,Checkpoint::BeforeCommit] {
+        let mut session=RustSessionV1::new().unwrap();success(run(&mut session,"A=[1 2 3;4 5 6];"));success(run(&mut session,"91"));let before=(session.context(),snapshot(&session),session.retained_bytes);
+        session.hook=Some(Box::new(move|at,handle|if at==checkpoint{handle.request_stop();}));
+        assert!(matches!(run(&mut session,"B=A(reshape(end,1,1));"),RustEvalOutcomeV1::Cancelled {reason:RustCancelReasonV1::UserStop,..}));session.hook=None;
+        assert_eq!((session.context(),snapshot(&session),session.retained_bytes),before);
+        let request=session.prepare(Arc::from("A(:,end)"),Some(Instant::now())).unwrap();assert!(matches!(request.execute(),RustEvalOutcomeV1::Cancelled {reason:RustCancelReasonV1::Deadline,..}));assert_eq!((session.context(),snapshot(&session),session.retained_bytes),before);
+        let revision=session.revision;session.revision=u64::MAX;assert!(matches!(assert_error_unchanged(&mut session,"A(end)"),RustSessionErrorV1::CounterExhausted));session.revision=revision;assert_eq!(success(run(&mut session,"A(end)")).value.as_slice(),&[6.]);
+    }
+    let mut session=RustSessionV1::new().unwrap();for i in 0..64 {success(run(&mut session,&format!("v{i}=ones(16);")));}
+    assert!(matches!(assert_error_unchanged(&mut session,"extra=v0(end);"),RustSessionErrorV1::WorkspaceLimit));assert!(matches!(assert_error_unchanged(&mut session,"v0(end)"),RustSessionErrorV1::WorkspaceLimit));
+    success(run(&mut session,"v0=v0(end);"));assert_eq!(session.retained_bytes,MAX_WORKSPACE_PAYLOAD_BYTES_V1-2048+8);
+}
+
+#[test]
+fn construction_session_values_bits_ans_assignment_independence_and_atomic_errors() {
+    let mut session=RustSessionV1::new().unwrap();success(run(&mut session,"A=[1;2];"));success(run(&mut session,"91"));let old=session.read("A").unwrap().unwrap();
+    let result=success(run(&mut session,"[A A;A A]"));assert_eq!(result.value.shape(),[4,2]);assert_eq!(result.value.as_slice(),&[1.,2.,1.,2.,1.,2.,1.,2.]);assert_eq!(result.display_name.as_deref(),Some("ans"));assert_eq!(result.after.workspace_revision,result.before.workspace_revision+1);
+    let assigned=success(run(&mut session,"B=[A,ones(2,1)];"));assert!(assigned.display_name.is_none());assert_eq!(assigned.value.as_slice(),&[1.,2.,1.,1.]);assert_eq!(values(&session,"ans"),[1.,2.,1.,2.,1.,2.,1.,2.]);
+    for source in ["B=[A,1];","B=[A,1;missing];","B=[A;missing];","B=[zeros(0,16),zeros(0,1)];","B=[end];","B=[[1,2;3],missing];"] {let retained=session.retained_bytes;assert_error_unchanged(&mut session,source);assert_eq!(session.retained_bytes,retained);assert_eq!(success(run(&mut session,"A([end])")).value.as_slice(),&[2.]);}
+    success(run(&mut session,"A=[A;A];"));assert_eq!(values(&session,"A"),[1.,2.,1.,2.]);assert_eq!(old.value.as_slice(),&[1.,2.]);
+    success(run(&mut session,"E=[zeros(0,2),zeros(3,0),zeros(0,4)];"));assert_eq!(session.read("E").unwrap().unwrap().value.shape(),[0,0]);
+    let words=[0x8000000000000000,0x7ff8000000000042];session.bindings.push(Binding {name:"H".into(),value:SessionValueV1::try_from_col_major([1,2],&words.map(f64::from_bits)).unwrap()});session.retained_bytes+=16;
+    let result=success(run(&mut session,"[H;H]"));assert_eq!(result.value.as_slice().iter().map(|w|w.to_bits()).collect::<Vec<_>>(),[words[0],words[0],words[1],words[1]]);
+}
+
+#[test]
+fn construction_session_reservations_cancellation_deadline_revision_quota_and_recovery() {
+    for site in [ReservationSite::Name,ReservationSite::Slot,ReservationSite::Response] {
+        let mut session=RustSessionV1::new().unwrap();success(run(&mut session,"A=[1;2];"));success(run(&mut session,"91"));session.fail_reservation=Some(site);
+        assert!(matches!(assert_error_unchanged(&mut session,"B=[A,A];"),RustSessionErrorV1::Allocation {..}));assert_eq!(success(run(&mut session,"B=[A,A];")).value.shape(),[2,2]);
+    }
+    for checkpoint in [Checkpoint::Task,Checkpoint::AfterEvaluation,Checkpoint::BeforeCommit] {
+        let mut session=RustSessionV1::new().unwrap();success(run(&mut session,"A=[1;2];"));success(run(&mut session,"91"));let before=(session.context(),snapshot(&session),session.retained_bytes);session.hook=Some(Box::new(move|at,handle|if at==checkpoint{handle.request_stop();}));
+        assert!(matches!(run(&mut session,"B=[A,A;A,A];"),RustEvalOutcomeV1::Cancelled {reason:RustCancelReasonV1::UserStop,..}));session.hook=None;assert_eq!((session.context(),snapshot(&session),session.retained_bytes),before);
+        let request=session.prepare(Arc::from("[A,A]"),Some(Instant::now())).unwrap();assert!(matches!(request.execute(),RustEvalOutcomeV1::Cancelled {reason:RustCancelReasonV1::Deadline,..}));assert_eq!((session.context(),snapshot(&session),session.retained_bytes),before);
+        let revision=session.revision;session.revision=u64::MAX;assert!(matches!(assert_error_unchanged(&mut session,"[A,A]"),RustSessionErrorV1::CounterExhausted));session.revision=revision;assert_eq!(success(run(&mut session,"[A,A]")).value.shape(),[2,2]);
+    }
+    let mut session=RustSessionV1::new().unwrap();for i in 0..64{success(run(&mut session,&format!("v{i}=ones(16);")));}assert!(matches!(assert_error_unchanged(&mut session,"extra=[v0];"),RustSessionErrorV1::WorkspaceLimit));assert!(matches!(assert_error_unchanged(&mut session,"[v0]"),RustSessionErrorV1::WorkspaceLimit));success(run(&mut session,"v0=[v0(1,end)];"));assert_eq!(session.retained_bytes,MAX_WORKSPACE_PAYLOAD_BYTES_V1-2048+8);
+}
+
+#[test]
+fn indexed_write_session_fixed_geometry_bits_ans_revision_empty_policy_and_atomicity() {
+    let mut session=RustSessionV1::new().unwrap();success(run(&mut session,"A=[1 2 3;4 5 6];"));success(run(&mut session,"91"));let old=session.read("A").unwrap().unwrap();
+    let result=success(run(&mut session,"A([2,1],[3,1])=[10,30;20,40]"));assert_eq!(result.value.shape(),[2,3]);assert_eq!(result.value.as_slice(),&[40.,30.,2.,5.,20.,10.]);assert_eq!(result.display_name.as_deref(),Some("A"));assert_eq!(result.after.workspace_revision,result.before.workspace_revision+1);assert_eq!(values(&session,"ans"),[91.]);
+    let retained=session.retained_bytes;let result=success(run(&mut session,"A([1,1])=[7,8];"));assert!(result.display_name.is_none());assert_eq!(values(&session,"A"),[8.,30.,2.,5.,20.,10.]);assert_eq!(session.retained_bytes,retained);assert_eq!(old.value.as_slice(),&[1.,4.,2.,5.,3.,6.]);
+    success(run(&mut session,"A([2,1])=A([1,2]);"));assert_eq!(values(&session,"A"),[30.,8.,2.,5.,20.,10.]);
+    for source in ["New(1)=1;","A(7)=1;","A(0,missing)=[];","A(1)=[];","A(1)=zeros(0,0);","A([1,2],[1,2])=[1,2,3,4];","A(1)=rhs_missing;"] {assert_error_unchanged(&mut session,source);assert_eq!(session.retained_bytes,retained);}
+    success(run(&mut session,"E=zeros(0,3);"));success(run(&mut session,"Z=zeros(0,1);"));
+    for source in ["E(:,1)=[];","E(:,1)=zeros(0,0);","E(:,1)=([]);"] {assert_error_unchanged(&mut session,source);assert_eq!(session.read("E").unwrap().unwrap().value.shape(),[0,3]);}
+    let before=session.context();let retained=session.retained_bytes;let no_op=success(run(&mut session,"E(:,1)=Z;"));assert_eq!(no_op.value.shape(),[0,3]);assert!(no_op.value.as_slice().is_empty());assert_eq!(no_op.after.workspace_revision,before.workspace_revision+1);assert_eq!(session.retained_bytes,retained);assert_eq!(values(&session,"ans"),[91.]);
+    let words=[0x8000000000000000,0x7ff8000000000042];session.bindings.push(Binding {name:"H".into(),value:SessionValueV1::try_from_col_major([1,2],&words.map(f64::from_bits)).unwrap()});session.retained_bytes+=16;let old_h=session.read("H").unwrap().unwrap();let result=success(run(&mut session,"H([2,1])=H;"));assert_eq!(result.value.as_slice().iter().map(|w|w.to_bits()).collect::<Vec<_>>(),[words[1],words[0]]);assert_eq!(old_h.value.as_slice().iter().map(|w|w.to_bits()).collect::<Vec<_>>(),words);
+}
+
+#[test]
+fn indexed_write_session_reservations_phase_cancellation_deadline_quota_and_recovery() {
+    for site in [ReservationSite::Name,ReservationSite::Response] {
+        let mut session=RustSessionV1::new().unwrap();success(run(&mut session,"A=[1 2 3;4 5 6];"));success(run(&mut session,"91"));session.fail_reservation=Some(site);assert!(matches!(assert_error_unchanged(&mut session,"A([end;1],end)=A([1,end]);"),RustSessionErrorV1::Allocation {..}));assert_eq!(success(run(&mut session,"A(end)=7;")).value.as_slice()[5],7.);
+    }
+    for checkpoint in [Checkpoint::Task,Checkpoint::AfterEvaluation,Checkpoint::BeforeCommit] {
+        let mut session=RustSessionV1::new().unwrap();success(run(&mut session,"A=[1 2 3;4 5 6];"));success(run(&mut session,"91"));let before=(session.context(),snapshot(&session),session.retained_bytes);session.hook=Some(Box::new(move|at,handle|if at==checkpoint{handle.request_stop();}));assert!(matches!(run(&mut session,"A([end;1],end)=A([1,end]);"),RustEvalOutcomeV1::Cancelled {reason:RustCancelReasonV1::UserStop,..}));session.hook=None;assert_eq!((session.context(),snapshot(&session),session.retained_bytes),before);
+        let request=session.prepare(Arc::from("A(end)=7"),Some(Instant::now())).unwrap();assert!(matches!(request.execute(),RustEvalOutcomeV1::Cancelled {reason:RustCancelReasonV1::Deadline,..}));assert_eq!((session.context(),snapshot(&session),session.retained_bytes),before);let revision=session.revision;session.revision=u64::MAX;assert!(matches!(assert_error_unchanged(&mut session,"A(end)=7"),RustSessionErrorV1::CounterExhausted));session.revision=revision;assert_eq!(success(run(&mut session,"A(end)=7")).value.as_slice()[5],7.);
+    }
+    let mut session=RustSessionV1::new().unwrap();for i in 0..64{success(run(&mut session,&format!("v{i}=ones(16);")));}assert_eq!(session.retained_bytes,MAX_WORKSPACE_PAYLOAD_BYTES_V1);let old=session.read("v0").unwrap().unwrap();let before=session.context();let result=success(run(&mut session,"v0(:)=2;"));assert_eq!(result.value.shape(),[16,16]);assert!(result.value.as_slice().iter().all(|w|*w==2.));assert_eq!(result.after.workspace_revision,before.workspace_revision+1);assert_eq!(session.retained_bytes,MAX_WORKSPACE_PAYLOAD_BYTES_V1);assert!(old.value.as_slice().iter().all(|w|*w==1.));assert!(session.read("ans").unwrap().is_none());assert_error_unchanged(&mut session,"v0(:)");assert_eq!(success(run(&mut session,"v0(:,:)=3;")).value.as_slice(),&[3.;256]);
+}
+
+#[test]
+fn sum_default_session_ans_suppression_revision_bits_and_atomic_recovery() {
+    let mut session=RustSessionV1::new().unwrap();
+    success(run(&mut session,"A=[1 2 3;4 5 6];"));
+    let old=session.read("A").unwrap().unwrap();
+    let result=success(run(&mut session,"sum(A)"));
+    assert_eq!(result.value.as_slice(), &[5.,7.,9.]);
+    assert_eq!(result.display_name.as_deref(), Some("ans"));
+    assert_eq!(result.after.workspace_revision,result.before.workspace_revision+1);
+    let assigned=success(run(&mut session,"B=sum(A);"));
+    assert!(assigned.display_name.is_none()); assert_eq!(values(&session,"ans"),[5.,7.,9.]);
+    success(run(&mut session,"A(1,:)=sum(A);"));
+    assert_eq!(old.value.as_slice(), &[1.,4.,2.,5.,3.,6.]);
+    assert_eq!(values(&session,"B"),[5.,7.,9.]);
+    for source in ["B=sum(missing);","B=sum(A,missing);","B=sum(:);","B=sum(zeros(17));"] {
+        assert_error_unchanged(&mut session,source);
+        assert_eq!(success(run(&mut session,"sum(B)")).value.as_slice(), &[21.]);
+    }
+    let empty=success(run(&mut session,"sum(zeros(0,0))"));
+    assert_eq!(empty.value.shape(),[1,1]);assert_eq!(empty.value.as_slice()[0].to_bits(),0);
+    assert_eq!(success(run(&mut session,"sum(zeros(3,0))")).value.shape(),[1,0]);
+    assert_eq!(success(run(&mut session,"sum([-0 -0])")).value.as_slice()[0].to_bits(),0x8000000000000000);
+    // Intentional private accuracy amendment U27: cancellation is exact before one rounding.
+    assert_eq!(success(run(&mut session,"sum([1e308 1e308 -1e308 -1e308])")).value.as_slice()[0].to_bits(),0);
+    success(run(&mut session,"sum=[8 9];"));
+    assert_eq!(success(run(&mut session,"sum(end)")).value.as_slice(), &[9.]);
+}
+
+#[test]
+fn sum_default_session_reservations_cancel_deadline_quotas_and_recovery() {
+    for site in [ReservationSite::Name,ReservationSite::Slot,ReservationSite::Response] {
+        let mut session=RustSessionV1::new().unwrap();success(run(&mut session,"A=ones(16);"));success(run(&mut session,"91"));
+        session.fail_reservation=Some(site);
+        assert!(matches!(assert_error_unchanged(&mut session,"B=sum(A);"),RustSessionErrorV1::Allocation {..}));
+        assert_eq!(success(run(&mut session,"B=sum(A);" )).value.as_slice(), &[16.;16]);
+    }
+    for checkpoint in [Checkpoint::Task,Checkpoint::AfterEvaluation,Checkpoint::BeforeCommit] {
+        let mut session=RustSessionV1::new().unwrap();success(run(&mut session,"A=ones(16);"));success(run(&mut session,"91"));
+        let before=(session.context(),snapshot(&session),session.retained_bytes);
+        session.hook=Some(Box::new(move|at,handle|if at==checkpoint{handle.request_stop();}));
+        assert!(matches!(run(&mut session,"B=sum(A);"),RustEvalOutcomeV1::Cancelled {reason:RustCancelReasonV1::UserStop,..}));
+        session.hook=None;assert_eq!((session.context(),snapshot(&session),session.retained_bytes),before);
+        let request=session.prepare(Arc::from("sum(A)"),Some(Instant::now())).unwrap();
+        assert!(matches!(request.execute(),RustEvalOutcomeV1::Cancelled {reason:RustCancelReasonV1::Deadline,..}));
+        assert_eq!((session.context(),snapshot(&session),session.retained_bytes),before);
+        let revision=session.revision;session.revision=u64::MAX;
+        assert!(matches!(assert_error_unchanged(&mut session,"sum(A)"),RustSessionErrorV1::CounterExhausted));session.revision=revision;
+        assert_eq!(success(run(&mut session,"sum(A)" )).value.as_slice(), &[16.;16]);
+    }
+    let mut session=RustSessionV1::new().unwrap();for i in 0..64 {success(run(&mut session,&format!("v{i}=ones(16);")));}
+    assert!(matches!(assert_error_unchanged(&mut session,"extra=sum(v0);"),RustSessionErrorV1::WorkspaceLimit));
+    success(run(&mut session,"v0=sum(v0);"));assert_eq!(session.retained_bytes,MAX_WORKSPACE_PAYLOAD_BYTES_V1-2048+128);
+}
+
+
+#[test]
+fn extrema_default_session_geometry_ans_suppression_words_and_atomic_recovery() {
+    for (operation,expected,scalar) in [("min",[1.,2.,3.],1.),("max",[4.,5.,6.],6.)] {
+        let mut session=RustSessionV1::new().unwrap();success(run(&mut session,"A=[1 2 3;4 5 6];"));let old=session.read("A").unwrap().unwrap();
+        let result=success(run(&mut session,&format!("{operation}(A)")));assert_eq!(result.value.as_slice(),&expected);assert_eq!(result.display_name.as_deref(),Some("ans"));assert_eq!(result.after.workspace_revision,result.before.workspace_revision+1);
+        let assigned=success(run(&mut session,&format!("B={operation}(A);")));assert!(assigned.display_name.is_none());assert_eq!(values(&session,"ans"),expected);
+        success(run(&mut session,&format!("A(1,:)={operation}(A);")));assert_eq!(old.value.as_slice(),&[1.,4.,2.,5.,3.,6.]);assert_eq!(values(&session,"B"),expected);
+        for source in [format!("B={operation}(missing);"),format!("B={operation}(A,missing);"),format!("B={operation}(:);"),format!("B={operation}(zeros(17));"),format!("A(1)={operation}([]);")] {
+            assert_error_unchanged(&mut session,&source);assert_eq!(success(run(&mut session,&format!("{operation}(B)"))).value.as_slice(),&[scalar]);
+        }
+        assert_eq!(success(run(&mut session,&format!("{operation}([])"))).value.shape(),[0,0]);assert_eq!(success(run(&mut session,&format!("{operation}(zeros(0,3))"))).value.shape(),[0,3]);assert_eq!(success(run(&mut session,&format!("{operation}(zeros(3,0))"))).value.shape(),[1,0]);
+        assert_eq!(success(run(&mut session,&format!("{operation}([-0 0])"))).value.as_slice()[0].to_bits(),0x8000000000000000);assert_eq!(success(run(&mut session,&format!("{operation}([0 -0])"))).value.as_slice()[0].to_bits(),0);
+        let words=[0xfff8000000000042,0x7ff8000000000abc];session.bindings.push(Binding {name:"P".into(),value:SessionValueV1::try_from_col_major([1,2],&words.map(f64::from_bits)).unwrap()});session.retained_bytes+=16;
+        let result=success(run(&mut session,&format!("{operation}(P)")));assert_eq!(result.value.as_slice()[0].to_bits(),words[0]);assert_eq!(session.read("ans").unwrap().unwrap().value.as_slice()[0].to_bits(),words[0]);assert_eq!(session.read("P").unwrap().unwrap().value.as_slice().iter().map(|v|v.to_bits()).collect::<Vec<_>>(),words);
+        success(run(&mut session,&format!("{operation}=[8 9];")));assert_eq!(success(run(&mut session,&format!("{operation}(end)"))).value.as_slice(),&[9.]);
+    }
+}
+
+#[test]
+fn extrema_default_session_reservations_cancel_deadline_quota_counter_and_recovery() {
+    for operation in ["min","max"] {
+        for site in [ReservationSite::Name,ReservationSite::Slot,ReservationSite::Response] {
+            let mut session=RustSessionV1::new().unwrap();success(run(&mut session,"A=ones(16);"));success(run(&mut session,"91"));session.fail_reservation=Some(site);
+            assert!(matches!(assert_error_unchanged(&mut session,&format!("B={operation}(A);")),RustSessionErrorV1::Allocation {..}));assert_eq!(success(run(&mut session,&format!("B={operation}(A);"))).value.as_slice(),&[1.;16]);
+        }
+        for checkpoint in [Checkpoint::Task,Checkpoint::AfterEvaluation,Checkpoint::BeforeCommit] {
+            let mut session=RustSessionV1::new().unwrap();success(run(&mut session,"A=ones(16);"));success(run(&mut session,"91"));let before=(session.context(),snapshot(&session),session.retained_bytes);
+            session.hook=Some(Box::new(move|at,handle|if at==checkpoint{handle.request_stop();}));assert!(matches!(run(&mut session,&format!("B={operation}(A);")),RustEvalOutcomeV1::Cancelled {reason:RustCancelReasonV1::UserStop,..}));session.hook=None;assert_eq!((session.context(),snapshot(&session),session.retained_bytes),before);
+            let request=session.prepare(Arc::from(format!("{operation}(A)")),Some(Instant::now())).unwrap();assert!(matches!(request.execute(),RustEvalOutcomeV1::Cancelled {reason:RustCancelReasonV1::Deadline,..}));assert_eq!((session.context(),snapshot(&session),session.retained_bytes),before);
+            let revision=session.revision;session.revision=u64::MAX;assert!(matches!(assert_error_unchanged(&mut session,&format!("{operation}(A)")),RustSessionErrorV1::CounterExhausted));session.revision=revision;assert_eq!(success(run(&mut session,&format!("{operation}(A)"))).value.as_slice(),&[1.;16]);
+        }
+        let mut session=RustSessionV1::new().unwrap();for i in 0..64 {success(run(&mut session,&format!("v{i}=ones(16);")));}assert!(matches!(assert_error_unchanged(&mut session,&format!("extra={operation}(v0);")),RustSessionErrorV1::WorkspaceLimit));success(run(&mut session,&format!("v0={operation}(v0);")));assert_eq!(session.retained_bytes,MAX_WORKSPACE_PAYLOAD_BYTES_V1-2048+128);
+    }
+}
+
+
+#[test]
+fn exact_mean_prod_session_words_ans_revision_empty_write_and_atomic_recovery() {
+    for (operation,expected,reduced) in [("mean",[2.5,3.5,4.5],3.5),("prod",[4.,10.,18.],720.)] {
+        let mut session=RustSessionV1::new().unwrap();success(run(&mut session,"A=[1 2 3;4 5 6];"));let old=session.read("A").unwrap().unwrap();
+        let result=success(run(&mut session,&format!("{operation}(A)")));assert_eq!(result.value.as_slice(),&expected);assert_eq!(result.display_name.as_deref(),Some("ans"));assert_eq!(result.after.workspace_revision,result.before.workspace_revision+1);
+        assert!(success(run(&mut session,&format!("B={operation}(A);"))).display_name.is_none());assert_eq!(values(&session,"ans"),expected);
+        success(run(&mut session,&format!("A(1,:)={operation}(A);")));assert_eq!(old.value.as_slice(),&[1.,4.,2.,5.,3.,6.]);assert_eq!(values(&session,"B"),expected);
+        for source in [format!("B={operation}(missing);"),format!("B={operation}(A,missing);"),format!("B={operation}(:);"),format!("B={operation}(zeros(17));"),"A(1)=min([]);".into()] {assert_error_unchanged(&mut session,&source);assert_eq!(success(run(&mut session,&format!("{operation}(B)"))).value.as_slice(),&[reduced]);}
+        let empty=success(run(&mut session,&format!("{operation}([])")));assert_eq!(empty.value.shape(),[1,1]);assert_eq!(empty.value.as_slice()[0].to_bits(),if operation=="mean"{0x7ff8000000000000}else{0x3ff0000000000000});assert_eq!(success(run(&mut session,&format!("{operation}(zeros(3,0))"))).value.shape(),[1,0]);
+        success(run(&mut session,"E=zeros(0,3);"));let noop=success(run(&mut session,&format!("E(:,1)={operation}([]);")));assert_eq!(noop.value.shape(),[0,3]);assert_eq!(noop.after.workspace_revision,noop.before.workspace_revision+1);
+        let words=[0xfff8000000000042,0x7ff8000000000abc];session.bindings.push(Binding {name:"P".into(),value:SessionValueV1::try_from_col_major([1,2],&words.map(f64::from_bits)).unwrap()});session.retained_bytes+=16;
+        assert_eq!(success(run(&mut session,&format!("{operation}(P)"))).value.as_slice()[0].to_bits(),words[0]);assert_eq!(session.read("P").unwrap().unwrap().value.as_slice().iter().map(|v|v.to_bits()).collect::<Vec<_>>(),words);
+        success(run(&mut session,&format!("{operation}=[8 9];")));assert_eq!(success(run(&mut session,&format!("{operation}(end)"))).value.as_slice(),&[9.]);
+    }
+    let mut session=RustSessionV1::new().unwrap();assert_eq!(success(run(&mut session,"mean([9007199254740992 1 -9007199254740992])")).value.as_slice()[0].to_bits(),0x3fd5555555555555);assert_eq!(success(run(&mut session,"mean([1e308 1e308 -1e308 -1e308])")).value.as_slice(),&[0.]);
+}
+
+#[test]
+fn exact_mean_prod_session_reservations_cancel_deadline_quota_counter_recovery() {
+    for operation in ["mean","prod"] {
+        for site in [ReservationSite::Name,ReservationSite::Slot,ReservationSite::Response] {
+            let mut session=RustSessionV1::new().unwrap();success(run(&mut session,"A=ones(16);"));success(run(&mut session,"91"));session.fail_reservation=Some(site);assert!(matches!(assert_error_unchanged(&mut session,&format!("B={operation}(A);")),RustSessionErrorV1::Allocation {..}));assert_eq!(success(run(&mut session,&format!("B={operation}(A);"))).value.as_slice(),&[1.;16]);
+        }
+        for checkpoint in [Checkpoint::Task,Checkpoint::AfterEvaluation,Checkpoint::BeforeCommit] {
+            let mut session=RustSessionV1::new().unwrap();success(run(&mut session,"A=ones(16);"));success(run(&mut session,"91"));let before=(session.context(),snapshot(&session),session.retained_bytes);session.hook=Some(Box::new(move|at,handle|if at==checkpoint{handle.request_stop();}));assert!(matches!(run(&mut session,&format!("B={operation}(A);")),RustEvalOutcomeV1::Cancelled {reason:RustCancelReasonV1::UserStop,..}));session.hook=None;assert_eq!((session.context(),snapshot(&session),session.retained_bytes),before);
+            let request=session.prepare(Arc::from(format!("{operation}(A)")),Some(Instant::now())).unwrap();assert!(matches!(request.execute(),RustEvalOutcomeV1::Cancelled {reason:RustCancelReasonV1::Deadline,..}));assert_eq!((session.context(),snapshot(&session),session.retained_bytes),before);
+            let revision=session.revision;session.revision=u64::MAX;assert!(matches!(assert_error_unchanged(&mut session,&format!("{operation}(A)")),RustSessionErrorV1::CounterExhausted));session.revision=revision;assert_eq!(success(run(&mut session,&format!("{operation}(A)"))).value.as_slice(),&[1.;16]);
+        }
+        let mut session=RustSessionV1::new().unwrap();for i in 0..64 {success(run(&mut session,&format!("v{i}=ones(16);")));}assert!(matches!(assert_error_unchanged(&mut session,&format!("extra={operation}(v0);")),RustSessionErrorV1::WorkspaceLimit));success(run(&mut session,&format!("v0={operation}(v0);")));assert_eq!(session.retained_bytes,MAX_WORKSPACE_PAYLOAD_BYTES_V1-2048+128);
+    }
+}
+
+#[test]
+fn exact_sum_input_infinities_override_finite_intermediate_range_and_recover() {
+    for (words,expected) in [([0x7fefffffffffffff,0x7fefffffffffffff,0xfff0000000000000],0xfff0000000000000),([0xffefffffffffffff,0xffefffffffffffff,0x7ff0000000000000],0x7ff0000000000000)] {
+        let mut session=RustSessionV1::new().unwrap();session.bindings.push(Binding {name:"A".into(),value:SessionValueV1::try_from_col_major([1,3],&words.map(f64::from_bits)).unwrap()});session.retained_bytes+=24;
+        let before=session.read("A").unwrap().unwrap();let result=success(run(&mut session,"B=sum(A);"));assert_eq!(result.value.as_slice()[0].to_bits(),expected);assert!(result.display_name.is_none());assert_eq!(result.after.workspace_revision,result.before.workspace_revision+1);
+        assert_eq!(success(run(&mut session,"sum(A)")).value.as_slice()[0].to_bits(),expected);assert_eq!(values(&session,"ans")[0].to_bits(),expected);assert_error_unchanged(&mut session,"B=sum(missing);");
+        assert_eq!(session.read("A").unwrap().unwrap().value.as_slice().iter().map(|v|v.to_bits()).collect::<Vec<_>>(),words);assert_eq!(before.value.as_slice().iter().map(|v|v.to_bits()).collect::<Vec<_>>(),words);
+        assert_eq!(success(run(&mut session,"sum([9007199254740992 1 -9007199254740992])")).value.as_slice(),&[1.]);
+    }
 }
