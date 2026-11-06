@@ -160,5 +160,87 @@ class HeadlessQAContracts(unittest.TestCase):
                 stop.assert_not_called()
 
 
+    def readonly_relocation_fixture(self, root):
+        original = root / "original package"
+        (original / "bin").mkdir(parents=True)
+        (original / "share").mkdir()
+        (original / "bin/mathlab").write_bytes(b"synthetic executable bytes; never run")
+        (original / "share/notes").write_bytes("original payload Ω".encode())
+        for path in original.rglob("*"):
+            path.chmod(0o555 if path.is_dir() or path.name == "mathlab" else 0o444)
+        original.chmod(0o555)
+        output = root / "QA owned evidence"
+        output.mkdir()
+        relocated = output / "installed with spaces"
+        import shutil
+        shutil.copytree(original, relocated)
+        return original, output, relocated, output / "second relocated install"
+
+    def restore_fixture_directory_modes(self, *roots):
+        # Only fresh fixture directories are made removable after assertions.
+        for root in roots:
+            if root.exists():
+                root.chmod(0o755)
+                for path in root.rglob("*"):
+                    if path.is_dir(): path.chmod(0o755)
+
+    def test_readonly_second_relocation_restores_modes_inventory_and_original(self):
+        with tempfile.TemporaryDirectory() as temp:
+            original, output, relocated, second = self.readonly_relocation_fixture(Path(temp).resolve())
+            before = qa.release.inventory(relocated)
+            before_modes = {path.relative_to(relocated).as_posix(): path.stat().st_mode & 0o777
+                            for path in relocated.rglob("*")}
+            original_before = qa.release.inventory(original)
+            real_rename = Path.rename
+            def checked_rename(source, target):
+                self.assertEqual(source, relocated)
+                self.assertEqual(target, second)
+                self.assertEqual(source.stat().st_mode & 0o777, 0o755)
+                self.assertEqual(qa.release.inventory(source), before)
+                self.assertEqual(original.stat().st_mode & 0o777, 0o555)
+                return real_rename(source, target)
+            try:
+                with patch.object(Path, "rename", autospec=True, side_effect=checked_rename) as rename, \
+                        patch.object(qa.installed.Runner, "run") as execute:
+                    qa.relocate_readonly_copy(relocated, second, output)
+                    rename.assert_called_once_with(relocated, second)
+                    execute.assert_not_called()
+                self.assertFalse(relocated.exists())
+                self.assertEqual(second.stat().st_mode & 0o777, 0o555)
+                self.assertEqual(qa.release.inventory(second), before)
+                self.assertEqual({path.relative_to(second).as_posix(): path.stat().st_mode & 0o777
+                                  for path in second.rglob("*")}, before_modes)
+                self.assertEqual(qa.release.inventory(original), original_before)
+                self.assertEqual(original.stat().st_mode & 0o777, 0o555)
+            finally:
+                self.restore_fixture_directory_modes(original, relocated, second)
+
+    def test_failed_second_relocation_restores_readonly_without_execution_or_payload_change(self):
+        with tempfile.TemporaryDirectory() as temp:
+            original, output, relocated, second = self.readonly_relocation_fixture(Path(temp).resolve())
+            before = qa.release.inventory(relocated)
+            before_modes = {path.relative_to(relocated).as_posix(): path.stat().st_mode & 0o777
+                            for path in relocated.rglob("*")}
+            original_before = qa.release.inventory(original)
+            def refuse_rename(source, target):
+                self.assertEqual(source.stat().st_mode & 0o777, 0o755)
+                raise PermissionError("synthetic rename refusal")
+            try:
+                with patch.object(Path, "rename", autospec=True, side_effect=refuse_rename), \
+                        patch.object(qa.installed.Runner, "run") as execute:
+                    with self.assertRaisesRegex(PermissionError, "synthetic rename refusal"):
+                        qa.relocate_readonly_copy(relocated, second, output)
+                    execute.assert_not_called()
+                self.assertFalse(second.exists())
+                self.assertEqual(relocated.stat().st_mode & 0o777, 0o555)
+                self.assertEqual(qa.release.inventory(relocated), before)
+                self.assertEqual({path.relative_to(relocated).as_posix(): path.stat().st_mode & 0o777
+                                  for path in relocated.rglob("*")}, before_modes)
+                self.assertEqual(qa.release.inventory(original), original_before)
+                self.assertEqual(original.stat().st_mode & 0o777, 0o555)
+            finally:
+                self.restore_fixture_directory_modes(original, relocated, second)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

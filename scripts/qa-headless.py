@@ -119,6 +119,36 @@ class ReadyObservation:
             os.kill(process.pid, signal.SIGINT)
 
 
+def relocate_readonly_copy(relocated, second, output):
+    # Darwin disallows renaming a write-disabled directory even within the
+    # same parent. Only this fresh QA-owned copy's top directory is writable
+    # during maintenance; all execution remains against read-only packages.
+    require(relocated.parent == output and not relocated.is_symlink()
+            and relocated.stat().st_uid == os.getuid(), "Relocation copy is not QA-owned")
+    readonly_inventory = release.inventory(relocated)
+    readonly_modes = {path.relative_to(relocated).as_posix(): path.stat().st_mode & 0o777
+                      for path in relocated.rglob("*")}
+    require(all(not mode & 0o222 for mode in readonly_modes.values()),
+            "Relocation copy has writable payload members")
+    readonly_mode = relocated.stat().st_mode & 0o777
+    require(readonly_mode == 0o555 and not second.exists() and not second.is_symlink(),
+            "Second relocation requires the unchanged read-only copy and a fresh destination")
+    moved = relocated
+    try:
+        relocated.chmod(readonly_mode | 0o200)
+        relocated.rename(second)
+        moved = second
+    finally:
+        moved.chmod(readonly_mode)
+    require(release.inventory(second) == readonly_inventory,
+            "Relocation changed package bytes or member modes")
+    require({path.relative_to(second).as_posix(): path.stat().st_mode & 0o777
+             for path in second.rglob("*")} == readonly_modes,
+            "Relocation changed member permission modes")
+    require(second.stat().st_mode & 0o777 == readonly_mode,
+            "Relocated package root is not read-only")
+
+
 def accept(bundle, output, timeout=120):
     require(os.name == "posix", "Installed signal/process-group QA currently requires POSIX")
     bundle, requested_output = Path(bundle).resolve(), Path(output).absolute()
@@ -243,7 +273,8 @@ def accept(bundle, output, timeout=120):
         report["full_fit_oracle"] = checked
         # A second location/cwd proves independence from the initial install path.
         second = output / "second relocated install"
-        relocated.rename(second)
+        relocate_readonly_copy(relocated, second, output)
+        report["relocation_maintenance"] = "QA-owned copy root alone temporarily owner-writable for rename; restored before second execution"
         cli = second / "bin/mathlab"
         other = output / "other cwd"
         other.mkdir()

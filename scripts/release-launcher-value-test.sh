@@ -6,6 +6,10 @@ set -euo pipefail
 
 test_repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 test_tmp="$(mktemp -d "${TMPDIR:-/tmp}/mathlab launcher-value.XXXXXX")"
+# macOS TMPDIR commonly ends in '/'; mktemp may retain the resulting '//'.
+# The launcher deliberately resolves cwd before forwarding it. Canonicalize the
+# owned fixture root too, so default-project expectations use that same spelling.
+test_tmp="$(cd -- "$test_tmp" && pwd -P)"
 cleanup() {
   # Only this harness's new tree is writable/removed, including read-only bundles.
   chmod -R u+w "$test_tmp" 2>/dev/null || true
