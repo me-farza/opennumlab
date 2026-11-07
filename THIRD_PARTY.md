@@ -1,6 +1,6 @@
 # Third-party provenance
 
-Open MathLab's application source is GPL-3.0-or-later. Its scientific execution engine is a separately installed GNU Octave process. The application does not translate the Octave codebase into Rust, and this repository does not redistribute an Octave binary. Exact Rust dependency versions are recorded in `Cargo.lock`.
+See [Licensing](LICENSING.md) for OpenNumLab's MIT and GPL terms. Its scientific execution engine is a separately installed GNU Octave process. The application does not translate the Octave codebase into Rust, and this repository does not redistribute an Octave binary. Exact Rust dependency versions are recorded in `Cargo.lock`.
 
 The optional native debugger adapter is project-owned GPL-3.0-or-later C++ code using GNU Octave's public interpreter/event/breakpoint interfaces. `--with-debugger` builds an `.oct` module against the selected local Octave development installation. The macOS bundle includes that module, its recorded compiler runtime version, and the corresponding C++ source. It still requires a compatible separately installed Octave runtime. Numerical algorithms and interpreter implementation remain supplied by Octave.
 
@@ -37,4 +37,4 @@ The local development installation has the separately installed Octave profile `
 
 Other packages from the [Octave package catalog](https://packages.octave.org/) are candidates for later curated profiles. Scilab/Xcos, OpenModelica, Nelson, SymPy, GPU runtimes, and specialized domain systems appear in the roadmap as candidates; the current product does not integrate them.
 
-The full GPLv3 license text in this repository's `LICENSE` was copied from the installed GNU Octave 11.3.0 distribution's `COPYING`; the application is offered under GPL version 3 or any later version as stated in the workspace metadata and original source notices. Original example/fixture source is project-owned; numerical formulas and tests were written for this repository, not copied from MATLAB or Octave suites.
+The verbatim [GPLv3 text](GPL-3.0.txt) comes from GNU Octave 11.3.0's `COPYING` and accompanies the GPL option and the native adapters. Original example/fixture source is project-owned; numerical formulas and tests were written for this repository, not copied from MATLAB or Octave suites.

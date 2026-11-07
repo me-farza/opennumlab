@@ -185,7 +185,7 @@ Study documented behavior, published algorithms, architecture, and appropriately
 
 Translating an existing implementation into another language does not erase its license obligations. Keep provenance records for imported or adapted code, tests, and assets. Build compatibility from public specifications and independently authored tests; do not copy proprietary MATLAB implementation code. Octave itself documents this boundary in its [contribution governance](https://octave.org/governance).
 
-The application uses GPL-3.0-or-later, with the full license included in the repository. Third-party components retain their original licenses and notices. The local bundle includes corresponding project source and a dependency inventory; future distribution work must also account for any bundled numerical runtimes, packages and platform libraries.
+See [Licensing](LICENSING.md) for the MIT and GPL terms. Third-party components retain their original licenses and notices. The local bundle includes corresponding project source and a dependency inventory; future distribution work must also account for any bundled numerical runtimes, packages and platform libraries.
 
 ## Development stages and release gates
 

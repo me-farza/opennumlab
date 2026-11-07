@@ -234,6 +234,7 @@ def verify(directory):
             require(blob_id(data, commit) == record["git_blob"], "Public-tree Git blob mismatch: " + name)
             actual_files.add(name)
     require(actual_files == set(names) and actual_directories == directories(files), "Public-tree inventory mismatch")
+    policy.require_project_license_files(actual_files, (tree / "LICENSE").read_bytes())
     require((directory / FILE_TREE).read_bytes() == file_tree(files), "FILE_TREE is not canonical or complete")
     require((directory / CHECKSUMS).read_bytes() == checksums(directory, files), "Public-tree checksums disagree")
     return manifest

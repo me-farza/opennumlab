@@ -26,6 +26,7 @@ import tarfile
 import tempfile
 import uuid
 
+PROJECT_LICENSE_FILES = ("LICENSE", "GPL-3.0.txt", "LICENSING.md")
 ROOT_FILES = {"Cargo.toml", "Cargo.lock", "LICENSE", "README.md", "THIRD_PARTY.md"}
 SCRIPT_FILES = {"build-debugger.sh", "build-value-bridge.sh", "verify-value-provisioning-test.sh",
                 "fetch-upstream-licenses.py", "generate-notices.py",
@@ -332,7 +333,7 @@ def allowed_source(name):
         return False
     if p.suffix.lower() in BINARY_SUFFIXES or any(x.startswith(".") for x in p.parts):
         return False
-    if name in ROOT_FILES or name in DOC_FILES or name in SOURCE_DATA_FILES or name in BRAND_FILES:
+    if name in ROOT_FILES or name in PROJECT_LICENSE_FILES or name in DOC_FILES or name in SOURCE_DATA_FILES or name in BRAND_FILES:
         return True
     if p.parts[0] == "crates":
         return p.suffix in {".rs", ".toml", ".md", ".m"}
@@ -388,6 +389,13 @@ def inventory(root):
     return result
 
 
+def require_project_license_files(paths, license_text):
+    names = set(paths)
+    companion_files = set(PROJECT_LICENSE_FILES[1:])
+    if license_text.lstrip().startswith(b"MIT License") or names & companion_files:
+        require(companion_files.issubset(names), "MIT source requires GPL-3.0.txt and LICENSING.md")
+
+
 def source_snapshot(repo):
     names = run(["git", "ls-files", "-z"], repo).split("\0")
     paths = sorted(name for name in names if name and allowed_source(name))
@@ -407,6 +415,7 @@ def source_snapshot(repo):
         if path.is_file():
             files.append({"path": name, "sha256": sha(path), "size": path.stat().st_size,
                           "executable": bool(path.stat().st_mode & 0o111)})
+    require_project_license_files((item["path"] for item in files), (repo / "LICENSE").read_bytes())
     return {"commit": run(["git", "rev-parse", "HEAD"], repo),
             "dirty": bool(run(["git", "status", "--porcelain", "--untracked-files=normal"], repo)),
             "files": files}
@@ -940,6 +949,9 @@ def package(repo, destination, with_debugger=False, builder=build, notice_builde
         (contents / "MacOS/mathlab-launcher").chmod(0o755)
         for name in ("LICENSE", "README.md", "THIRD_PARTY.md"):
             shutil.copy2(source / name, resources / name)
+        for name in PROJECT_LICENSE_FILES[1:]:
+            if (source / name).is_file():
+                shutil.copy2(source / name, resources / name)
         for name in BRAND_FILES:
             if (source / name).is_file():
                 shutil.copy2(source / name, resources / Path(name).name)

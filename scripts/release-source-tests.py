@@ -70,6 +70,15 @@ class SourceArchiveTests(unittest.TestCase):
     def create(self, reference=None, output=None):
         return source.create(self.repo, reference or self.commit, output or self.output)
 
+    def test_mit_source_requires_both_companion_notices(self):
+        self.write("LICENSE", "MIT License\n")
+        self.write("LICENSING.md", "Project license scope\n")
+        with self.assertRaisesRegex(RuntimeError, "MIT source requires GPL-3.0.txt"):
+            self.create(self.commit_all())
+        self.write("GPL-3.0.txt", "GPL text\n")
+        self.create(self.commit_all())
+        source.verify(self.output)
+
     def archive_contents(self, output=None):
         output = output or self.output
         manifest = json.loads((output / source.MANIFEST).read_text())

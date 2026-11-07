@@ -127,6 +127,7 @@ def committed_files(repo, commit):
         files.append({"path": name, "sha256": digest(data), "size": len(data),
                       "executable": mode == "100755", "mode": "0755" if mode == "100755" else "0644",
                       "git_blob": object_id})
+    policy.require_project_license_files(contents, contents["LICENSE"])
     # A reproducible set includes the exact selector/exporter used, rather than
     # silently applying an uncommitted or unrelated policy to an older ref.
     for name, local in ((POLICY_PATH, SCRIPTS / "release-package.py"), (EXPORTER_PATH, Path(__file__))):
@@ -205,6 +206,7 @@ def verify(directory):
     # Validate the complete decompressed stream. A streaming tar reader buffers
     # ahead and can otherwise hide bytes after its end marker from gzip.read().
     tar_bytes = gzip.decompress(archive_bytes)
+    license_text = b""
     with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:") as archive:
         observed, final_end = 0, 0
         for member in archive:
@@ -224,10 +226,13 @@ def verify(directory):
                 require(member.size == record["size"], "Source member size mismatch")
                 data = archive.extractfile(member).read()
                 require(digest(data) == record["sha256"], "Source member hash mismatch")
+                if record["path"] == "LICENSE":
+                    license_text = data
                 blob = b"blob " + str(len(data)).encode("ascii") + b"\0" + data
                 require(hashlib.new("sha1" if len(commit) == 40 else "sha256", blob).hexdigest() == record["git_blob"],
                         "Source Git blob mismatch")
         require(observed == len(expected), "Missing archive member")
+    policy.require_project_license_files(names, license_text)
     tail = tar_bytes[final_end:]
     require(len(tail) >= 1024 and len(tar_bytes) % tarfile.RECORDSIZE == 0 and not tail.strip(b"\0"),
             "Unexpected trailing archive data or missing canonical tar end padding")

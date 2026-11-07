@@ -36,7 +36,7 @@ class PackageTests(unittest.TestCase):
         self.git("config", "user.name", "Release Tests")
         self.git("config", "user.email", "tests@example.invalid")
         self.git("config", "commit.gpgsign", "false")
-        for name in release.ROOT_FILES:
+        for name in release.ROOT_FILES.union(release.PROJECT_LICENSE_FILES):
             self.write(name, "fixture " + name)
         self.write("examples/getting_started.m", "assert(1+1 == 2);\n")
         self.write("examples/other.m", "x = 1;\n")
@@ -152,6 +152,12 @@ class PackageTests(unittest.TestCase):
         paths = {r["path"] for r in manifest["source"]["files"]}
         self.assertIn("crates/test/src/main.rs", paths)
         self.assertIn("compatibility/conformance/fixtures/original.m", paths)
+        resources = self.destination / "Contents/Resources"
+        for name in release.PROJECT_LICENSE_FILES:
+            self.assertIn(name, paths)
+            expected = (self.repo / name).read_bytes()
+            self.assertEqual((resources / name).read_bytes(), expected)
+            self.assertEqual((resources / "source" / name).read_bytes(), expected)
         for name in ("docs/research/private.m", "artifacts/local.json", "crates/vendor/file.rs", "native/vendor.dylib", "tests/fixtures/generated.mat"):
             self.assertNotIn(name, paths)
         self.assertFalse(manifest["source"]["dirty"])

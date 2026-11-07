@@ -2,7 +2,7 @@
 name = "mathlab-engine"
 version = "0.1.0"
 edition = "2024"
-license = "GPL-3.0-or-later"
+license = "MIT OR GPL-3.0-or-later"
 description = "Persistent GNU Octave execution engine for Open MathLab"
 
 [dependencies]

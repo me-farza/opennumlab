@@ -109,9 +109,11 @@ when state or data can change. Changes to numerical, protocol, native, packaging
 or release behavior need independent review of both the source and relevant
 results. Preserve existing source and user data during failed operations.
 
-The project source and original examples/fixtures use **GPL-3.0-or-later**; see
-[LICENSE](LICENSE). Keep applicable source notices and record dependency/license
-changes in [THIRD_PARTY.md](THIRD_PARTY.md). Contribute code and fixtures you have
-permission to share. Use public interfaces, documentation and original tests for
-interoperability work; do not submit proprietary implementation code, restricted
-datasets or unreviewed third-party payloads.
+See [Licensing](LICENSING.md) for the MIT and GPL options. Submit original
+contributions under both licenses for files covered by both, and under the
+applicable terms for other files. Preserve existing notices and document
+dependency changes in [THIRD_PARTY.md](THIRD_PARTY.md). Contribute material
+you have the rights to license under those terms. Use public interfaces,
+documentation and original tests for interoperability work. Keep proprietary
+implementation code, restricted datasets and unreviewed third-party payloads
+out of submissions.
