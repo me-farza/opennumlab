@@ -6,6 +6,13 @@
 
 <p align="center">Open-source scientific computing for MATLAB-style scripts.</p>
 
+<p align="center">
+  <a href="https://github.com/me-farza/opennumlab/stargazers"><img src="https://img.shields.io/github/stars/me-farza/opennumlab?style=flat&amp;logo=github" alt="GitHub stars"></a>
+  <a href="https://github.com/me-farza/opennumlab/forks"><img src="https://img.shields.io/github/forks/me-farza/opennumlab?style=flat" alt="GitHub forks"></a>
+  <a href="https://github.com/me-farza/opennumlab/issues"><img src="https://img.shields.io/github/issues/me-farza/opennumlab?style=flat" alt="Open issues"></a>
+  <a href="https://github.com/me-farza/opennumlab/blob/main/LICENSE"><img src="https://img.shields.io/github/license/me-farza/opennumlab?style=flat" alt="Repository license"></a>
+</p>
+
 OpenNumLab is building an independent scientific computing environment in Rust. You can try the headless Rust preview or run the desktop and CLI with GNU Octave.
 
 ## Try the Rust preview
